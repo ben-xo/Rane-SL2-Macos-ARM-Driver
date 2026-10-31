@@ -1,0 +1,99 @@
+========================================================================
+       DRIVER RANE SL2 PARA MAC (APPLE SILICON M1 / M2 / M3 / M4)
+              Idea original y proyecto por: pepelee (PPLEE)
+            Instagram: @pepeleedj (instagram.com/pepeleedj/)
+========================================================================
+
+1. COMPATIBILIDAD
+-----------------
+- Procesadores: Cualquier Mac con procesador Apple Silicon de la serie M
+  (M1, M2, M3, M4 y sus variantes Pro, Max, Ultra), asi como Macs Intel.
+  Todos los binarios estan compilados como Universal (arm64 + x86_64).
+- Sistema Operativo: macOS 12 Monterey, macOS 13 Ventura, macOS 14 Sonoma,
+  macOS 15 Sequoia y posteriores.
+- Compatibilidad con Serato DJ Pro y DAWs:
+  * Funciona nativamente con Serato DJ Pro 2.5.5 (ultima version de Serato
+    compatible con Rane SL2; versiones posteriores eliminaron el soporte de
+    la SL2).
+  * Funciona con el panel oficial "SL 2" en Ajustes del Sistema de macOS.
+  * Funciona como tarjeta de sonido de 4 entradas y 4 salidas (24-bit,
+    44.1 / 48 kHz) en Ableton Live, Traktor, Mixxx, Logic Pro, Rekordbox y
+    el audio del sistema de macOS.
+- Arquitectura: Driver CoreAudio en espacio de usuario (HAL Plug-In sobre
+  IOUSBHost) + puente nativo SL2Api.framework. NO utiliza extensiones de
+  kernel (.kext) activas, por lo que NO requiere desactivar la seguridad
+  del Mac (SIP / Reduced Security) ni reiniciar el ordenador.
+
+
+2. CONTENIDO DE ESTA CARPETA
+----------------------------
+- RaneSL2-macOS-Universal.pkg  -> Instalador grafico de macOS con el logo
+                                  y creditos de pepelee (@pepeleedj). Instala
+                                  automaticamente el driver CoreAudio, la
+                                  libreria SL2Api.framework para Serato DJ
+                                  Pro 2.5.5 y el panel de Ajustes del Sistema.
+- Instalar-Rane-SL2.command    -> Instalador automatico en 1 clic (elimina
+                                  la cuarentena de Gatekeeper e instala todo).
+- Panel-Control-SL2.command    -> Utilidad en Terminal para ver el estado de
+                                  la Rane SL2.
+- Desinstalar-Rane-SL2.command -> Elimina el driver y sus componentes si
+                                  deseas desinstalarlo.
+
+
+3. COMO INSTALARLO EN CUALQUIER MAC
+-----------------------------------
+Tienes dos formas de instalarlo (ambas instalan exactamente lo mismo y NO
+requieren reiniciar el ordenador):
+
+OPCION A (Recomendada y mas rapida):
+1. Haz doble clic en "Instalar-Rane-SL2.command".
+   (Si macOS pregunta si deseas abrirlo, haz clic derecho -> Abrir).
+2. Escribe la contrasena de tu Mac cuando la pida en la ventana y pulsa ENTER.
+3. ¡Listo! El motor de audio se recargara solo y la Rane SL2 funcionara al
+   instante en Serato DJ Pro 2.5.5, en Ajustes del Sistema -> SL 2, y en
+   cualquier software de audio (Ableton Live, Traktor, Logic Pro, etc.).
+
+OPCION B (Con el asistente grafico RaneSL2-macOS-Universal.pkg):
+1. Haz clic derecho sobre "RaneSL2-macOS-Universal.pkg" y selecciona "Abrir"
+   para ver el asistente con el logo de PPLEE (@pepeleedj).
+2. Si macOS muestra un aviso de que el paquete no esta firmado por Apple:
+   - Ve a "Ajustes del Sistema" -> "Privacidad y seguridad".
+   - Baja hasta abajo y pulsa en "Abrir igualmente" junto al aviso de
+     RaneSL2-macOS-Universal.pkg.
+3. Sigue los pasos del instalador e introduce tu contrasena.
+
+* NOTA SI EL OTRO MAC BLOQUEA LOS ARCHIVOS COPIADOS POR PENDRIVE O DESCARGA:
+  Si al copiar la carpeta a otro Mac te salta el aviso de seguridad de Apple,
+  abre la app Terminal, escribe:
+    xattr -cr 
+  (con un espacio al final), arrastra esta carpeta dentro de la Terminal y
+  pulsa ENTER. Luego abre "Instalar-Rane-SL2.command" o el ".pkg".
+
+
+4. USO CON SERATO DJ PRO 2.5.5
+------------------------------
+- Descarga e instala Serato DJ Pro 2.5.5 (ultima version con soporte oficial
+  para Rane SL2).
+- En Macs con procesador M1/M2/M3/M4, si es la primera vez que abres una app
+  Intel como Serato DJ Pro 2.5.5, macOS te instalara Rosetta 2 en un clic si
+  aun no lo tenias instalado.
+- Conecta tu Rane SL2 por USB y abre Serato DJ Pro 2.5.5: detectara la
+  tarjeta al instante y activara los modos ABS / REL / INT y THRU.
+
+
+5. COMO FUNCIONA EL DRIVER EN EL DIA A DIA
+------------------------------------------
+- Conexion en caliente: Puedes enchufar y desenchufar la Rane SL2 por USB en
+  cualquier momento.
+- Canales de Audio (4 Entradas / 4 Salidas a 24-bit / 44.1 o 48 kHz):
+    * Canales 1 y 2: Left Deck (Plato / CDJ Izquierdo)
+    * Canales 3 y 4: Right Deck (Plato / CDJ Derecho)
+- Panel de Control en Ajustes del Sistema:
+    * En "Ajustes del Sistema" -> "SL 2" (abajo del todo) puedes consultar y
+      cambiar entre Phono / Line, activar o desactivar Thru en cada canal y
+      cambiar la frecuencia de muestreo (44100 Hz / 48000 Hz).
+
+========================================================================
+  Creditos: Idea original y proyecto por pepelee (PPLEE)
+  Instagram: https://www.instagram.com/pepeleedj/ (@pepeleedj)
+========================================================================
