@@ -24,9 +24,9 @@ can't damage it. **Physical damage is another matter entirely:** the reflash pro
 below is electrically hazardous, and a wiring or voltage slip can destroy the FX2 or the
 board permanently. Read the warning before you start.
 
-(An over-USB firmware loader, `sl2flash`, with its protocol write-up in `UPLOAD-PROTOCOL.md`
-and `BOOTSTRAP-ANALYSIS.md`, is in this folder; this guide is the direct EEPROM reflash, which
-fixes every case including a hard brick.)
+(An over-USB flasher, `sl2flash`, can program the EEPROM of a box that still enumerates — see
+`README.md` in this folder. This guide is the direct EEPROM reflash, which fixes every case
+including a hard brick.)
 
 ---
 
@@ -36,8 +36,8 @@ SPUSBDataType`; Linux `lsusb | grep 1cc5`):
 
 | What you see | State | Fix |
 |---|---|---|
-| "Rane SL 2", `bcdDevice 0x0100`, ~4 interfaces | healthy | nothing to do |
-| "Unnamed Device", VID `1cc5`/PID `0013`, `bcdDevice 0x0000` (bootloader mode) | C0 / blank EEPROM | the USB firmware loader (`sl2flash`) can upload over USB — **or** reflash the EEPROM (below) |
+| "Rane SL 2", `bcdDevice 0x0100`, ~4 interfaces; both LEDs on | healthy | nothing to do |
+| "Unnamed Device", VID `1cc5`/PID `0013`, `bcdDevice 0x0000` (bootloader mode); all LEDs off | C0 / blank EEPROM | `sl2flash` can write the firmware over USB — **or** reflash the EEPROM (below) |
 | A device with no VID/PID that never finishes enumerating | **bricked** (C2 + garbage) | **reflash the EEPROM directly** (below) — USB recovery can't reach it |
 
 The direct‑EEPROM reflash below fixes *all* of these and is the surest route, but comes at your own risk, as there is a non-zero risk of damaging your hardware if you do not follow the procedure with care.
@@ -132,4 +132,4 @@ idempotent); if it keeps failing, desolder U11 and program it on a breadboard.
 ## Files here
 - `pi/pi-eeprom-24lc512.py` — read / write / verify the 24LC512 from a Pi (safety‑gated)
 - `extract-sl2-firmware.py` — build `eeprom-image-24lc512.bin` from your own driver copy
-- `sl2flash.m`, `SL2Loader.{h,m}` — the over-USB loader (see `README.md` in this folder)
+- `sl2flash.m` — the over-USB flasher (see `README.md` in this folder)

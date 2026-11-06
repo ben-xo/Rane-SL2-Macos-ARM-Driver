@@ -14,10 +14,10 @@ panel:
 	$(CC) $(ARCH) $(CFLAGS) -framework Foundation -framework CoreAudio tools/sl2panel.m -o sl2panel
 
 dump:
-	$(CC) $(ARCH) $(CFLAGS) -framework Foundation -framework CoreAudio tools/sl2dump.m -o sl2dump
+	$(CC) $(ARCH) $(CFLAGS) -framework Foundation -framework CoreAudio tools/sl2dump.m tools/SL2Passthrough.m -o sl2dump
 
 flash:
-	$(CC) $(ARCH) $(CFLAGS) -framework Foundation -framework IOKit -framework IOUSBHost tools/firmware/sl2flash.m tools/firmware/SL2Loader.m -o sl2flash
+	$(CC) $(ARCH) $(CFLAGS) -Itools -framework Foundation -framework CoreAudio -framework IOKit -framework IOUSBHost tools/firmware/sl2flash.m tools/SL2Passthrough.m -o sl2flash
 
 clean:
 	rm -f SL2Device SL2Api sl2panel sl2dump sl2flash

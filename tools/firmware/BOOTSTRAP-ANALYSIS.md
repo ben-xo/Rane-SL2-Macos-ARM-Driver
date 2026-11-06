@@ -58,8 +58,8 @@ channel is **EP1 interrupt OUT (commands) / EP1 interrupt IN (replies), 64-byte
 reports**, byte[0] = opcode (echoed in the reply). EP1 belongs to interface 3, a HID
 interface (class 3) with a 28-byte vendor-defined report descriptor. Rane's Mac driver
 reached it through its kext user client (`IOConnectCallMethod(selector=7, 60-byte struct)`);
-a kext-less host can open the EP1 interrupt pipes directly, as `sl2flash` does. The running
-firmware uses the same transport and loop.
+a kext-less host can open the EP1 interrupt pipes itself (this project's tools go through the
+HAL driver, which holds them). The running firmware uses the same transport and loop.
 
 Opcode dispatch is an 8051 jump table (`FUN_CODE_073f`): inline records of
 `[handlerHi][handlerLo][opcode]` straight after the dispatcher call (`CODE:0842`),
@@ -76,7 +76,7 @@ tables are in `docs/SL2-COMMANDS.md`.
 
 Every handler except `0x00` and `0x06` copies request bytes 1–4 into the reply (helper
 `CODE:16dd` in the bootstrap). Rane's driver puts a sequence number there to match replies
-to requests; `sl2flash` sends 0 and matches on the echoed address instead.
+to requests; `sl2flash` does the same, and also checks the echoed address.
 
 For the EEPROM commands:
 
@@ -211,8 +211,8 @@ enumerates but, by the firmware's own logic, never starts its audio side.
    including "Rane SL 2" and the audio interfaces) is byte-identical to the running
    firmware's, bcdDevice `0x0100` included. Nothing in USB enumeration tells them apart;
    command `0x01` does (version `01 02` for the bootstrap, `01 0a` for the running
-   firmware). So an audio driver that matches on VID/PID/bcdDevice will see the bootstrap
-   as an SL 2 and may try to open it during a flash.
+   firmware). So this project's HAL driver opens the bootstrap as if it were a running SL 2,
+   and `sl2flash` relies on that: it sends Stage 2 through the driver, as for a running box.
 4. Safe-programming is built in (C0 before, C2 after). If a flash is interrupted
    between `0x17` and `0x16`, the EEPROM is left C0 (non-bootable) → the device returns to
    bootloader mode and the whole sequence can simply be run again. The dangerous case is
@@ -229,3 +229,8 @@ enumerates but, by the firmware's own logic, never starts its audio side.
 - **Confirmed:** the layout of the 64 KiB image, including the FPGA bitstream and the
   sequence that loads it.
 - **Inferred:** that PC5 resets the FX2.
+- **Verified on hardware** with `sl2flash`: the bootstrap, once loaded, enumerates as
+  `bcdDevice 0x0100` and reports version `01 02`; its `0x16` works without a preceding
+  `0x17`; it programs and verifies the whole 64 KiB EEPROM, after which the box boots the
+  firmware and passes audio. The running firmware's `0x17`/`0x02`/`0x03`/`0x16` do the same
+  on a working box.

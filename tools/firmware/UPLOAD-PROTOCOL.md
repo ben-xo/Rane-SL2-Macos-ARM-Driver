@@ -6,7 +6,7 @@ exported symbols. Original source path leaked in asserts:
 `/projects/Rane/SL3/mac/Sl3Api/source/SixtyEightApiState.mm`.
 
 This is the host side of the protocol. `BOOTSTRAP-ANALYSIS.md` covers the device side;
-`sl2flash` (`sl2flash.m` + `SL2Loader.m`) is this folder's implementation of it.
+`sl2flash` (`sl2flash.m`) is this folder's implementation of it.
 
 ## Hardware
 - USB controller is a **Cypress EZ-USB FX2** family part (8051 core; CPUCS reset
@@ -78,8 +78,9 @@ Transport: each command is a **64-byte report** sent on **EP1 interrupt OUT**; t
 replies with a 64-byte report on **EP1 interrupt IN** whose byte 0 echoes the opcode.
 EP1 belongs to the box's HID interface (interface 3); SL2Api calls these "HID requests"
 (`SendHidRequest`/`PostHidRequest`) and sent them through Rane's kext user client
-(`IOConnectCallMethod(selector=7, inStruct=60B)`). A reimplementation can open the EP1
-interrupt pipes directly, as `sl2flash` does.
+(`IOConnectCallMethod(selector=7, inStruct=60B)`). A kext-less host can open the EP1
+interrupt pipes itself; `sl2flash` instead sends the reports through this project's HAL
+driver, which holds the interface (its `sl2h` passthrough, `tools/SL2Passthrough.h`).
 
 The bootstrap programs a 64 KiB I2C EEPROM (device `0x51`): `0x17` writes the
 non-bootable `0xC0` boot header, `0x02` writes the body at the supplied 16-bit address,
@@ -99,8 +100,8 @@ RAM load. See `BOOTSTRAP-ANALYSIS.md` for the device-side evidence.
 | 39–63 | `0` | `0` | — |
 
 The address is **not** at bytes 1–2. Bytes 1–4 are a host-chosen 32-bit tag that the
-device copies into the reply unchanged; Rane's driver uses a sequence number there, and
-`sl2flash` sends 0 and matches replies by the echoed address. Getting this layout wrong writes the image to the wrong EEPROM
+device copies into the reply unchanged; Rane's driver uses a sequence number there, and so
+does `sl2flash`, which also checks the echoed address. Getting this layout wrong writes the image to the wrong EEPROM
 addresses — and if that image is then finalized with `0x16`, the box is bricked (see
 `RECOVERY.md`).
 
@@ -128,8 +129,8 @@ addresses — and if that image is then finalized with `0x16`, the box is bricke
 
 `0x16` is the irreversible step: it makes whatever is in the EEPROM bootable. `sl2flash`
 therefore re-reads the whole image with `0x03` and only sends `0x16` if every byte matches.
-If anything fails before `0x16`, the EEPROM stays `0xC0` and the box simply returns to
-bootloader mode, ready for another attempt.
+If anything fails before `0x16`, the EEPROM stays `0xC0` and the box returns to bootloader
+mode at its next power-up (a running box keeps working until then), ready for another attempt.
 
 ---
 
@@ -148,8 +149,13 @@ both images accept.
 ## Implementation notes
 - The audio driver (`plugin/SL2Device.m`) only *detects* a bootloader-mode box and reports
   it; it never writes firmware. Loading is done by the standalone `sl2flash` tool.
-- Stage 1 = IOUSBHost (or libusb) control transfers on EP0.
+- Stage 1 = IOUSBHost control transfers on EP0. `sl2flash` opens the bootloader-mode box
+  itself, as a normal user (no root needed); the driver never opens a box in that mode.
 - Stage 2 = 64-byte interrupt transfers on EP1 OUT, each followed by one EP1 IN reply.
+  The bootstrap enumerates like a running box, so the driver opens it as one, and `sl2flash`
+  sends Stage 2 through the driver in both cases.
+- Before writing, `sl2flash` reads the EEPROM: if it already holds the image, a running box
+  is left alone and a bootloader-mode box only gets `0x16`.
 - Use the **de-obfuscated** images. The XOR-256 key (`sl2_xor_key_256.bin`, also written
   by `extract-sl2-firmware.py`) is only how they were stored in the Mac binary; the device
   expects de-obfuscated bytes.

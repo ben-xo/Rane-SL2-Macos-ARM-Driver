@@ -80,7 +80,8 @@ does not implement (`0x13`, `0x14`, `0x15`, `0x42`); the SL 2 answers all of the
   the bootstrap. A consequence worth guarding against: **`0x17` sent to a working box
   immediately marks its EEPROM non-bootable**, and the box will come up in bootloader mode
   at its next power-up unless `0x16` follows. The layout and safe-programming sequence are
-  in `tools/firmware/UPLOAD-PROTOCOL.md`.
+  in `tools/firmware/UPLOAD-PROTOCOL.md`. `sl2flash` (`tools/firmware/sl2flash.m`) uses
+  these commands on both images, and both have been exercised on hardware.
 - **`0x1a` / `0x1b` product ID.** Both images contain two USB device descriptors that are
   identical except for the product ID (`0x0013` and `0x0014`, both bcdDevice `0x0100`).
   In the running firmware these commands ack, power down the audio side (as for USB
