@@ -14,6 +14,10 @@
  *   - Full HID Command/Response + Unsolicited Report Queue ('sl2h', 'sl2s', 'sl2q')
  *     for Serato DJ Pro (SL2Api.framework) and Control Panel
  *   - Automatic USB Hotplug detection (plug / unplug at any time)
+ *   - Bootloader detection: a box whose EEPROM firmware is missing/corrupt enumerates in the
+ *     USB bootloader (bcdDevice 0x0000, "Unnamed Device") and passes no audio. The driver
+ *     detects this and reports it — in the log and via a boot_mode flag in the 'sl2s' status —
+ *     so a client can tell the box needs its firmware restored.
  */
 
 #import <Foundation/Foundation.h>
@@ -28,6 +32,8 @@
 
 #define VID          0x1cc5
 #define PID          0x0013
+#define BCD_LOADER   0x0000  /* USB bootloader: EEPROM has no bootable firmware ("Unnamed Device") */
+#define BCD_AUDIO    0x0100  /* running firmware: the 4-interface audio device */
 #define IF_PLAY      1
 #define IF_CAP       2
 #define IF_HID       3
@@ -68,6 +74,7 @@ typedef struct {
     uint8_t  port_b;
     uint64_t cap_frames;
     uint64_t play_frames;
+    uint32_t boot_mode;      /* 1 = the box is in its USB bootloader; no audio until firmware is loaded */
 } SL2StatusPacket;
 
 enum {
@@ -90,6 +97,7 @@ static Float64  g_sr = 44100.0;
 static UInt32   g_io_clients = 0;
 static _Atomic bool g_io_running = false;
 static _Atomic bool g_hw_connected = false;
+static _Atomic bool g_boot_mode = false;     /* a bootloader-mode box (no firmware) is attached */
 static uint32_t g_ref_count = 0;
 
 /* Ring buffers (Float32 interleaved, NCH channels) */
@@ -511,6 +519,17 @@ static void cap_submit(int idx) {
  * USB Open / Close Lifecycle
  * ============================================================================ */
 
+/* bcdDevice of a USB device service, or -1 if unreadable: BCD_AUDIO (running firmware) vs
+   BCD_LOADER (USB bootloader, no firmware). */
+static int svc_bcd(io_service_t svc) {
+    CFNumberRef n = IORegistryEntryCreateCFProperty(svc, CFSTR("bcdDevice"), kCFAllocatorDefault, 0);
+    if (!n) return -1;
+    int v = -1;
+    CFNumberGetValue(n, kCFNumberIntType, &v);
+    CFRelease(n);
+    return v;
+}
+
 static io_service_t find_sl2_service(void) {
     CFMutableDictionaryRef m = IOServiceMatching(kIOUSBDeviceClassName);
     if (!m) return IO_OBJECT_NULL;
@@ -520,7 +539,17 @@ static io_service_t find_sl2_service(void) {
     CFDictionarySetValue(m, CFSTR(kUSBVendorID), vn);
     CFDictionarySetValue(m, CFSTR(kUSBProductID), pn);
     CFRelease(vn); CFRelease(pn);
-    return IOServiceGetMatchingService(kIOMainPortDefault, m);
+    io_iterator_t it = 0;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, m, &it) != KERN_SUCCESS) return IO_OBJECT_NULL;
+    io_service_t s, found = IO_OBJECT_NULL;
+    while ((s = IOIteratorNext(it))) {
+        /* Only the running firmware (bcdDevice 0x0100) has the audio interfaces. A box in its
+           bootloader must stay untouched so the standalone firmware tools can reach it. */
+        if (!found && svc_bcd(s) == BCD_AUDIO) found = s;
+        else IOObjectRelease(s);
+    }
+    IOObjectRelease(it);
+    return found;
 }
 
 static bool usb_ensure_hid(void) {
@@ -564,6 +593,7 @@ static bool usb_ensure_hid(void) {
         hb_read();
         refresh_hw_status();
         atomic_store(&g_hw_connected, true);
+        atomic_store(&g_boot_mode, false);
         return true;
     }
     return false;
@@ -673,16 +703,37 @@ static void notify_alive_changed(void) {
     g_host->PropertiesChanged(g_host, kObjDevice, 1, &addr);
 }
 
+/* ----------------------------------------------------------------------------
+ * Bootloader detection. The SL 2 keeps its firmware in an on-board I2C EEPROM. If that is blank
+ * or corrupt the box enumerates in the Cypress FX2 USB bootloader (bcdDevice 0x0000: one vendor
+ * interface, no strings, shown as "Unnamed Device") and passes no audio until the EEPROM is
+ * written again. The driver reports this — in the log and via a boot_mode flag in the 'sl2s'
+ * status — so a client knows the box needs its firmware restored.
+ * ---------------------------------------------------------------------------- */
+static void note_bootloader_device(void) {
+    LOG("Rane SL 2 is in USB bootloader mode (bcdDevice 0x0000): no firmware loaded, so no "
+        "audio until the box's firmware is restored.");
+}
+
 static void on_usb_added(void *refcon, io_iterator_t iter) {
     io_service_t s;
-    bool found = false;
-    while ((s = IOIteratorNext(iter))) { IOObjectRelease(s); found = true; }
-    if (found) {
+    bool audio = false, bootloader = false;
+    while ((s = IOIteratorNext(iter))) {
+        if (svc_bcd(s) == BCD_LOADER) bootloader = true;
+        else                          audio = true;
+        IOObjectRelease(s);
+    }
+    if (audio) {
+        atomic_store(&g_boot_mode, false);
         LOG("Rane SL 2 USB connected");
         pthread_mutex_lock(&g_mutex);
         usb_ensure_hid();
         pthread_mutex_unlock(&g_mutex);
         notify_alive_changed();
+    }
+    if (bootloader) {
+        atomic_store(&g_boot_mode, true);
+        note_bootloader_device();
     }
 }
 
@@ -1079,6 +1130,7 @@ static OSStatus SL2_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
                 g_st.sample_rate = (uint32_t)g_sr;
                 g_st.cap_frames = atomic_load(&g_total_cap_frames);
                 g_st.play_frames = atomic_load(&g_total_play_frames);
+                g_st.boot_mode = atomic_load(&g_boot_mode) ? 1 : 0;
                 pthread_mutex_unlock(&g_mutex);
                 *(CFDataRef*)outData = CFDataCreate(kCFAllocatorDefault, (const UInt8*)&g_st, sizeof(g_st));
                 *outSize = sizeof(CFDataRef);
