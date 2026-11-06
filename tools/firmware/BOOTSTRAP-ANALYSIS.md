@@ -2,8 +2,8 @@
 
 Companion to `UPLOAD-PROTOCOL.md` (host side). This documents the **device side**:
 what the A0-loaded bootstrap actually does with the bytes the host streams, and so
-how and where the firmware persists. It also lists every command opcode the bootstrap
-and the running SL 2 firmware handle.
+how and where the firmware persists. The full command set of both firmware images is in
+`docs/SL2-COMMANDS.md`.
 
 ## Sources and method
 - **Bootstrap:** `sl2_bootstrap_firmware.deobfuscated.bin` (6247 B), produced by
