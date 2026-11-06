@@ -3,6 +3,7 @@
 /SL2Api
 /sl2panel
 /sl2dump
+/sl2flash
 *.o
 *.dSYM/
 .DS_Store

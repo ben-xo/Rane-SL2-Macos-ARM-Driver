@@ -2,7 +2,7 @@ CC = clang
 ARCH = -arch arm64 -arch x86_64
 CFLAGS = -fobjc-arc -O2
 
-all: plugin api panel dump
+all: plugin api panel dump flash
 
 plugin:
 	$(CC) $(ARCH) -bundle $(CFLAGS) -framework Foundation -framework CoreAudio -framework IOKit -framework IOUSBHost plugin/SL2Device.m -o SL2Device
@@ -16,7 +16,10 @@ panel:
 dump:
 	$(CC) $(ARCH) $(CFLAGS) -framework Foundation -framework CoreAudio tools/sl2dump.m -o sl2dump
 
-clean:
-	rm -f SL2Device SL2Api sl2panel sl2dump
+flash:
+	$(CC) $(ARCH) $(CFLAGS) -framework Foundation -framework IOKit -framework IOUSBHost tools/firmware/sl2flash.m tools/firmware/SL2Loader.m -o sl2flash
 
-.PHONY: all plugin api panel dump clean
+clean:
+	rm -f SL2Device SL2Api sl2panel sl2dump sl2flash
+
+.PHONY: all plugin api panel dump flash clean
