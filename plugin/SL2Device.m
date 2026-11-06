@@ -252,20 +252,25 @@ static bool hid_cmd(uint8_t cmd, const uint8_t *pl, size_t plen, uint8_t *reply_
 }
 
 static void refresh_hw_status(void) {
+    /* Firmware version via HID command 0x01, as Rane's SL2Api reads it
+       (SendHidRequest(dev, 0x01, ...) -> reply[5]=major, reply[6]=minor, 32-bit build stamp at
+       reply[7..10]); c.f. the SL3, which uses 0x10. bcdDevice is only a mode marker
+       (0x0100 = running firmware, 0x0000 = bootloader), not the version. */
     uint8_t r[64];
-    if (hid_cmd(0x10, NULL, 0, r, NULL)) {
+    if (hid_cmd(0x01, NULL, 0, r, NULL)) {
         g_st.version_maj = r[5];
         g_st.version_min = r[6];
     }
-    if (hid_cmd(0x04, NULL, 0, r, NULL)) {
-        for (int i = 0; i < 31; i++) {
-            uint16_t ch = r[5 + i*2] | (r[6 + i*2] << 8);
-            if (!ch || ch > 127) { g_st.serial[i] = 0; break; }
-            g_st.serial[i] = (uint8_t)ch;
-        }
+    /* Serial from the USB iSerialNumber string ("SL2.01.00"), a fixed device serial independent
+       of the firmware version; c.f. the SL3, which queries it over HID 0x04. */
+    CFTypeRef ser = IORegistryEntryCreateCFProperty(g_dev.ioService, CFSTR("USB Serial Number"), kCFAllocatorDefault, 0);
+    if (ser) {
+        if (CFGetTypeID(ser) == CFStringGetTypeID())
+            CFStringGetCString((CFStringRef)ser, (char *)g_st.serial, sizeof g_st.serial, kCFStringEncodingUTF8);
+        CFRelease(ser);
     }
     uint8_t req_ports[1] = {0};
-    if (hid_cmd(0x45, req_ports, 1, r, NULL)) {
+    if (hid_cmd(0x45, req_ports, 1, r, NULL)) {   /* 0x45 = port status */
         g_st.port_a = r[5];
         g_st.port_b = r[6];
     }
