@@ -45,22 +45,22 @@ that image does not implement the command (it replies `0xFF`).
 | op | SL2Api | boot | run | request | reply / effect |
 |----|--------|------|-----|---------|----------------|
 | `0x00` | — | `0870` | `0175` | — | ping: reply byte 0 = `0x00`; tag **not** echoed |
-| `0x01` | `RH_get_firmware_version` | `087b` | `0180` | — | `[5]` major, `[6]` minor, `[7..10]` 32-bit big-endian build stamp |
+| `0x01` | `RH_get_firmware_version` | `087b` | `0180` | — | firmware version: `[5]` major, `[6]` minor, `[7..10]` 32-bit big-endian build stamp |
 | `0x02` | `UpdateFinalFirmware` | `09a2` | `05a8` | `[5..6]` EEPROM address, `[7..38]` data | write 32 EEPROM bytes, reply with them read back; requires `0x17` first |
-| `0x03` | — | `09dd` | `05e3` | `[5..6]` EEPROM address | `[5..6]` address, `[7..38]` 32 EEPROM bytes |
+| `0x03` | — | `09dd` | `05e3` | `[5..6]` EEPROM address | read 32 EEPROM bytes: `[5..6]` address echoed, `[7..38]` the data; read-only, no `0x17` needed |
 | `0x06` | — | `0878` | `017d` | — | does nothing; **no reply is sent** |
-| `0x0a` | `RH_get_port_speed` | `08b0` | `01b6` | — | `[5]`: 0 = not configured, 1 = full speed, 2 = high speed |
+| `0x0a` | `RH_get_port_speed` | `08b0` | `01b6` | — | USB connection speed in `[5]`: 0 = not configured, 1 = full speed, 2 = high speed |
 | `0x16` | `UpdateFinalFirmware` | `0a35` | `063c` | — | finalize: write `0xC2` boot header, disconnect, restart from EEPROM |
 | `0x17` | `UpdateFinalFirmware` | `0a0d` | `0613` | — | begin: write `0xC0` (non-bootable) boot header, enable `0x02` |
 | `0x1a` | `RH_set_alt_product_id` | — | `06bf` | — | reconnect to USB as product ID `0x0014` |
 | `0x1b` | — | — | `06bf` | — | reconnect to USB as product ID `0x0013` (the normal identity) |
-| `0x30` | `SL2_get_sample_rate` | `08d1` | `01db` | — | `[5..6]` current sample rate, big-endian |
+| `0x30` | `SL2_get_sample_rate` | `08d1` | `01db` | — | get the sample rate: `[5..6]`, big-endian |
 | `0x31` | — | `08e7` | `01f1` | `[5..6]` sample rate, big-endian | set the sample rate; only 44100 and 48000 are accepted, anything else → `0xFF` |
 | `0x36` | — | `0938` | `0250` | `[5]` on/off | enable (non-zero) or disable (zero) unsolicited `0x40` reports |
-| `0x37` | `RH_driver_timer` | `0951` | `054b` | `[5..12]` 8-byte challenge | `[5..12]` 8-byte response |
+| `0x37` | `RH_driver_timer` | `0951` | `054b` | `[5..12]` 8-byte challenge | challenge/response (see below): `[5..12]` 8-byte response |
 | `0x41` | (Hidi messages) | — | `0269` | `[5]` length (≤ 58), `[6..]` MIDI bytes | MIDI-style control messages, see below; `0xFF` if too long |
-| `0x45` | `RH_get_usb_port_status` | `08be` | `01c8` | — | `[5..6]` = `00 00`, always |
-| other | | `0aac` | `0739` | — | `0xFF` |
+| `0x45` | `RH_get_usb_port_status` | `08be` | `01c8` | — | USB port status: `[5..6]` = `00 00`, always |
+| other | | `0aac` | `0739` | — | unknown command: reply byte 0 = `0xFF` |
 
 SL2Api's code is shared with other Rane devices and contains senders for opcodes the SL 2
 does not implement (`0x13`, `0x14`, `0x15`, `0x42`); the SL 2 answers all of them `0xFF`.
