@@ -63,7 +63,8 @@ that image does not implement the command (it replies `0xFF`).
 | other | | `0aac` | `0739` | — | unknown command: reply byte 0 = `0xFF` |
 
 SL2Api's code is shared with other Rane devices and contains senders for opcodes the SL 2
-does not implement (`0x13`, `0x14`, `0x15`, `0x42`); the SL 2 answers all of them `0xFF`.
+does not implement (`0x0c`, `0x13`, `0x14`, `0x15`, `0x42`; `0x0c` and `0x14` read and write
+the flash of Rane's flash-based devices); the SL 2 answers all of them `0xFF`.
 
 ### Details
 
