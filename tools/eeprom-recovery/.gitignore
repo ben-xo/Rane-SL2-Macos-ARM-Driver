@@ -1,0 +1,9 @@
+# Produced locally from the user's own copy of the proprietary driver — never commit.
+# firmware images and EEPROM dumps
+*.bin
+# extract-sl2-firmware.py default output directories
+*-out/
+sl2-fw-out/
+# python caches
+__pycache__/
+*.pyc
