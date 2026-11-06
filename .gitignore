@@ -1,0 +1,8 @@
+# build products (see Makefile)
+/SL2Device
+/SL2Api
+/sl2panel
+/sl2dump
+*.o
+*.dSYM/
+.DS_Store
