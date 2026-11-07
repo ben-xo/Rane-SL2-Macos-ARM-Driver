@@ -1,8 +1,8 @@
 # Rane SL 2 — EEPROM recovery / un‑brick guide
 
 How to bring a Rane SL 2 back when it won't enumerate — including the worst case, a
-**bricked boot EEPROM** (the box shows up as "Unnamed Device" with no VID/PID and never
-recovers on its own). Proven: this is exactly how the unit in this project was recovered.
+**bricked boot EEPROM** (the box never finishes enumerating: no vendor/product ID, and it
+never recovers on its own). Proven: this is exactly how the unit in this project was recovered.
 
 > The firmware itself is proprietary Rane/Serato code and is **not** included here. You
 > extract it from **your own** copy of the official driver (see Step 1). Everything in
@@ -24,8 +24,9 @@ can't damage it. **Physical damage is another matter entirely:** the reflash pro
 below is electrically hazardous, and a wiring or voltage slip can destroy the FX2 or the
 board permanently. Read the warning before you start.
 
-(An over-USB firmware loader, with its own protocol write-up, ships separately; this guide is
-the direct EEPROM reflash, which fixes every case including a hard brick.)
+(An over-USB flasher, `sl2flash`, can program the EEPROM of a box that still enumerates — see
+`README.md` in this folder. This guide is the direct EEPROM reflash, which fixes every case
+including a hard brick.)
 
 ---
 
@@ -35,9 +36,9 @@ SPUSBDataType`; Linux `lsusb | grep 1cc5`):
 
 | What you see | State | Fix |
 |---|---|---|
-| "Rane SL 2", `bcdDevice 0x0100`, ~4 interfaces | healthy | nothing to do |
-| VID `1cc5`/PID `0013`, `bcdDevice 0x0000` ("firmware load" mode) | C0 / blank EEPROM | a USB firmware loader (shipped separately) can upload over USB — **or** reflash the EEPROM (below) |
-| "Unnamed Device", no VID/PID, won't settle | **bricked** (C2 + garbage) | **reflash the EEPROM directly** (below) — USB recovery can't reach it |
+| "Rane SL 2", `bcdDevice 0x0100`, ~4 interfaces; both LEDs on | healthy | nothing to do |
+| "Unnamed Device", VID `1cc5`/PID `0013`, `bcdDevice 0x0000` (bootloader mode); all LEDs off | C0 / blank EEPROM | `sl2flash` can write the firmware over USB — **or** reflash the EEPROM (below) |
+| A device with no VID/PID that never finishes enumerating | **bricked** (C2 + garbage) | **reflash the EEPROM directly** (below) — USB recovery can't reach it |
 
 The direct‑EEPROM reflash below fixes *all* of these and is the surest route, but comes at your own risk, as there is a non-zero risk of damaging your hardware if you do not follow the procedure with care.
 
@@ -131,3 +132,4 @@ idempotent); if it keeps failing, desolder U11 and program it on a breadboard.
 ## Files here
 - `pi/pi-eeprom-24lc512.py` — read / write / verify the 24LC512 from a Pi (safety‑gated)
 - `extract-sl2-firmware.py` — build `eeprom-image-24lc512.bin` from your own driver copy
+- `sl2flash.m` — the over-USB flasher (see `README.md` in this folder)
