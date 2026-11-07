@@ -104,9 +104,15 @@ static uint32_t g_ref_count = 0;
 static float g_in_ring[RING_FRAMES * NCH];
 static float g_out_ring[RING_FRAMES * NCH];
 
-/* Clock state */
+/* Clock state. The HAL's timeline (GetZeroTimeStamp) puts sample 0 at g_anchor_host, fixed when
+   streaming starts: moving it while IO runs makes the HAL see its timestamps jump and reset its
+   clock, an audible gap. Capture only begins some milliseconds later, so the first captured frame
+   is stored at the timeline position matching its arrival (g_cap_base), and the device's real
+   rate is measured from that first frame's time (g_rate_anchor). Both are touched only on g_q. */
 static mach_timebase_info_data_t g_tb;
 static _Atomic uint64_t g_anchor_host = 0;
+static uint64_t g_rate_anchor = 0;
+static uint64_t g_cap_base = 0;
 static _Atomic uint64_t g_total_cap_frames = 0;
 static _Atomic uint64_t g_total_play_frames = 0;
 static _Atomic double   g_ticks_per_frame = 0;
@@ -364,15 +370,21 @@ static IOUSBHostPipe *copy_isoch_pipe(IOUSBHostInterface *intf, uint8_t dir, uin
  * Isochronous Audio Streaming (Capture + Implicit-Feedback Playback)
  * ============================================================================ */
 
+/* First capture of a stream: note when it arrived, and where on the HAL's timeline it belongs. */
+static void clk_first_capture(uint64_t hw_time) {
+    uint64_t now = (hw_time > 0) ? hw_time : mach_absolute_time();
+    uint64_t a = atomic_load_explicit(&g_anchor_host, memory_order_acquire);
+    double tpf = atomic_load_explicit(&g_ticks_per_frame, memory_order_relaxed);
+    g_rate_anchor = now;
+    g_cap_base = (now > a && tpf > 0) ? (uint64_t)((double)(now - a) / tpf) : 0;
+}
+
 static void clk_update(int frames, uint64_t hw_time) {
     if (!frames) return;
     uint64_t now = (hw_time > 0) ? hw_time : mach_absolute_time();
     uint64_t prev = atomic_fetch_add_explicit(&g_total_cap_frames, frames, memory_order_relaxed);
-    if (prev == 0) {
-        atomic_store_explicit(&g_anchor_host, now, memory_order_release);
-    } else if ((prev / 2048) != ((prev + frames) / 2048)) {
-        uint64_t a = atomic_load_explicit(&g_anchor_host, memory_order_relaxed);
-        double elapsed = (double)(now - a);
+    if (prev != 0 && (prev / 2048) != ((prev + frames) / 2048)) {
+        double elapsed = (double)(now - g_rate_anchor);
         double measured = elapsed / (double)(prev + frames);
         double nom = ((1e9 / g_sr) * (double)g_tb.denom) / (double)g_tb.numer;
         if (measured > nom * 0.90 && measured < nom * 1.10) {
@@ -479,6 +491,17 @@ static void cap_submit(int idx) {
         uint64_t wp = atomic_load_explicit(&g_total_cap_frames, memory_order_relaxed);
         int got = 0;
         uint64_t ts = 0;
+
+        if (wp == 0) {   /* nothing captured yet: place this transfer's first frame on the timeline */
+            for (int k = 0; k < CAP_PKTS; k++) {
+                if (done[k].status == kIOReturnSuccess && done[k].completeCount >= FRAME_BYTES &&
+                    done[k].completeCount <= PKT_MAX) {
+                    clk_first_capture(done[k].timeStamp);
+                    break;
+                }
+            }
+        }
+        wp += g_cap_base;
 
         for (int k = 0; k < CAP_PKTS; k++) {
             /* Drop errored packets and impossible lengths. The first completion after a
