@@ -110,6 +110,7 @@ static _Atomic uint64_t g_anchor_host = 0;
 static _Atomic uint64_t g_total_cap_frames = 0;
 static _Atomic uint64_t g_total_play_frames = 0;
 static _Atomic double   g_ticks_per_frame = 0;
+static _Atomic uint64_t g_zts_seed = 1;     /* GetZeroTimeStamp seed: bumped when the timeline changes */
 
 /* Implicit feedback packet-size FIFO */
 static int g_fifo[FIFO_N];
@@ -816,7 +817,42 @@ static OSStatus SL2_CreateDevice(AudioServerPlugInDriverRef d, CFDictionaryRef d
 static OSStatus SL2_DestroyDevice(AudioServerPlugInDriverRef d, AudioObjectID id) { return kAudioHardwareUnsupportedOperationError; }
 static OSStatus SL2_AddDeviceClient(AudioServerPlugInDriverRef d, AudioObjectID id, const AudioServerPlugInClientInfo *ci) { return kAudioHardwareNoError; }
 static OSStatus SL2_RemoveDeviceClient(AudioServerPlugInDriverRef d, AudioObjectID id, const AudioServerPlugInClientInfo *ci) { return kAudioHardwareNoError; }
-static OSStatus SL2_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef d, AudioObjectID id, UInt64 action, void *info) { return kAudioHardwareNoError; }
+/* Sample-rate changes go through the HAL's configuration-change handshake: the setters call
+   RequestDeviceConfigurationChange with the new rate as the action, and the HAL calls this with
+   IO stopped, then re-reads the device's rate and formats. The HAL caches the rate, so a plug-in
+   must not change it any other way: the HAL would keep rendering at the cached rate into a box
+   clocked at the new one. */
+static OSStatus SL2_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef d, AudioObjectID id, UInt64 action, void *info) {
+    if (id != kObjDevice || (action != 44100 && action != 48000)) return kAudioHardwareBadObjectError;
+    pthread_mutex_lock(&g_mutex);
+    if ((Float64)action != g_sr) {
+        bool was_streaming = atomic_load(&g_io_running);
+        if (was_streaming) usb_stop_streaming();
+        g_sr = (Float64)action;
+        double nom = ((1e9 / g_sr) * (double)g_tb.denom) / (double)g_tb.numer;
+        atomic_store(&g_ticks_per_frame, nom);
+        atomic_fetch_add(&g_zts_seed, 1);   /* new timeline for the HAL */
+        if (was_streaming) usb_open_all();   /* sends 0x31 itself */
+        else if (usb_ensure_hid()) send_hw_samplerate((int)g_sr);
+        LOG("Sample rate changed to %.0f Hz", g_sr);
+    }
+    pthread_mutex_unlock(&g_mutex);
+    return kAudioHardwareNoError;
+}
+
+/* Ask the HAL to switch the device to rate; it then stops IO and calls
+   SL2_PerformDeviceConfigurationChange. Re-selecting the current rate just re-sends it to the box. */
+static OSStatus request_sample_rate(Float64 rate) {
+    if (rate != 44100.0 && rate != 48000.0) return kAudioDeviceUnsupportedFormatError;
+    if (rate == g_sr) {
+        pthread_mutex_lock(&g_mutex);
+        if (usb_ensure_hid()) send_hw_samplerate((int)rate);
+        pthread_mutex_unlock(&g_mutex);
+        return kAudioHardwareNoError;
+    }
+    if (!g_host) return kAudioHardwareNotRunningError;
+    return g_host->RequestDeviceConfigurationChange(g_host, kObjDevice, (UInt64)rate, NULL);
+}
 static OSStatus SL2_AbortDeviceConfigurationChange(AudioServerPlugInDriverRef d, AudioObjectID id, UInt64 action, void *info) { return kAudioHardwareNoError; }
 
 static Boolean SL2_HasProperty(AudioServerPlugInDriverRef d, AudioObjectID oid, pid_t pid, const AudioObjectPropertyAddress *addr) {
@@ -862,7 +898,6 @@ static Boolean SL2_HasProperty(AudioServerPlugInDriverRef d, AudioObjectID oid, 
             case kAudioDevicePropertySafetyOffset:
             case kAudioDevicePropertyNominalSampleRate:
             case kAudioDevicePropertyAvailableNominalSampleRates:
-            case kAudioDevicePropertyIcon:
             case kAudioDevicePropertyIsHidden:
             case kAudioDevicePropertyZeroTimeStampPeriod:
             case kAudioDevicePropertyPreferredChannelsForStereo:
@@ -1202,8 +1237,11 @@ static OSStatus SL2_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
                 memcpy(g_last_cmd_in, CFDataGetBytePtr(cd), CFDataGetLength(cd));
                 if (g_last_cmd_in[0] == 0x31 && CFDataGetLength(cd) >= 7) {
                     int sr = (g_last_cmd_in[5] << 8) | g_last_cmd_in[6];
+                    /* A client (Serato) changing the rate over HID: route it through the HAL
+                       so CoreAudio's rate and the box's stay in step. */
                     if (sr == 44100 || sr == 48000) {
-                        g_sr = (Float64)sr;
+                        if ((Float64)sr != g_sr && g_host)
+                            g_host->RequestDeviceConfigurationChange(g_host, kObjDevice, (UInt64)sr, NULL);
                         push_sr_unsol(sr);
                     }
                 }
@@ -1212,29 +1250,13 @@ static OSStatus SL2_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
         return 0;
     }
     if (oid == kObjDevice && addr->mSelector == kAudioDevicePropertyNominalSampleRate) {
-        Float64 v = *(const Float64*)inData;
-        if (v == 44100.0 || v == 48000.0) {
-            g_sr = v;
-            double nom = ((1e9 / g_sr) * (double)g_tb.denom) / (double)g_tb.numer;
-            atomic_store(&g_ticks_per_frame, nom);
-            pthread_mutex_lock(&g_mutex);
-            if (usb_ensure_hid()) send_hw_samplerate((int)g_sr);
-            pthread_mutex_unlock(&g_mutex);
-        }
-        return 0;
+        if (inSize < sizeof(Float64) || !inData) return kAudioHardwareBadPropertySizeError;
+        return request_sample_rate(*(const Float64*)inData);
     }
     if ((oid == kObjStreamIn || oid == kObjStreamOut) &&
         (addr->mSelector == kAudioStreamPropertyVirtualFormat || addr->mSelector == kAudioStreamPropertyPhysicalFormat)) {
-        const AudioStreamBasicDescription *a = (const AudioStreamBasicDescription*)inData;
-        if (a->mSampleRate == 44100.0 || a->mSampleRate == 48000.0) {
-            g_sr = a->mSampleRate;
-            double nom = ((1e9 / g_sr) * (double)g_tb.denom) / (double)g_tb.numer;
-            atomic_store(&g_ticks_per_frame, nom);
-            pthread_mutex_lock(&g_mutex);
-            if (usb_ensure_hid()) send_hw_samplerate((int)g_sr);
-            pthread_mutex_unlock(&g_mutex);
-        }
-        return 0;
+        if (inSize < sizeof(AudioStreamBasicDescription) || !inData) return kAudioHardwareBadPropertySizeError;
+        return request_sample_rate(((const AudioStreamBasicDescription*)inData)->mSampleRate);
     }
     return kAudioHardwareUnsupportedOperationError;
 }
@@ -1278,7 +1300,7 @@ static OSStatus SL2_GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID
 
     *outSampleTime = (Float64)(periods * 2048ULL);
     *outHostTime   = anchor + (uint64_t)((double)periods * period_ticks);
-    *outSeed       = 1;
+    *outSeed       = atomic_load(&g_zts_seed);
     return 0;
 }
 
