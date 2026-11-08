@@ -93,8 +93,8 @@ static os_log_t g_log;
 #define LOG(fmt, ...) os_log(g_log, "[SL2] " fmt, ##__VA_ARGS__)
 
 /* Debug build (make plugin DEBUG=1): streaming diagnostics (counters, timing histograms, periodic
-   "DBG" log lines), the 'sl2h' debug commands 0xF0-0xF4 (intercepted, never sent to the box), and
-   the experiments kept for reference (late-write test, workloop / realtime-policy attempts, the
+   "DBG" log lines), the 'sl2h' debug commands 0xF0-0xF2 and 0xF4 (intercepted, never sent to the
+   box), and the experiments kept for reference (workloop / realtime-policy attempts, the
    shallow-queue playback path as a selectable alternative). A release build compiles none of it. */
 #ifndef SL2_DEBUG
 #define SL2_DEBUG 0
@@ -712,114 +712,7 @@ static void play_submit(int idx) {
     play_submit_try(idx, 0);
 }
 
-/* ============================================================================
- * DEBUG EXPERIMENT (temporary): deep playback schedule with late writes.
- * Does audio written into an already-queued isochronous OUT transfer reach the wire, and does
- * the box accept OUT packet sizes predicted from the clock rate rather than copied from capture?
- * XP_SLOTS 1 ms transfers are kept queued ahead in ioDataWithCapacity: buffers, zero-filled.
- * Mode 1 writes a 997 Hz tone (ch1) into each transfer g_xp_lead frames before it starts, from
- * the capture handler; mode 2 writes it at submit (control). Normal playback is bypassed.
- * ============================================================================ */
-#define XP_SLOTS 32
-static _Atomic int g_dbg_xp = 0;        /* next stream: 0 off, 1 late write, 2 write at submit */
-static _Atomic int g_dbg_xp_lead = 2;   /* next stream: late-write lead in USB frames */
-static int g_xp_mode, g_xp_lead;
-static bool g_xp_started;
-static NSMutableData *g_xp_buf[XP_SLOTS];
-static IOUSBHostIsochronousTransaction g_xp_tx[XP_SLOTS][PLAY_PKTS];
-static uint64_t g_xp_start_frame[XP_SLOTS], g_xp_first_sample[XP_SLOTS];
-static int      g_xp_nframes[XP_SLOTS][PLAY_PKTS];
-static bool     g_xp_pending[XP_SLOTS], g_xp_written[XP_SLOTS];
-static uint64_t g_xp_next_frame, g_xp_next_sample;
-static double   g_xp_acc;
-static uint32_t xp_late, xp_missed, xp_enq_fail, xp_completions, xp_resync, xp_alloc_fail;
-static int64_t  xp_min_lead_seen = 1 << 30;
-
-/* Frames in the next OUT packet (one microframe), from the box's measured rate. */
-static int xp_packet_frames(void) {
-    uint64_t h; double s, tpf;
-    clk_get(&h, &s, &tpf);
-    double ticks_per_uframe = 125e3 * (double)g_tb.denom / (double)g_tb.numer;   /* 125 us */
-    g_xp_acc += ticks_per_uframe / tpf;
-    int n = (int)g_xp_acc;
-    g_xp_acc -= n;
-    if (n < 4) n = 4;
-    if (n > PKT_MAX / FRAME_BYTES) n = PKT_MAX / FRAME_BYTES;
-    return n;
-}
-
-static void xp_fill(int slot) {
-    uint8_t *buf = g_xp_buf[slot].mutableBytes;
-    uint64_t si = g_xp_first_sample[slot];
-    double w = 2 * M_PI * 997.0 / g_sr;
-    for (int k = 0; k < PLAY_PKTS; k++) {
-        uint8_t *dst = buf + k * PKT_MAX;
-        for (int s = 0; s < g_xp_nframes[slot][k]; s++, si++) {
-            int32_t raw = (int32_t)(0.4 * sin(w * (double)si) * 2147483392.0);
-            memcpy(dst + s * FRAME_BYTES, &raw, 4);   /* ch1 only; the rest stays zero */
-        }
-    }
-}
-
-static void xp_submit(int slot) {
-    if (!atomic_load(&g_io_running) || !g_ppipe || !g_xp_buf[slot]) return;
-    uint64_t usb_now = [g_dev frameNumberWithTime:NULL];
-    if (g_xp_next_frame < usb_now + 3) {   /* schedule ran dry (shouldn't, this deep): restart it */
-        xp_resync++;
-        g_xp_next_frame = usb_now + 4;
-    }
-    g_xp_start_frame[slot] = g_xp_next_frame++;
-    g_xp_first_sample[slot] = g_xp_next_sample;
-    for (int k = 0; k < PLAY_PKTS; k++) {
-        int n = xp_packet_frames();
-        g_xp_nframes[slot][k] = n;
-        g_xp_tx[slot][k] = (IOUSBHostIsochronousTransaction){ .requestCount = (uint32_t)(n * FRAME_BYTES), .offset = (uint32_t)(k * PKT_MAX) };
-        g_xp_next_sample += n;
-    }
-    memset(g_xp_buf[slot].mutableBytes, 0, PLAY_PKTS * PKT_MAX);
-    g_xp_written[slot] = false;
-    if (g_xp_mode == 2) { xp_fill(slot); g_xp_written[slot] = true; }
-    NSError *e = nil;
-    BOOL ok = [g_ppipe enqueueIORequestWithData:g_xp_buf[slot] transactionList:g_xp_tx[slot] transactionListCount:PLAY_PKTS
-                               firstFrameNumber:g_xp_start_frame[slot] options:IOUSBHostIsochronousTransferOptionsNone error:&e
-                              completionHandler:^(IOReturn st, IOUSBHostIsochronousTransaction *done) {
-        xp_completions++;
-        g_xp_pending[slot] = false;
-        if (atomic_load(&g_io_running) && st != kIOReturnAborted) xp_submit(slot);
-    }];
-    if (ok) g_xp_pending[slot] = true;
-    else { xp_enq_fail++; DBG_LOG("DBG xp enqueue failed: %{public}@", e); }
-}
-
-static void xp_start(void) {
-    NSError *e = nil;
-    for (int i = 0; i < XP_SLOTS; i++) {
-        if (!g_xp_buf[i]) g_xp_buf[i] = [g_play ioDataWithCapacity:PLAY_PKTS * PKT_MAX error:&e];
-        if (!g_xp_buf[i]) { xp_alloc_fail++; DBG_LOG("DBG xp ioDataWithCapacity failed: %{public}@", e); return; }
-    }
-    g_xp_next_frame = [g_dev frameNumberWithTime:NULL] + 4;
-    g_xp_next_sample = 0;
-    g_xp_acc = 0;
-    for (int i = 0; i < XP_SLOTS; i++) xp_submit(i);
-    g_xp_started = true;
-    DBG_LOG("DBG xp started: mode %d (1 late write, 2 at submit), lead %d frames, %d x 1 ms queued",
-        g_xp_mode, g_xp_lead, XP_SLOTS);
-}
-
-/* Mode 1: fill transfers that are about to start. */
-static void xp_write_due(void) {
-    if (g_xp_mode != 1) return;
-    uint64_t usb_now = [g_dev frameNumberWithTime:NULL];
-    for (int i = 0; i < XP_SLOTS; i++) {
-        if (!g_xp_pending[i] || g_xp_written[i]) continue;
-        int64_t d = (int64_t)g_xp_start_frame[i] - (int64_t)usb_now;
-        if (d > g_xp_lead) continue;
-        g_xp_written[i] = true;
-        if (d >= 1) { xp_fill(i); xp_late++; if (d < xp_min_lead_seen) xp_min_lead_seen = d; }
-        else xp_missed++;
-    }
-}
-#endif /* SL2_DEBUG: shallow-queue playback and the late-write experiment */
+#endif /* SL2_DEBUG: shallow-queue playback */
 
 /* ============================================================================
  * Deep-schedule playback
@@ -1255,10 +1148,7 @@ static void cap_submit(int idx) {
             dp_track_capture(fc, got + errored * last_n);
         }
 #if SL2_DEBUG
-        else if (g_xp_mode) {   /* late-write experiment replaces normal playback; start once the rate is measured */
-            if (!g_xp_started && !xp_alloc_fail && wp > (uint64_t)(g_sr / 2)) xp_start();
-            else if (g_xp_started) xp_write_due();
-        } else if (atomic_load(&g_play_inflight) == 0 &&
+        else if (atomic_load(&g_play_inflight) == 0 &&
             (atomic_load(&g_fifo_w) - atomic_load(&g_fifo_r)) >= (uint32_t)(atomic_load(&g_play_nxf) * PLAY_PKTS)) {
             uint64_t usb_now = [g_dev frameNumberWithTime:NULL];
             g_play_frame = usb_now + PLAY_START_MS;
@@ -1485,12 +1375,6 @@ static bool usb_open_all(void) {
     dbg_wm_last_thread = dbg_wm_high = 0;
     dp_enq_fail = dp_resync = dp_dbg_n = 0; dp_err_max = 0;
     DBG_LOG("DBG playback path for this stream: %{public}s", g_dp_stream ? "deep schedule" : "shallow queue");
-    g_xp_mode = atomic_load(&g_dbg_xp);
-    g_xp_lead = atomic_load(&g_dbg_xp_lead);
-    g_xp_started = false;
-    xp_late = xp_missed = xp_enq_fail = xp_completions = xp_resync = xp_alloc_fail = 0;
-    xp_min_lead_seen = 1 << 30;
-    for (int i = 0; i < XP_SLOTS; i++) { g_xp_buf[i] = nil; g_xp_pending[i] = false; }
 #endif
 
     io_iterator_t it = 0;
@@ -1585,9 +1469,6 @@ static void dp_release(void) {
     for (int i = 0; i < DP_SLOTS; i++) { g_dp_data[i] = nil; g_dp_ptr[i] = NULL; }
     for (int i = 0; i < DP_SCHED_N; i++) atomic_store(&g_dp_sched[i].frame, 0);
     atomic_store(&g_dp_newest, 0);
-#if SL2_DEBUG
-    for (int i = 0; i < XP_SLOTS; i++) g_xp_buf[i] = nil;   /* late-write experiment buffers, same reason */
-#endif
 }
 
 static void usb_stop_streaming(void) {
@@ -1608,11 +1489,6 @@ static void usb_stop_streaming(void) {
         DBG_LOG("DBG capture handler vs bus start of its frame (ms, bin start:count):%{public}s | "
             "min %.2f max %.2f | stack stamp min %.2f max %.2f",
             hb, dbg_capdelay_min, dbg_capdelay_max, dbg_capstamp_min, dbg_capstamp_max);
-        if (g_xp_mode)
-            DBG_LOG("DBG xp result: mode %d lead %d | late writes %u (closest %lld frames) | missed %u | "
-                "completions %u | enqueue fail %u | resyncs %u | alloc fail %u",
-                g_xp_mode, g_xp_lead, xp_late, (long long)xp_min_lead_seen, xp_missed, xp_completions,
-                xp_enq_fail, xp_resync, xp_alloc_fail);
     }
 #endif
     if (g_cpipe) [g_cpipe abortWithError:nil];
@@ -2169,7 +2045,7 @@ static OSStatus SL2_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
     if (oid == kObjDevice && addr->mSelector == kSL2PropHIDCommand) {
         if (inSize == sizeof(CFDataRef) && inData) {
             CFDataRef cd = *(CFDataRef*)inData;
-#if SL2_DEBUG   /* debug commands 0xF0-0xF4: handled here, never sent to the box */
+#if SL2_DEBUG   /* debug commands 0xF0-0xF2, 0xF4: handled here, never sent to the box */
             if (cd && CFGetTypeID(cd) == CFDataGetTypeID() && CFDataGetLength(cd) >= 6 &&
                 CFDataGetBytePtr(cd)[0] == 0xF0) {
                 /* shallow-queue playback: queue size for the next stream */
@@ -2195,14 +2071,6 @@ static OSStatus SL2_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
                 atomic_store(&g_dp_enabled, CFDataGetBytePtr(cd)[5] != 0);
                 DBG_LOG("DBG deep-schedule playback %{public}s", CFDataGetBytePtr(cd)[5] ? "on" : "off");
                 if (g_host) g_host->RequestDeviceConfigurationChange(g_host, kObjDevice, (UInt64)g_sr, NULL);
-                return 0;
-            }
-            if (cd && CFGetTypeID(cd) == CFDataGetTypeID() && CFDataGetLength(cd) >= 7 &&
-                CFDataGetBytePtr(cd)[0] == 0xF3) {
-                /* late-write experiment for the next stream */
-                atomic_store(&g_dbg_xp, CFDataGetBytePtr(cd)[5]);
-                atomic_store(&g_dbg_xp_lead, CFDataGetBytePtr(cd)[6] ? CFDataGetBytePtr(cd)[6] : 2);
-                DBG_LOG("DBG next stream: experiment mode %d, lead %d", CFDataGetBytePtr(cd)[5], CFDataGetBytePtr(cd)[6]);
                 return 0;
             }
             if (cd && CFGetTypeID(cd) == CFDataGetTypeID() && CFDataGetLength(cd) >= 6 &&
