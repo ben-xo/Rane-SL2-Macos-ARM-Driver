@@ -815,11 +815,11 @@ static void xp_write_due(void) {
  * sent: its positions move to the next frame (the audio stays continuous) and it does not count
  * as sent, so the steering makes up the frames the box missed.
  * ============================================================================ */
-#define DP_SLOTS       64          /* transfers kept queued: 64 ms */
-#define DP_SCHED_N     256         /* schedule ring entries, power of two, > DP_SLOTS */
+#define DP_SLOTS       128         /* transfers kept queued: 128 ms (the HAL writes up to ~2 IO buffers ahead) */
+#define DP_SCHED_N     512         /* schedule ring entries: power of two, >= 2 x (DP_SLOTS + HAL lead) */
 #define DP_START_LEAD  8           /* (re)anchor this many frames ahead of the bus (+4 was refused) */
 #define DP_CORR_S      1.0         /* sent-vs-captured frame difference is removed over this many seconds */
-#define DP_WRITE_GUARD 0.25        /* a frame is written only if it starts at least this many ms from now */
+#define DP_WRITE_GUARD 1.0         /* a frame is written only if it starts at least this many ms from now */
 #define DP_TRIES       4           /* enqueue attempts per call before retrying the slot later */
 
 typedef struct {
@@ -838,7 +838,7 @@ static _Atomic bool     g_dp_active;          /* WriteMix writes into the schedu
 static _Atomic int      g_dp_writers;         /* WriteMix calls currently inside dp_write */
 static _Atomic uint64_t g_dp_x0, g_dp_F0;     /* current anchor: first position / frame (read by WriteMix) */
 static bool     g_dp_stream, g_dp_started;    /* g_q only from here down */
-static uint64_t g_dp_next_frame, g_dp_next_pos, g_dp_sent_cum, g_dp_in_cum;
+static uint64_t g_dp_next_frame, g_dp_next_pos, g_dp_sent_cum, g_dp_in_cum, g_dp_last_refresh;
 static double   g_dp_acc, g_dp_err;
 /* USB frame clock: microframe g_dp_ref_uframe began at host time g_dp_ref_time (seqlock) */
 static _Atomic uint32_t g_dp_ref_seq;
@@ -862,6 +862,7 @@ static void dp_ref_refresh(void) {
     atomic_thread_fence(memory_order_release);
     g_dp_ref_uframe = uf; g_dp_ref_time = t;
     atomic_store_explicit(&g_dp_ref_seq, s + 2, memory_order_release);
+    g_dp_last_refresh = mach_absolute_time();
 }
 
 /* The microframe reference, consistently. Bounded so the IO thread never spins on a preempted
@@ -926,7 +927,7 @@ static bool dp_gone(IOReturn st) {
 static void dp_submit(int slot) {
     for (int attempt = 0; attempt < DP_TRIES; attempt++) {
         if (!atomic_load(&g_io_running) || !g_ppipe || !g_dp_ptr[slot]) return;
-        dp_ref_refresh();
+        if ((double)(mach_absolute_time() - g_dp_last_refresh) > 0.5 * ticks_per_ms()) dp_ref_refresh();
         uint64_t now_f = (uint64_t)dp_frame_at(mach_absolute_time());
         if (g_dp_next_frame < now_f + DP_START_LEAD) {
             /* The schedule ran dry: a stall longer than DP_SLOTS ms. Re-anchor ahead of the bus. */
@@ -974,7 +975,8 @@ static void dp_submit(int slot) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_MSEC), g_q, ^{ dp_submit(slot); });
 }
 
-static bool dp_start(void) {
+/* Allocate the transfer buffers (from the playback interface; dp_release frees them). */
+static bool dp_alloc(void) {
     NSError *e = nil;
     for (int i = 0; i < DP_SLOTS; i++) {
         g_dp_data[i] = [g_play ioDataWithCapacity:PLAY_PKTS * PKT_MAX error:&e];
@@ -982,6 +984,10 @@ static bool dp_start(void) {
         g_dp_ptr[i] = g_dp_data[i].mutableBytes;
     }
     for (int i = 0; i < DP_SCHED_N; i++) atomic_store(&g_dp_sched[i].frame, 0);
+    return true;
+}
+
+static void dp_start(void) {
     dp_ref_refresh();
     dp_anchor((uint64_t)dp_frame_at(mach_absolute_time()) + DP_START_LEAD);
     uint64_t F0 = atomic_load(&g_dp_F0);
@@ -991,7 +997,6 @@ static bool dp_start(void) {
     LOG("Deep-schedule playback started: frame %llu (frameNumber %llu), %d x 1 ms queued, "
         "output latency %.1f + safety %.1f ms",
         F0, [g_dev frameNumberWithTime:NULL], DP_SLOTS, DP_OUT_LATENCY_MS, DP_OUT_SAFETY_MS);
-    return true;
 }
 
 /* A capture transfer for USB frame fc delivered `got` frames. Steer the predicted OUT sizes so
@@ -1170,7 +1175,7 @@ static void cap_submit(int idx) {
         clk_track(wp, got, ts);
 
         if (g_dp_stream) {   /* deep-schedule playback: start after a few ms of capture */
-            if (!g_dp_started && wp >= (uint64_t)(8 * g_sr / 1000) && !dp_start()) g_dp_stream = false;
+            if (!g_dp_started && wp >= (uint64_t)(8 * g_sr / 1000)) dp_start();
             dp_track_capture(g_cap_xf_frame[idx], got);
         } else if (g_xp_mode) {   /* DEBUG experiment replaces normal playback; start once the rate is measured */
             if (!g_xp_started && !xp_alloc_fail && wp > (uint64_t)(g_sr / 2)) xp_start();
@@ -1430,6 +1435,7 @@ static bool usb_open_all(void) {
         LOG("Failed to open Isoch pipes");
         return false;
     }
+    if (g_dp_stream && !dp_alloc()) g_dp_stream = false;
 
     for (int i = 0; i < CAP_NXF; i++) {
         if (!g_cap_xf[i].buf) g_cap_xf[i].buf = [NSMutableData dataWithLength:CAP_PKTS * PKT_MAX];
