@@ -9,8 +9,6 @@
  *   - 4-channel 24-bit (32-bit container) / 44.1 & 48 kHz Isochronous USB Audio
  *   - Implicit-feedback packet pacing from Capture to Playback
  *   - Automatic USB Audio / Analog Thru switching on StartIO / StopIO (HID 0x41)
- *   - 0x37 challenge heartbeat every 100 ms while streaming: the SL 2 only passes
- *     USB audio to its outputs while the host keeps this traffic going
  *   - Full HID Command/Response + Unsolicited Report Queue ('sl2h', 'sl2s', 'sl2q')
  *     for Serato DJ Pro (SL2Api.framework) and Control Panel
  *   - Automatic USB Hotplug detection (plug / unplug at any time)
@@ -46,7 +44,6 @@
 #define NCH          4
 #define FRAME_BYTES  16      /* 4 ch * 4 bytes (24-bit left-justified in 32-bit int) */
 #define PKT_MAX      112     /* wMaxPacketSize of EP 0x06/0x82: 7 frames * 16 bytes per microframe */
-#define HEARTBEAT_MS 100
 #define CAP_PKTS     8       /* 1 ms per transfer */
 #define CAP_NXF      64
 #define PLAY_PKTS    8       /* 1 ms per transfer */
@@ -109,7 +106,7 @@ static os_log_t g_log;
 #define LOG(fmt, ...) os_log(g_log, "[SL2] " fmt, ##__VA_ARGS__)
 
 /* Debug build (make plugin DEBUG=1): streaming diagnostics (counters, timing histograms, periodic
-   "DBG" log lines) and the 'sl2h' debug commands 0xF2-0xF5 (input safety offset and test hooks,
+   "DBG" log lines) and the 'sl2h' debug commands 0xF2-0xF4 (input safety offset and test hooks,
    handled by the driver and never sent to the box; see dbg_command). A release build compiles
    none of it, and refuses every 'sl2h' command from 0xF0 up. */
 #ifndef SL2_DEBUG
@@ -139,7 +136,6 @@ static double   dbg_dp_err_max;
 /* Test hooks */
 static _Atomic uint32_t dbg_stall_ms;      /* 0xF3: hold the USB queue (g_q) this many ms, once */
 static _Atomic uint32_t dbg_err_pkts;      /* 0xF4: treat this many more capture packets as errored */
-static _Atomic bool     dbg_no_heartbeat;  /* 0xF5: stop sending the 0x37 heartbeat */
 
 static void dbg_reset(void) {
     memset(dbg_capdelay_hist, 0, sizeof dbg_capdelay_hist);
@@ -292,9 +288,9 @@ static uint64_t g_cap_frame = 0;
 
 /* HID state */
 static NSMutableData *g_hbuf_in;
-static _Atomic uint32_t g_seq = 1;   /* bumped by hid_cmd (any thread) and the heartbeat (g_q) */
+static _Atomic uint32_t g_seq = 1;   /* the tag of the next HID command (hid_cmd) */
 static dispatch_semaphore_t g_hid_sem;
-/* The command hid_cmd is waiting for a reply to (g_hid_mtx serialises commands; hb_read on g_q
+/* The command hid_cmd is waiting for a reply to (g_hid_mtx serialises commands; hid_read on g_q
    fills the reply and signals g_hid_sem) */
 static _Atomic bool g_waiting = false;
 static uint8_t  g_wait_cmd = 0;
@@ -302,9 +298,6 @@ static uint32_t g_wait_seq = 0;
 static uint8_t  g_reply_buf[HID_REPORT_LEN];
 static SL2StatusPacket g_st;
 
-/* 0x37 heartbeat (8 random challenge bytes, the box answers with 8 derived bytes) */
-static dispatch_source_t g_hb_timer;
-static uint32_t g_hb_seq;
 
 /* Reports for clients (see unsol_push) */
 #define UNSOL_Q_MAX   256
@@ -363,9 +356,9 @@ static void push_sr_unsol(int sr) {
  * ============================================================================ */
 
 /* Keep one read queued on the HID IN pipe (runs on g_q). Each report is either the reply hid_cmd
-   is waiting for, the reply to the driver's own heartbeat, or an unsolicited report from the box,
+   is waiting for, or an unsolicited report from the box,
    which updates the status and is queued for clients. */
-static void hb_read(void) {
+static void hid_read(void) {
     if (!g_hpipe_in || !g_hbuf_in) return;
     [g_hpipe_in enqueueIORequestWithData:g_hbuf_in completionTimeout:0 error:nil completionHandler:^(IOReturn s, NSUInteger n) {
         if (s == kIOReturnSuccess && n > 0) {
@@ -398,16 +391,15 @@ static void hb_read(void) {
                 }
                 unsol_push(b);
             }
-            /* Anything else is the heartbeat's reply or a reply that came after hid_cmd gave up:
-               not for clients. */
+            /* Anything else is a reply that came after hid_cmd gave up: not for clients. */
         }
-        if (s != kIOReturnAborted && g_hpipe_in) hb_read();
+        if (s != kIOReturnAborted && g_hpipe_in) hid_read();
     }];
 }
 
 /* Send a command and wait up to 150 ms for its reply. Every command gets one except
    SL2_CMD_NO_REPLY. The driver always tags the request with its own sequence number (so a reply can
-   never be confused with another's, e.g. the heartbeat's); client_tag, if given, is put back into
+   never be confused with another's); client_tag, if given, is put back into
    the reply returned. True if the box answered and accepted the command; reply_out then holds the
    reply, and holds the rejection (0xFF) if it refused it. */
 static bool hid_cmd(uint8_t cmd, const uint8_t *pl, size_t plen, uint8_t *reply_out, const uint8_t *client_tag) {
@@ -490,7 +482,7 @@ static void refresh_hw_status(void) {
         g_st.port_a = r[5];
         g_st.port_b = r[6];
     }
-    /* Switch and thru state arrive as unsolicited 0x40 reports (parsed in hb_read), which the box
+    /* Switch and thru state arrive as unsolicited 0x40 reports (parsed in hid_read), which the box
        sends only once 0x36 has enabled them. Then ask for a state dump (0x41 SysEx F0 17 04 F7),
        so the LINE/PHONO switch is known before it is first moved. */
     uint8_t enable[1] = { 1 };
@@ -514,40 +506,6 @@ static void set_usb_switches(bool usb_mode) {
         hid_cmd(SL2_CMD_HIDI, pl, 4, NULL, NULL);
         g_st.thru[i] = usb_mode ? 0 : 1;
     }
-}
-
-/* Heartbeat. Like the SL 3, the SL 2 answers command 0x37 (8 challenge bytes -> 8 derived
-   bytes) and keeps its decks on USB audio only while this traffic flows; without it the
-   outputs stay silent even with the thru switches off. Rane's SL2_driver_timer did this.
-   Runs on g_q every HEARTBEAT_MS while streaming. */
-static void hb_tick(void) {
-    if (!atomic_load(&g_io_running) || !g_hpipe_out) return;
-#if SL2_DEBUG
-    if (atomic_load(&dbg_no_heartbeat)) return;   /* test hook 0xF5 */
-#endif
-    uint8_t buf[64] = {0};
-    buf[0] = SL2_CMD_CHALLENGE;
-    g_hb_seq = g_seq++;
-    memcpy(buf + 1, &g_hb_seq, 4);
-    arc4random_buf(buf + 5, 8);
-    NSMutableData *d = [NSMutableData dataWithBytes:buf length:64];
-    pthread_mutex_lock(&g_hout_mtx);
-    [g_hpipe_out enqueueIORequestWithData:d completionTimeout:0 error:nil completionHandler:^(IOReturn s, NSUInteger n) { (void)s; (void)n; }];
-    pthread_mutex_unlock(&g_hout_mtx);
-}
-
-static void hb_start(void) {
-    if (g_hb_timer || !g_q) return;
-    g_hb_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, g_q);
-    dispatch_source_set_timer(g_hb_timer, dispatch_time(DISPATCH_TIME_NOW, 0), HEARTBEAT_MS * NSEC_PER_MSEC, 5 * NSEC_PER_MSEC);
-    dispatch_source_set_event_handler(g_hb_timer, ^{ hb_tick(); });
-    dispatch_resume(g_hb_timer);
-}
-
-static void hb_stop(void) {
-    if (!g_hb_timer) return;
-    dispatch_source_cancel(g_hb_timer);
-    g_hb_timer = nil;
 }
 
 static IOUSBHostPipe *copy_isoch_pipe(IOUSBHostInterface *intf, uint8_t dir, uint8_t fallback1, uint8_t fallback2) {
@@ -1204,7 +1162,7 @@ static bool usb_ensure_hid(void) {
     g_hpipe_in  = [g_hid copyPipeWithAddress:EP_HID_IN error:&e];
     if (!g_hpipe_out || !g_hpipe_in) return false;
     g_hbuf_in   = [NSMutableData dataWithLength:64];
-    hb_read();
+    hid_read();
     refresh_hw_status();
     atomic_store(&g_hw_connected, true);
     atomic_store(&g_boot_mode, false);
@@ -1297,9 +1255,8 @@ static bool usb_open_all(void) {
         if (!g_cap_xf[i].tx)  g_cap_xf[i].tx  = calloc(CAP_PKTS, sizeof(IOUSBHostIsochronousTransaction));
     }
 
-    /* Decks to USB audio, and the heartbeat. */
+    /* Decks to USB audio. */
     set_usb_switches(true);
-    hb_start();
 
     /* A new timeline and an empty capture ring. */
     memset(g_in_ring, 0, sizeof(g_in_ring));
@@ -1325,7 +1282,6 @@ static void usb_stop_streaming(bool box_attached) {
     dp_stop();   /* WriteMix stops touching the schedule */
     if (!atomic_exchange(&g_io_running, false)) return;
     atomic_fetch_add(&g_stream_gen, 1);   /* completions and retries of this stream now do nothing */
-    hb_stop();
 #if SL2_DEBUG   /* this stream's results */
     if (g_dp_started)
         DBG_LOG("DBG dp result: written %u, late %u, unscheduled %u | enqueue refused %u, resyncs %u | "
@@ -1354,7 +1310,6 @@ static void usb_stop_streaming(bool box_attached) {
 /* The box is gone: stop streaming, then release the HID side (on g_q, like the audio side). */
 static void usb_close_all(void) {
     usb_stop_streaming(false);
-    hb_stop();
     if (g_hpipe_in)  [g_hpipe_in abortWithError:nil];
     if (g_hpipe_out) [g_hpipe_out abortWithError:nil];
     if (g_q) dispatch_sync(g_q, ^{
@@ -2051,8 +2006,7 @@ static OSStatus SL2_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
      0xF2 <ms>         input safety offset (the HAL reads it only at device setup, so it applies to
                        a device set up again, not to the running one)
      0xF3 <ms hi> <lo> hold the USB queue this long, once, as a completion stall would
-     0xF4 <n>          treat the next n capture packets as errored
-     0xF5 <0|1>        1 = stop sending the 0x37 heartbeat, 0 = send it again */
+     0xF4 <n>          treat the next n capture packets as errored */
 static OSStatus dbg_command(const uint8_t *c, CFIndex len) {
     if (len < 6) return kAudioHardwareBadPropertySizeError;
     switch (c[0]) {
@@ -2070,10 +2024,6 @@ static OSStatus dbg_command(const uint8_t *c, CFIndex len) {
         case 0xF4:
             atomic_store(&dbg_err_pkts, c[5]);
             DBG_LOG("DBG next %u capture packets treated as errored", c[5]);
-            return 0;
-        case 0xF5:
-            atomic_store(&dbg_no_heartbeat, c[5] != 0);
-            DBG_LOG("DBG 0x37 heartbeat %{public}s", c[5] ? "off" : "on");
             return 0;
     }
     return kAudioHardwareIllegalOperationError;

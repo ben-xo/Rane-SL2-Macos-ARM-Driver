@@ -5,14 +5,13 @@
 //   sl2dbg stall <ms>         hold the driver's USB queue this long, once, as a stall in USB
 //                             completion delivery would
 //   sl2dbg errpkts <n>        treat the next n capture packets as errored
-//   sl2dbg heartbeat on|off   send or stop sending the 0x37 heartbeat
 #include <CoreAudio/CoreAudio.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 static int usage(void) {
-    fprintf(stderr, "usage: sl2dbg insafe <ms> | stall <ms> | errpkts <n> | heartbeat on|off\n");
+    fprintf(stderr, "usage: sl2dbg insafe <ms> | stall <ms> | errpkts <n>\n");
     return 2;
 }
 
@@ -25,7 +24,6 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "insafe"))         { cmd[0] = 0xF2; cmd[5] = (UInt8)v; }
     else if (!strcmp(argv[1], "stall"))     { cmd[0] = 0xF3; cmd[5] = (UInt8)(v >> 8); cmd[6] = (UInt8)v; }
     else if (!strcmp(argv[1], "errpkts"))   { cmd[0] = 0xF4; cmd[5] = (UInt8)v; }
-    else if (!strcmp(argv[1], "heartbeat")) { cmd[0] = 0xF5; cmd[5] = !strcmp(argv[2], "off"); }
     else return usage();
 
     // Find the driver's device by its UID.
