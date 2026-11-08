@@ -85,8 +85,9 @@ static os_log_t g_log;
 #define LOG(fmt, ...) os_log(g_log, "[SL2] " fmt, ##__VA_ARGS__)
 
 /* Debug build (make plugin DEBUG=1): streaming diagnostics (counters, timing histograms, periodic
-   "DBG" log lines) and the 'sl2h' debug command 0xF2 (intercepted, never sent to the box).
-   A release build compiles none of it. */
+   "DBG" log lines) and the 'sl2h' debug commands 0xF2-0xF5 (input safety offset and test hooks,
+   handled by the driver and never sent to the box; see dbg_command). A release build compiles
+   none of it, and refuses every 'sl2h' command from 0xF0 up. */
 #ifndef SL2_DEBUG
 #define SL2_DEBUG 0
 #endif
@@ -96,6 +97,43 @@ static os_log_t g_log;
 #else
 #define DBG_LOG(fmt, ...) do { } while (0)
 #define DBG_DO(stmt)      do { } while (0)
+#endif
+
+#if SL2_DEBUG
+/* Debug-only state. The counters and histograms describe one stream: dbg_reset clears them when
+   it starts. The test hooks are set by the 'sl2h' debug commands (dbg_command). */
+static uint32_t dbg_capdelay_hist[24];   /* capture handler time - bus start of its frame: 0.5 ms bins from -2 ms */
+static double   dbg_capdelay_min, dbg_capdelay_max, dbg_capstamp_min, dbg_capstamp_max;
+static uint32_t dbg_cap_pkt_err;         /* capture packets dropped: error status or impossible length */
+static _Atomic uint32_t dbg_dp_written, dbg_dp_late, dbg_dp_unscheduled;   /* WriteMix samples, IO thread */
+/* The HAL's WriteMix calling pattern (see SL2_DoIOOperation): thread switches, concurrent calls,
+   and samples written to positions already written */
+static _Atomic uint32_t dbg_wm_thread_switches, dbg_wm_concurrent, dbg_wm_rewritten;
+static _Atomic uint64_t dbg_wm_last_thread, dbg_wm_high;
+static uint32_t dbg_dp_enq_fail, dbg_dp_resync, dbg_dp_retry_later, dbg_dp_n;   /* deep schedule, g_q */
+static double   dbg_dp_err_max;
+/* Test hooks */
+static _Atomic uint32_t dbg_stall_ms;      /* 0xF3: hold the USB queue (g_q) this many ms, once */
+static _Atomic uint32_t dbg_err_pkts;      /* 0xF4: treat this many more capture packets as errored */
+static _Atomic bool     dbg_no_heartbeat;  /* 0xF5: stop sending the 0x37 heartbeat */
+
+static void dbg_reset(void) {
+    memset(dbg_capdelay_hist, 0, sizeof dbg_capdelay_hist);
+    dbg_capdelay_min = dbg_capstamp_min = 1e9; dbg_capdelay_max = dbg_capstamp_max = -1e9;
+    dbg_cap_pkt_err = 0;
+    dbg_dp_written = dbg_dp_late = dbg_dp_unscheduled = 0;
+    dbg_wm_thread_switches = dbg_wm_concurrent = dbg_wm_rewritten = 0;
+    dbg_wm_last_thread = dbg_wm_high = 0;
+    dbg_dp_enq_fail = dbg_dp_resync = dbg_dp_retry_later = dbg_dp_n = 0;
+    dbg_dp_err_max = 0;
+}
+
+/* Test hook 0xF4: true if this capture packet should be treated as errored. */
+static bool dbg_take_err_pkt(void) {
+    uint32_t n = atomic_load(&dbg_err_pkts);
+    while (n > 0 && !atomic_compare_exchange_weak(&dbg_err_pkts, &n, n - 1)) {}
+    return n > 0;
+}
 #endif
 
 static AudioServerPlugInHostRef g_host = NULL;
@@ -200,8 +238,6 @@ static double clk_sample_at(uint64_t t) {
 
 /* IOUSBHost state */
 static dispatch_queue_t    g_q;
-static uint32_t dbg_capdelay_hist[24];      /* capture handler time - bus start of its frame: 0.5 ms bins from -2 ms */
-static double   dbg_capdelay_min, dbg_capdelay_max, dbg_capstamp_min, dbg_capstamp_max;
 static IOUSBHostDevice    *g_dev;
 static IOUSBHostInterface *g_play, *g_cap, *g_hid;
 static IOUSBHostPipe      *g_ppipe, *g_cpipe, *g_hpipe_in, *g_hpipe_out;
@@ -406,6 +442,9 @@ static void set_usb_switches(bool usb_mode) {
    Runs on g_q every HEARTBEAT_MS while streaming. */
 static void hb_tick(void) {
     if (!atomic_load(&g_io_running) || !g_hpipe_out) return;
+#if SL2_DEBUG
+    if (atomic_load(&dbg_no_heartbeat)) return;   /* test hook 0xF5 */
+#endif
     uint8_t buf[64] = {0};
     buf[0] = 0x37;
     g_hb_seq = g_seq++;
@@ -493,9 +532,6 @@ static void clk_track(uint64_t count_before, int frames, uint64_t ts) {
 #endif
 }
 
-/* DEBUG: capture packets with an error status, per stream */
-static uint32_t dbg_cap_pkt_err;
-
 
 
 /* ============================================================================
@@ -555,14 +591,6 @@ static double   g_dp_acc, g_dp_err;
 /* USB frame clock: microframe g_dp_ref_uframe is associated with host time g_dp_ref_time (seqlock) */
 static _Atomic uint32_t g_dp_ref_seq;
 static uint64_t g_dp_ref_uframe, g_dp_ref_time;
-/* DEBUG counters */
-static _Atomic uint32_t dp_late, dp_unscheduled, dp_written;
-/* DEBUG: does the HAL call WriteMix once per IO cycle with every client mixed, or once per client
-   IO context? Thread switches, concurrent calls, and samples written to positions already written. */
-static _Atomic uint32_t dbg_wm_thread_switches, dbg_wm_concurrent, dbg_wm_rewritten;
-static _Atomic uint64_t dbg_wm_last_thread, dbg_wm_high;
-static uint32_t dp_enq_fail, dp_resync, dp_retry_later, dp_dbg_n;
-static double   dp_err_max;
 
 static double ticks_per_ms(void) {
     return 1e6 * (double)g_tb.denom / (double)g_tb.numer;
@@ -648,7 +676,7 @@ static void dp_submit(int slot) {
         if (g_dp_next_frame < now_f + DP_DRY_LEAD) {
             /* The schedule ran dry: a stall longer than DP_SLOTS ms. Re-anchor ahead of the bus. */
             dp_anchor(now_f + DP_START_LEAD);
-            DBG_DO(dp_resync++);
+            DBG_DO(dbg_dp_resync++);
         }
         uint64_t f = g_dp_next_frame++;
         DPEntry *e = &g_dp_sched[f & (DP_SCHED_N - 1)];
@@ -685,11 +713,11 @@ static void dp_submit(int slot) {
             return;
         }
         /* Refused: nothing is published, and the next frame carries these positions instead. */
-        DBG_DO(dp_enq_fail++);
+        DBG_DO(dbg_dp_enq_fail++);
         DBG_LOG("DBG dp enqueue refused for frame %llu (now ~%llu): %{public}@", f, now_f, err.localizedDescription);
     }
     /* Still refused: try this slot again shortly rather than losing it from the schedule. */
-    DBG_DO(dp_retry_later++);
+    DBG_DO(dbg_dp_retry_later++);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_MSEC), g_q, ^{ dp_submit(slot); });
 }
 
@@ -730,13 +758,13 @@ static void dp_track_capture(uint64_t fc, int frames) {
     if (atomic_load_explicit(&e->frame, memory_order_acquire) != fc) return;   /* not sent */
     g_dp_err = (double)e->sent_cum - (double)g_dp_in_cum;
 #if SL2_DEBUG   /* the deep schedule's health, every ~2 s */
-    if (fabs(g_dp_err) > dp_err_max) dp_err_max = fabs(g_dp_err);
-    if (++dp_dbg_n % 2000 == 0)
+    if (fabs(g_dp_err) > dbg_dp_err_max) dbg_dp_err_max = fabs(g_dp_err);
+    if (++dbg_dp_n % 2000 == 0)
         DBG_LOG("DBG dp: sent-captured %.1f frames (max %.1f) | written %u, late %u, unscheduled %u | "
             "enqueue refused %u, retried later %u, resyncs %u | WriteMix thread switches %u, concurrent %u, "
             "rewritten samples %u | capture packet errors %u",
-            g_dp_err, dp_err_max, atomic_load(&dp_written), atomic_load(&dp_late),
-            atomic_load(&dp_unscheduled), dp_enq_fail, dp_retry_later, dp_resync,
+            g_dp_err, dbg_dp_err_max, atomic_load(&dbg_dp_written), atomic_load(&dbg_dp_late),
+            atomic_load(&dbg_dp_unscheduled), dbg_dp_enq_fail, dbg_dp_retry_later, dbg_dp_resync,
             atomic_load(&dbg_wm_thread_switches), atomic_load(&dbg_wm_concurrent), atomic_load(&dbg_wm_rewritten),
             dbg_cap_pkt_err);
 #endif
@@ -795,7 +823,7 @@ static void dp_write(const float *buf, UInt32 frames, uint64_t pos) {
                     break;
                 }
             }
-            DBG_DO(atomic_fetch_add_explicit(&dp_unscheduled, skip, memory_order_relaxed));
+            DBG_DO(atomic_fetch_add_explicit(&dbg_dp_unscheduled, skip, memory_order_relaxed));
             i += skip;
             continue;
         }
@@ -803,7 +831,7 @@ static void dp_write(const float *buf, UInt32 frames, uint64_t pos) {
         uint32_t n = (uint32_t)(first + off[PLAY_PKTS] - p);
         if (n > frames - i) n = frames - i;
         if ((double)fg - now_f < DP_WRITE_GUARD) {
-            DBG_DO(atomic_fetch_add_explicit(&dp_late, n, memory_order_relaxed));
+            DBG_DO(atomic_fetch_add_explicit(&dbg_dp_late, n, memory_order_relaxed));
         } else {
             uint32_t j = (uint32_t)(p - first);
             int k = 0;
@@ -819,7 +847,7 @@ static void dp_write(const float *buf, UInt32 frames, uint64_t pos) {
                     memcpy(q + c * 4, &raw, 4);
                 }
             }
-            DBG_DO(atomic_fetch_add_explicit(&dp_written, n, memory_order_relaxed));
+            DBG_DO(atomic_fetch_add_explicit(&dbg_dp_written, n, memory_order_relaxed));
         }
         i += n;
     }
@@ -849,6 +877,12 @@ static void cap_submit(int idx) {
                                  error:&e
                      completionHandler:^(IOReturn st, IOUSBHostIsochronousTransaction *done) {
         if (!atomic_load(&g_io_running) || st == kIOReturnAborted) return;
+#if SL2_DEBUG
+        {   /* test hook 0xF3: hold g_q, as a stall in the USB stack's completion delivery would */
+            uint32_t ms = atomic_exchange(&dbg_stall_ms, 0);
+            if (ms) { DBG_LOG("DBG stalling the USB queue for %u ms", ms); usleep(ms * 1000); }
+        }
+#endif
         /* Times below are bus times, from the USB frame clock (dp_ref_*): a completion's own
            timeStamp is when the stack processed it, which can be many ms after the bus. */
         if ((double)(mach_absolute_time() - g_dp_last_refresh) > 0.5 * ticks_per_ms()) dp_ref_refresh();
@@ -890,7 +924,11 @@ static void cap_submit(int idx) {
             /* Drop errored packets and impossible lengths. The first completion after a
                killed helper can carry a residual from the old request (e.g. 0xFFFFFE00),
                and the frame loop must never run past the 112-byte packet. */
-            if (done[k].status != kIOReturnSuccess || done[k].completeCount > PKT_MAX) {
+            bool bad = done[k].status != kIOReturnSuccess || done[k].completeCount > PKT_MAX;
+#if SL2_DEBUG
+            if (!bad && dbg_take_err_pkt()) bad = true;   /* test hook 0xF4 */
+#endif
+            if (bad) {
                 DBG_DO(dbg_cap_pkt_err++);
                 errored++;
                 continue;
@@ -1025,15 +1063,7 @@ static bool usb_open_all(void) {
     g_dp_stream = true;
     g_dp_started = false;
     atomic_store(&g_dp_active, false);
-#if SL2_DEBUG
-    memset(dbg_capdelay_hist, 0, sizeof dbg_capdelay_hist);
-    dbg_capdelay_min = dbg_capstamp_min = 1e9; dbg_capdelay_max = dbg_capstamp_max = -1e9;
-    dp_late = dp_unscheduled = dp_written = 0;
-    dbg_wm_thread_switches = dbg_wm_concurrent = dbg_wm_rewritten = 0;
-    dbg_wm_last_thread = dbg_wm_high = 0;
-    dp_enq_fail = dp_resync = dp_retry_later = dp_dbg_n = 0; dp_err_max = 0;
-    dbg_cap_pkt_err = 0;
-#endif
+    DBG_DO(dbg_reset());
 
     io_iterator_t it = 0;
     IORegistryEntryGetChildIterator(g_dev.ioService, kIOServicePlane, &it);
@@ -1116,8 +1146,8 @@ static void usb_stop_streaming(void) {
     if (g_dp_started)
         DBG_LOG("DBG dp result: written %u, late %u, unscheduled %u | enqueue refused %u, resyncs %u | "
             "sent-captured now %.1f, max %.1f frames",
-            atomic_load(&dp_written), atomic_load(&dp_late), atomic_load(&dp_unscheduled),
-            dp_enq_fail, dp_resync, g_dp_err, dp_err_max);
+            atomic_load(&dbg_dp_written), atomic_load(&dbg_dp_late), atomic_load(&dbg_dp_unscheduled),
+            dbg_dp_enq_fail, dbg_dp_resync, g_dp_err, dbg_dp_err_max);
     {
         const uint32_t *c = dbg_capdelay_hist;
         char hb[600]; int o = 0;
@@ -1752,23 +1782,53 @@ static OSStatus SL2_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
     return kAudioHardwareUnknownPropertyError;
 }
 
+#if SL2_DEBUG
+/* 'sl2h' debug commands. Each takes its argument from byte [5] onwards:
+     0xF2 <ms>         input safety offset (the HAL reads it only at device setup, so it applies to
+                       a device set up again, not to the running one)
+     0xF3 <ms hi> <lo> hold the USB queue this long, once, as a completion stall would
+     0xF4 <n>          treat the next n capture packets as errored
+     0xF5 <0|1>        1 = stop sending the 0x37 heartbeat, 0 = send it again */
+static OSStatus dbg_command(const uint8_t *c, CFIndex len) {
+    if (len < 6) return kAudioHardwareBadPropertySizeError;
+    switch (c[0]) {
+        case 0xF2: {
+            int ms = c[5] < 1 ? 1 : c[5];
+            atomic_store(&g_in_safety_ms, ms);
+            DBG_LOG("DBG input safety offset set to %d ms (%u frames)", ms, in_safety_frames());
+            return 0;
+        }
+        case 0xF3:
+            if (len < 7) return kAudioHardwareBadPropertySizeError;
+            atomic_store(&dbg_stall_ms, ((uint32_t)c[5] << 8) | c[6]);
+            DBG_LOG("DBG next capture completion stalls the USB queue for %u ms", atomic_load(&dbg_stall_ms));
+            return 0;
+        case 0xF4:
+            atomic_store(&dbg_err_pkts, c[5]);
+            DBG_LOG("DBG next %u capture packets treated as errored", c[5]);
+            return 0;
+        case 0xF5:
+            atomic_store(&dbg_no_heartbeat, c[5] != 0);
+            DBG_LOG("DBG 0x37 heartbeat %{public}s", c[5] ? "off" : "on");
+            return 0;
+    }
+    return kAudioHardwareIllegalOperationError;
+}
+#endif
+
 static OSStatus SL2_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID oid, pid_t pid, const AudioObjectPropertyAddress *addr, UInt32 qsz, const void *qd, UInt32 inSize, const void *inData) {
     if (oid == kObjDevice && addr->mSelector == kSL2PropHIDCommand) {
         if (inSize == sizeof(CFDataRef) && inData) {
             CFDataRef cd = *(CFDataRef*)inData;
-#if SL2_DEBUG   /* debug command 0xF2: handled here, never sent to the box */
-            if (cd && CFGetTypeID(cd) == CFDataGetTypeID() && CFDataGetLength(cd) >= 6 &&
-                CFDataGetBytePtr(cd)[0] == 0xF2) {
-                /* input safety offset in ms. Of limited use: the HAL reads safety offsets only at
-                   device setup (neither PropertiesChanged nor a configuration change refreshes them),
-                   and a coreaudiod restart reloads the driver with its default. */
-                int ms = CFDataGetBytePtr(cd)[5];
-                if (ms < 1) ms = 1;
-                atomic_store(&g_in_safety_ms, ms);
-                DBG_LOG("DBG input safety offset set to %d ms (%u frames)", ms, in_safety_frames());
-                return 0;
-            }
+            /* Debug commands (0xF0 and up) are handled by the driver, never sent to the box. */
+            if (cd && CFGetTypeID(cd) == CFDataGetTypeID() && CFDataGetLength(cd) >= 1 &&
+                CFDataGetBytePtr(cd)[0] >= 0xF0) {
+#if SL2_DEBUG
+                return dbg_command(CFDataGetBytePtr(cd), CFDataGetLength(cd));
+#else
+                return kAudioHardwareIllegalOperationError;
 #endif
+            }
             if (cd && CFGetTypeID(cd) == CFDataGetTypeID() && CFDataGetLength(cd) <= 64) {
                 memset(g_last_cmd_in, 0, 64);
                 memcpy(g_last_cmd_in, CFDataGetBytePtr(cd), CFDataGetLength(cd));
