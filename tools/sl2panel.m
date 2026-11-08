@@ -6,6 +6,8 @@
  */
 #import <Foundation/Foundation.h>
 #import <CoreAudio/CoreAudio.h>
+#import <IOKit/IOKitLib.h>
+#import <IOKit/usb/IOUSBLib.h>
 
 #define kSL2PropHIDCommand  'sl2h'
 #define kSL2PropStatus      'sl2s'
@@ -37,6 +39,23 @@ static AudioObjectID find_hal_device(void) {
     UInt32 sz = sizeof(devID);
     OSStatus st = AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, sizeof(uid), &uid, &sz, &devID);
     return (st == noErr) ? devID : kAudioObjectUnknown;
+}
+
+/* An SL 2 is in the USB registry (in either mode). The driver only lists its device while a box is
+   attached, so this tells "no box" from "driver not loaded". */
+static bool sl2_on_usb(void) {
+    CFMutableDictionaryRef m = IOServiceMatching(kIOUSBDeviceClassName);
+    if (!m) return false;
+    int v = 0x1cc5, p = 0x0013;
+    CFNumberRef vn = CFNumberCreate(NULL, kCFNumberIntType, &v);
+    CFNumberRef pn = CFNumberCreate(NULL, kCFNumberIntType, &p);
+    CFDictionarySetValue(m, CFSTR(kUSBVendorID), vn);
+    CFDictionarySetValue(m, CFSTR(kUSBProductID), pn);
+    CFRelease(vn); CFRelease(pn);
+    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, m);
+    if (!svc) return false;
+    IOObjectRelease(svc);
+    return true;
 }
 
 static bool send_hidi(AudioObjectID dev, uint8_t st_byte, uint8_t note, uint8_t vel) {
@@ -71,8 +90,11 @@ static void print_status(AudioObjectID dev) {
         printf("Error: Could not read SL 2 status from CoreAudio HAL.\n");
         return;
     }
+    /* Copy what the driver sent; an older driver's packet may be shorter (no boot_mode). */
     SL2StatusPacket s;
-    memcpy(&s, CFDataGetBytePtr(d), sizeof(s));
+    memset(&s, 0, sizeof s);
+    CFIndex n = CFDataGetLength(d);
+    memcpy(&s, CFDataGetBytePtr(d), (size_t)(n < (CFIndex)sizeof s ? n : (CFIndex)sizeof s));
     CFRelease(d);
 
     printf("==================================================\n");
@@ -100,7 +122,10 @@ int main(int argc, const char *argv[]) {
     @autoreleasepool {
         AudioObjectID dev = find_hal_device();
         if (dev == kAudioObjectUnknown) {
-            printf("Error: SL 2 CoreAudio HAL driver not loaded in coreaudiod.\n");
+            if (sl2_on_usb())
+                printf("Error: an SL 2 is connected, but the SL 2 CoreAudio driver is not loaded in coreaudiod.\n");
+            else
+                printf("No SL 2 connected.\n");
             return 1;
         }
         if (argc < 2 || strcmp(argv[1], "status") == 0) {
