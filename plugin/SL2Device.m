@@ -139,7 +139,7 @@ static uint64_t g_clk_last_fix = 0;  /* captured-frame count at the last clk_tra
    most 1 ms (one transfer) ahead of the HAL's "now"; the HAL writes OUT_SAFETY_MS ahead. Both are
    reported to the HAL, so clients see the true output latency: their sum. */
 static _Atomic int g_play_nxf = PLAY_NXF;   /* transfers queued; DEBUG: settable via 'sl2h' 0xF0 */
-static _Atomic int g_in_safety_ms = 4;    /* DEBUG: settable via 'sl2h' 0xF2 (the HAL only reads it at device setup) */
+static _Atomic int g_in_safety_ms = 8;    /* DEBUG: settable via 'sl2h' 0xF2 (the HAL only reads it at device setup) */
 static UInt32 in_safety_frames(void) {
     return (UInt32)(atomic_load(&g_in_safety_ms) * g_sr / 1000.0 + 0.5);
 }
