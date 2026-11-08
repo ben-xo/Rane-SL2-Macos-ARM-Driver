@@ -139,15 +139,21 @@ static uint64_t g_clk_last_fix = 0;  /* captured-frame count at the last clk_tra
    most 1 ms (one transfer) ahead of the HAL's "now"; the HAL writes OUT_SAFETY_MS ahead. Both are
    reported to the HAL, so clients see the true output latency: their sum. */
 static _Atomic int g_play_nxf = PLAY_NXF;   /* transfers queued; DEBUG: settable via 'sl2h' 0xF0 */
-static _Atomic int g_in_safety_ms = 20;   /* DEBUG: settable via 'sl2h' 0xF2 */
+static _Atomic int g_in_safety_ms = 4;    /* DEBUG: settable via 'sl2h' 0xF2 (the HAL only reads it at device setup) */
 static UInt32 in_safety_frames(void) {
     return (UInt32)(atomic_load(&g_in_safety_ms) * g_sr / 1000.0 + 0.5);
 }
+/* Deep-schedule playback (dp_*, see "Deep-schedule playback" below) has its own output timing. */
+#define DP_OUT_SAFETY_MS  2.0
+#define DP_OUT_LATENCY_MS 1.5
+static _Atomic bool g_dp_enabled = true;    /* DEBUG: settable via 'sl2h' 0xF4; applies from the next stream */
 static UInt32 out_safety_frames(void) {
-    return (UInt32)(OUT_SAFETY_MS * g_sr / 1000.0 + 0.5);
+    double ms = atomic_load(&g_dp_enabled) ? DP_OUT_SAFETY_MS : OUT_SAFETY_MS;
+    return (UInt32)(ms * g_sr / 1000.0 + 0.5);
 }
 static UInt32 out_latency_frames(void) {
-    return (UInt32)(atomic_load(&g_play_nxf) * (PLAY_PKTS / 8) * g_sr / 1000.0 + 0.5);
+    double ms = atomic_load(&g_dp_enabled) ? DP_OUT_LATENCY_MS : atomic_load(&g_play_nxf) * (PLAY_PKTS / 8);
+    return (UInt32)(ms * g_sr / 1000.0 + 0.5);
 }
 static _Atomic uint64_t g_total_cap_frames = 0;
 static _Atomic uint64_t g_total_play_frames = 0;
@@ -212,6 +218,7 @@ typedef struct {
     IOUSBHostIsochronousTransaction *tx;
 } IsoXfer;
 static IsoXfer g_cap_xf[CAP_NXF];
+static uint64_t g_cap_xf_frame[CAP_NXF];   /* USB frame each capture transfer was scheduled for */
 static IsoXfer g_play_xf[PLAY_NXF];
 static uint64_t g_cap_frame = 0;
 static uint64_t g_play_frame = 0;
@@ -772,12 +779,248 @@ static void xp_write_due(void) {
     }
 }
 
+/* ============================================================================
+ * Deep-schedule playback
+ *
+ * USB completions can be delivered 5-30 ms late (the delay is in the USB stack, before any
+ * thread is woken, so no thread priority fixes it). So rather than filling each playback
+ * transfer when an earlier one completes, DP_SLOTS 1 ms transfers are kept queued ahead,
+ * zero-filled, and the HAL's IO thread (WriteMix) writes each sample straight into the queued
+ * transfer that will carry it, shortly before that transfer starts. This works because the
+ * controller reads a transfer's buffer when the transfer starts: audio written into a queued
+ * ioDataWithCapacity: buffer before then is what gets sent. Completions only recycle transfers
+ * at the far end of the schedule, so a stall shorter than the schedule costs nothing.
+ *
+ * Each scheduled USB frame carries a contiguous run of HAL timeline positions, published in
+ * g_dp_sched (indexed by frame number) for the IO thread to look up. The stream's first frame
+ * carries the position DP_OUT_LATENCY_MS before its own start time, and because the packet
+ * sizes follow the box's clock, every sample then plays DP_OUT_LATENCY_MS after its timeline
+ * position. The HAL writes each sample DP_OUT_SAFETY_MS ahead of "now"; their sum covers the
+ * up-to-1 ms between a sample's position and its frame's start, plus DP_WRITE_GUARD.
+ *
+ * Packet sizes are fixed when a transfer is queued, ~DP_SLOTS ms before it plays, so they cannot
+ * be copied from the matching capture packets (implicit feedback). They are predicted from the
+ * box's measured rate and steered (dp_track_capture) so that the frames sent per USB frame match
+ * the frames the box captured in the same USB frames.
+ * ============================================================================ */
+#define DP_SLOTS       64          /* transfers kept queued: 64 ms */
+#define DP_SCHED_N     256         /* schedule ring entries, power of two, > DP_SLOTS */
+#define DP_START_LEAD  4           /* the first transfer is scheduled this many frames ahead */
+#define DP_CORR_S      1.0         /* sent-vs-captured frame difference is removed over this many seconds */
+#define DP_WRITE_GUARD 0.25        /* a frame is written only if it starts at least this many ms from now */
+
+typedef struct {
+    _Atomic uint64_t frame;        /* USB frame this entry describes, 0 = none; published last */
+    uint64_t first;                /* timeline position of the frame's first sample */
+    uint16_t off[PLAY_PKTS + 1];   /* sample offset of each packet in the frame; [PLAY_PKTS] = total */
+    uint8_t *buf;                  /* the frame's transfer buffer */
+} DPEntry;
+
+static DPEntry        g_dp_sched[DP_SCHED_N];
+static NSMutableData *g_dp_data[DP_SLOTS];
+static uint8_t       *g_dp_ptr[DP_SLOTS];
+static IOUSBHostIsochronousTransaction g_dp_tx[DP_SLOTS][PLAY_PKTS];
+static _Atomic bool     g_dp_active;          /* WriteMix writes into the schedule */
+static _Atomic uint64_t g_dp_x0, g_dp_F0;     /* first position / frame of the schedule (read by WriteMix) */
+static bool     g_dp_stream, g_dp_started;    /* g_q only from here down */
+static uint64_t g_dp_next_frame, g_dp_next_pos, g_dp_in_cum;
+static double   g_dp_acc, g_dp_err;
+/* USB frame clock: microframe g_dp_ref_uframe began at host time g_dp_ref_time (seqlock) */
+static _Atomic uint32_t g_dp_ref_seq;
+static uint64_t g_dp_ref_uframe, g_dp_ref_time;
+/* DEBUG counters */
+static _Atomic uint32_t dp_late, dp_unscheduled, dp_written;
+static uint32_t dp_enq_fail, dp_resync, dp_dbg_n;
+static double   dp_err_max;
+
+static void dp_ref_refresh(void) {
+    IOUSBHostTime t = 0;
+    NSError *e = nil;
+    uint64_t uf = [g_dev currentMicroframeWithTime:&t error:&e];
+    if (!uf || !t) return;
+    atomic_fetch_add_explicit(&g_dp_ref_seq, 1, memory_order_acq_rel);
+    atomic_thread_fence(memory_order_release);
+    g_dp_ref_uframe = uf; g_dp_ref_time = t;
+    atomic_fetch_add_explicit(&g_dp_ref_seq, 1, memory_order_release);
+}
+
+/* USB frame (1 ms, fractional) at host time t. Safe on any thread. */
+static double dp_frame_at(uint64_t t) {
+    uint32_t s1, s2;
+    uint64_t uf, ut;
+    do {
+        s1 = atomic_load_explicit(&g_dp_ref_seq, memory_order_acquire);
+        uf = g_dp_ref_uframe; ut = g_dp_ref_time;
+        atomic_thread_fence(memory_order_acquire);
+        s2 = atomic_load_explicit(&g_dp_ref_seq, memory_order_relaxed);
+    } while ((s1 & 1) || s1 != s2);
+    double ticks_per_uframe = 125e3 * (double)g_tb.denom / (double)g_tb.numer;
+    return ((double)uf + ((double)t - (double)ut) / ticks_per_uframe) / 8.0;
+}
+
+/* Frames in the next OUT packet: the box's measured rate, steered by dp_track_capture. */
+static int dp_packet_frames(void) {
+    uint64_t h; double s, tpf;
+    clk_get(&h, &s, &tpf);
+    double rate = 125e3 * (double)g_tb.denom / (double)g_tb.numer / tpf;   /* frames per 125 us */
+    rate -= g_dp_err / (8000.0 * DP_CORR_S);
+    g_dp_acc += rate;
+    int n = (int)g_dp_acc;
+    g_dp_acc -= n;
+    if (n < 4) n = 4;
+    if (n > PKT_MAX / FRAME_BYTES) n = PKT_MAX / FRAME_BYTES;
+    return n;
+}
+
+/* Queue `slot` for the next frame of the schedule, zero-filled, and publish where its samples go. */
+static void dp_submit(int slot) {
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (!atomic_load(&g_io_running) || !g_ppipe) return;
+        dp_ref_refresh();
+        uint64_t now_f = (uint64_t)dp_frame_at(mach_absolute_time());
+        if (g_dp_next_frame < now_f + 2) {
+            /* The schedule ran dry (a stall longer than DP_SLOTS ms). Restart it ahead of the bus,
+               moving the positions on by the frames that will not be sent, to stay on the timeline. */
+            uint64_t to = now_f + DP_START_LEAD;
+            for (uint64_t f = g_dp_next_frame; f < to; f++)
+                for (int k = 0; k < PLAY_PKTS; k++) g_dp_next_pos += dp_packet_frames();
+            g_dp_next_frame = to;
+            dp_resync++;
+        }
+        uint64_t f = g_dp_next_frame++;
+        DPEntry *e = &g_dp_sched[f & (DP_SCHED_N - 1)];
+        atomic_store_explicit(&e->frame, 0, memory_order_release);   /* unpublish while it is rewritten */
+        uint16_t off = 0;
+        for (int k = 0; k < PLAY_PKTS; k++) {
+            int n = dp_packet_frames();
+            e->off[k] = off;
+            g_dp_tx[slot][k] = (IOUSBHostIsochronousTransaction){
+                .requestCount = (uint32_t)(n * FRAME_BYTES), .offset = (uint32_t)(k * PKT_MAX) };
+            off += n;
+        }
+        e->off[PLAY_PKTS] = off;
+        e->first = g_dp_next_pos;
+        g_dp_next_pos += off;
+        e->buf = g_dp_ptr[slot];
+        memset(g_dp_ptr[slot], 0, PLAY_PKTS * PKT_MAX);
+        atomic_store_explicit(&e->frame, f, memory_order_release);
+
+        NSError *err = nil;
+        BOOL ok = [g_ppipe enqueueIORequestWithData:g_dp_data[slot] transactionList:g_dp_tx[slot]
+                               transactionListCount:PLAY_PKTS firstFrameNumber:f
+                                            options:IOUSBHostIsochronousTransferOptionsNone error:&err
+                                  completionHandler:^(IOReturn st, IOUSBHostIsochronousTransaction *done) {
+            if (atomic_load(&g_io_running) && st != kIOReturnAborted) dp_submit(slot);
+        }];
+        if (ok) return;
+        atomic_store_explicit(&e->frame, 0, memory_order_release);
+        dp_enq_fail++;
+        LOG("DBG dp enqueue refused for frame %llu (now ~%llu): %{public}@", f, now_f, err.localizedDescription);
+    }
+}
+
+static bool dp_start(void) {
+    NSError *e = nil;
+    for (int i = 0; i < DP_SLOTS; i++) {
+        g_dp_data[i] = [g_play ioDataWithCapacity:PLAY_PKTS * PKT_MAX error:&e];
+        if (!g_dp_data[i]) { LOG("Deep-schedule playback: buffer allocation failed: %{public}@", e); return false; }
+        g_dp_ptr[i] = g_dp_data[i].mutableBytes;
+    }
+    for (int i = 0; i < DP_SCHED_N; i++) atomic_store(&g_dp_sched[i].frame, 0);
+    dp_ref_refresh();
+    double ticks_per_ms = 1e6 * (double)g_tb.denom / (double)g_tb.numer;
+    double now_f = dp_frame_at(mach_absolute_time());
+    uint64_t F0 = (uint64_t)now_f + DP_START_LEAD;
+    /* timeline position at the start of frame F0, less the output latency */
+    uint64_t t_F0 = mach_absolute_time() + (uint64_t)(((double)F0 - now_f) * ticks_per_ms);
+    double x0 = clk_sample_at(t_F0) - DP_OUT_LATENCY_MS * g_sr / 1000.0;
+    g_dp_next_frame = F0;
+    g_dp_next_pos = x0 > 0 ? (uint64_t)x0 : 0;
+    g_dp_acc = 0; g_dp_err = 0; g_dp_in_cum = 0;
+    atomic_store(&g_dp_F0, F0);
+    atomic_store(&g_dp_x0, g_dp_next_pos);
+    atomic_store_explicit(&g_dp_active, true, memory_order_release);
+    for (int i = 0; i < DP_SLOTS; i++) dp_submit(i);
+    g_dp_started = true;
+    LOG("Deep-schedule playback started: frame %llu (frameNumber %llu), %d x 1 ms queued, "
+        "output latency %.1f + safety %.1f ms",
+        F0, [g_dev frameNumberWithTime:NULL], DP_SLOTS, DP_OUT_LATENCY_MS, DP_OUT_SAFETY_MS);
+    return true;
+}
+
+/* A capture transfer for USB frame fc delivered `got` frames. Steer the predicted OUT sizes so
+   that the frames sent through each USB frame track the frames the box captured through it. */
+static void dp_track_capture(uint64_t fc, int got) {
+    if (!g_dp_started || fc < atomic_load(&g_dp_F0)) return;
+    g_dp_in_cum += got;
+    DPEntry *e = &g_dp_sched[fc & (DP_SCHED_N - 1)];
+    if (atomic_load_explicit(&e->frame, memory_order_acquire) != fc) return;
+    double sent = (double)(e->first + e->off[PLAY_PKTS] - atomic_load(&g_dp_x0));
+    g_dp_err = sent - (double)g_dp_in_cum;
+    if (fabs(g_dp_err) > dp_err_max) dp_err_max = fabs(g_dp_err);
+    if (++dp_dbg_n % 2000 == 0)   /* DEBUG */
+        LOG("DBG dp: sent-captured %.1f frames (max %.1f) | written %u, late %u, unscheduled %u | "
+            "enqueue refused %u, resyncs %u",
+            g_dp_err, dp_err_max, atomic_load(&dp_written), atomic_load(&dp_late),
+            atomic_load(&dp_unscheduled), dp_enq_fail, dp_resync);
+}
+
+/* WriteMix, on the HAL's IO thread: write the mix straight into the queued transfers. Lock-free;
+   no IOKit calls. Samples whose frame has already started, or is not yet scheduled, are dropped. */
+static void dp_write(const float *buf, UInt32 frames, uint64_t pos) {
+    double now_f = dp_frame_at(mach_absolute_time());
+    uint64_t x0 = atomic_load(&g_dp_x0), F0 = atomic_load(&g_dp_F0);
+    double per_frame = g_sr / 1000.0;
+    int64_t fg = (int64_t)F0 + (int64_t)(((double)pos - (double)x0) / per_frame);
+    UInt32 i = 0;
+    while (i < frames) {
+        uint64_t p = pos + i;
+        DPEntry *e = NULL;
+        uint64_t first = 0;
+        uint32_t total = 0;
+        for (int tries = 0; tries < 6 && fg >= 0; tries++) {
+            DPEntry *c = &g_dp_sched[(uint64_t)fg & (DP_SCHED_N - 1)];
+            if (atomic_load_explicit(&c->frame, memory_order_acquire) != (uint64_t)fg) break;
+            first = c->first; total = c->off[PLAY_PKTS];
+            if (p < first) { fg--; continue; }
+            if (p >= first + total) { fg++; continue; }
+            e = c;
+            break;
+        }
+        if (!e) { atomic_fetch_add_explicit(&dp_unscheduled, 1, memory_order_relaxed); i++; continue; }
+        uint32_t n = (uint32_t)(first + total - p);
+        if (n > frames - i) n = frames - i;
+        if ((double)fg - now_f < DP_WRITE_GUARD) {
+            atomic_fetch_add_explicit(&dp_late, n, memory_order_relaxed);
+        } else {
+            uint32_t j = (uint32_t)(p - first);
+            int k = 0;
+            for (uint32_t s = 0; s < n; s++, j++) {
+                while (k < PLAY_PKTS - 1 && j >= e->off[k + 1]) k++;
+                uint8_t *q = e->buf + k * PKT_MAX + (j - e->off[k]) * FRAME_BYTES;
+                const float *src = buf + (size_t)(i + s) * NCH;
+                for (int c = 0; c < NCH; c++) {
+                    float v = src[c];
+                    if (v > 1.0f) v = 1.0f;
+                    else if (v < -1.0f) v = -1.0f;
+                    int32_t raw = (int32_t)(v * 2147483392.0f);
+                    memcpy(q + c * 4, &raw, 4);
+                }
+            }
+            atomic_fetch_add_explicit(&dp_written, n, memory_order_relaxed);
+        }
+        i += n;
+        fg++;
+    }
+}
+
 static void cap_submit(int idx) {
     if (!atomic_load(&g_io_running) || !g_cpipe) return;
     IsoXfer *xf = &g_cap_xf[idx];
     IOUSBHostIsochronousTransaction *tx = xf->tx;
     uint64_t f = g_cap_frame;
     g_cap_frame += CAP_PKTS / 8;
+    g_cap_xf_frame[idx] = f;
 
     for (int k = 0; k < CAP_PKTS; k++) {
         tx[k] = (IOUSBHostIsochronousTransaction){
@@ -853,7 +1096,10 @@ static void cap_submit(int idx) {
         }
         clk_track(wp, got, ts);
 
-        if (g_xp_mode) {   /* DEBUG experiment replaces normal playback; start once the rate is measured */
+        if (g_dp_stream) {   /* deep-schedule playback: start after a few ms of capture */
+            if (!g_dp_started && wp >= (uint64_t)(8 * g_sr / 1000) && !dp_start()) g_dp_stream = false;
+            dp_track_capture(g_cap_xf_frame[idx], got);
+        } else if (g_xp_mode) {   /* DEBUG experiment replaces normal playback; start once the rate is measured */
             if (!g_xp_started && !xp_alloc_fail && wp > (uint64_t)(g_sr / 2)) xp_start();
             else if (g_xp_started) xp_write_due();
         } else if (atomic_load(&g_play_inflight) == 0 &&
@@ -1065,6 +1311,12 @@ static bool usb_open_all(void) {
         g_stream_rt ? "requested" : "off", atomic_load(&g_play_nxf));
     memset(dbg_margin_hist, 0, sizeof dbg_margin_hist);
     memset(dbg_capdelay_hist, 0, sizeof dbg_capdelay_hist);
+    g_dp_stream = atomic_load(&g_dp_enabled);
+    g_dp_started = false;
+    atomic_store(&g_dp_active, false);
+    dp_late = dp_unscheduled = dp_written = 0;   /* DEBUG */
+    dp_enq_fail = dp_resync = dp_dbg_n = 0; dp_err_max = 0;
+    LOG("DBG playback path for this stream: %{public}s", g_dp_stream ? "deep schedule" : "shallow queue");
     g_xp_mode = atomic_load(&g_dbg_xp);   /* DEBUG experiment */
     g_xp_lead = atomic_load(&g_dbg_xp_lead);
     g_xp_started = false;
@@ -1144,8 +1396,14 @@ static bool usb_open_all(void) {
 }
 
 static void usb_stop_streaming(void) {
+    atomic_store_explicit(&g_dp_active, false, memory_order_release);   /* WriteMix stops touching the schedule */
     if (!atomic_exchange(&g_io_running, false)) return;
     hb_stop();
+    if (g_dp_started)   /* DEBUG */
+        LOG("DBG dp result: written %u, late %u, unscheduled %u | enqueue refused %u, resyncs %u | "
+            "sent-captured now %.1f, max %.1f frames",
+            atomic_load(&dp_written), atomic_load(&dp_late), atomic_load(&dp_unscheduled),
+            dp_enq_fail, dp_resync, g_dp_err, dp_err_max);
     {   /* DEBUG: this stream's timing histograms */
         const uint32_t *m = dbg_margin_hist, *c = dbg_capdelay_hist;
         LOG("DBG hist play margin (frames) <0:%u 0:%u 1:%u 2:%u 3:%u 4:%u 5:%u >=6:%u | "
@@ -1728,6 +1986,15 @@ static OSStatus SL2_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
                 LOG("DBG next stream: queue mode %d, realtime %d", CFDataGetBytePtr(cd)[5], CFDataGetBytePtr(cd)[6]);
                 return 0;
             }
+            if (cd && CFGetTypeID(cd) == CFDataGetTypeID() && CFDataGetLength(cd) >= 6 &&
+                CFDataGetBytePtr(cd)[0] == 0xF4) {
+                /* DEBUG (temporary): deep-schedule playback on/off; the HAL re-reads the output
+                   latency and safety offset through a (no-op) configuration change */
+                atomic_store(&g_dp_enabled, CFDataGetBytePtr(cd)[5] != 0);
+                LOG("DBG deep-schedule playback %{public}s", CFDataGetBytePtr(cd)[5] ? "on" : "off");
+                if (g_host) g_host->RequestDeviceConfigurationChange(g_host, kObjDevice, (UInt64)g_sr, NULL);
+                return 0;
+            }
             if (cd && CFGetTypeID(cd) == CFDataGetTypeID() && CFDataGetLength(cd) >= 7 &&
                 CFDataGetBytePtr(cd)[0] == 0xF3) {
                 /* DEBUG (temporary): late-write experiment for the next stream */
@@ -1831,6 +2098,10 @@ static OSStatus SL2_DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID oi
         }
     } else if (op == kAudioServerPlugInIOOperationWriteMix) {
         uint64_t pos = (uint64_t)ci->mOutputTime.mSampleTime;
+        if (atomic_load_explicit(&g_dp_active, memory_order_acquire)) {
+            dp_write(buf, frames, pos);
+            return 0;
+        }
         for (UInt32 f = 0; f < frames; f++) {
             uint32_t idx = ((uint32_t)((pos + f) & RING_MASK)) * NCH;
             for (int c = 0; c < NCH; c++) {
