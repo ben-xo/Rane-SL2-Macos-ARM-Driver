@@ -838,7 +838,8 @@ static uint8_t       *g_dp_ptr[DP_SLOTS];
 static IOUSBHostIsochronousTransaction g_dp_tx[DP_SLOTS][PLAY_PKTS];
 static _Atomic bool     g_dp_active;          /* WriteMix writes into the schedule */
 static _Atomic int      g_dp_writers;         /* WriteMix calls currently inside dp_write */
-static _Atomic uint64_t g_dp_x0, g_dp_F0;     /* current anchor: first position / frame (read by WriteMix) */
+static _Atomic uint64_t g_dp_x0, g_dp_F0;     /* current anchor: first position / frame */
+static _Atomic uint64_t g_dp_newest;          /* newest published frame: where WriteMix starts looking */
 static bool     g_dp_stream, g_dp_started;    /* g_q only from here down */
 static uint64_t g_dp_next_frame, g_dp_next_pos, g_dp_sent_cum, g_dp_in_cum, g_dp_last_refresh;
 static double   g_dp_acc, g_dp_err;
@@ -966,6 +967,7 @@ static void dp_submit(int slot) {
             g_dp_sent_cum += off;
             e->sent_cum = g_dp_sent_cum;
             atomic_store_explicit(&e->frame, f, memory_order_release);   /* publish */
+            atomic_store_explicit(&g_dp_newest, f, memory_order_release);
             return;
         }
         /* Refused: nothing is published, and the next frame carries these positions instead. */
@@ -1034,11 +1036,17 @@ static bool dp_entry_get(uint64_t f, uint64_t *first, uint16_t off[PLAY_PKTS + 1
 /* WriteMix, on the HAL's IO thread: write the mix straight into the queued transfers. Lock-free;
    no IOKit calls. Samples whose frame starts too soon, or is not queued, are dropped. */
 static void dp_write(const float *buf, UInt32 frames, uint64_t pos) {
-    /* Where to start looking: the frame found last time (this thread only), so the estimate never
-       drifts from the schedule; re-seeded from the anchor when it changes. */
-    static __thread uint64_t hint_frame, hint_first, hint_anchor;
-    uint64_t F0 = atomic_load(&g_dp_F0);
-    if (hint_anchor != F0) { hint_anchor = F0; hint_frame = F0; hint_first = atomic_load(&g_dp_x0); }
+    /* Where to start looking: the newest published frame. It is at most DP_SLOTS frames from any
+       frame WriteMix can still write, so a nominal-rate estimate from it is off by well under a
+       frame whatever the box's clock error, on every IO thread (the HAL can run more than one, for
+       example when another app plays to the device). */
+    uint64_t hint_frame = atomic_load_explicit(&g_dp_newest, memory_order_acquire), hint_first = 0;
+    {
+        uint16_t o[PLAY_PKTS + 1]; uint8_t *b;
+        if (!hint_frame || !dp_entry_get(hint_frame, &hint_first, o, &b)) {
+            hint_frame = atomic_load(&g_dp_F0); hint_first = atomic_load(&g_dp_x0);
+        }
+    }
     double now_f = dp_frame_at(mach_absolute_time());
     double per_frame = g_sr / 1000.0;
     UInt32 i = 0;
@@ -1511,6 +1519,7 @@ static void dp_stop(void) {
 static void dp_release(void) {
     for (int i = 0; i < DP_SLOTS; i++) { g_dp_data[i] = nil; g_dp_ptr[i] = NULL; }
     for (int i = 0; i < DP_SCHED_N; i++) atomic_store(&g_dp_sched[i].frame, 0);
+    atomic_store(&g_dp_newest, 0);
     for (int i = 0; i < XP_SLOTS; i++) g_xp_buf[i] = nil;   /* DEBUG experiment buffers, same reason */
 }
 
