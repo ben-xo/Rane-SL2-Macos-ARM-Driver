@@ -139,11 +139,11 @@ velocity `0x40`):
 |------|-----------|---------|
 | `0x5C` / `0x5D` | a `0x41` message changes it, or on a state dump | deck 1 / deck 2 analogue thru (On = thru on) |
 | `0x60` | input PC7 changes (debounced), or on a state dump | state of PC7 |
-| `0x61` | input PE0 changes, or on a state dump | state of PE0 |
+| `0x61` | input PE0 changes, or on a state dump | the LINE/PHONO switch (one, for both decks): On = phono |
 
 These reports are sent **only after `0x36` has enabled them**; until then, queued messages
 are discarded. The bootstrap contains the same sender but nothing in it ever queues a
-message. What PC7 and PE0 are wired to on the board was not traced.
+message. PE0 is the LINE/PHONO switch (verified on the hardware by flipping it); what PC7 is wired to was not traced.
 
 ## Running-firmware hardware map (as far as traced)
 
@@ -156,7 +156,7 @@ message. What PC7 and PE0 are wired to on the board was not traced.
 | PC5 | out (only in `0x16`) | pulsed low after disconnecting in `0x16`; most likely resets the FX2 so it reboots from EEPROM |
 | PC6, PE4, PE5 | out | audio clock / power: PE4 = 44.1 kHz, PE5 = 48 kHz; all raised when powering down |
 | PC7 | in | unknown input (debounced, 6 ms); reported as note `0x60`; decides the thru default and whether the audio side is powered down on suspend |
-| PE0 | in | unknown input; reported as note `0x61`; a change also sends the word `0x8000` to the FPGA |
+| PE0 | in | the LINE/PHONO switch; reported as note `0x61` (On = phono); a change also sends the word `0x8000` to the FPGA |
 | PE1, PE2 | out | deck 2 / deck 1 analogue thru |
 | PE6 | out | select line for 16-bit writes to the FPGA over serial port 0 |
 | serial port 0 | out | FPGA configuration data and clock (LSB first), then 16-bit FPGA writes |

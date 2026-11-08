@@ -285,10 +285,13 @@ static void hb_read(void) {
                         uint8_t note = b[6 + i + 1];
                         uint8_t vel = b[6 + i + 2];
                         int on = ((st & 0xF0) == 0x90) ? 1 : 0;
+                        (void)vel;   /* always 0x40 in the box's reports */
                         if (note >= 0x5C && note <= 0x5D) {
                             g_st.thru[note - 0x5C] = on;
-                        } else if (note == 0x61 && vel < 4) {
-                            g_st.phono[vel] = on;
+                        } else if (note == 0x61) {
+                            /* the box's one LINE/PHONO switch (firmware input PE0), shared by both
+                               decks: On = phono */
+                            g_st.phono[0] = g_st.phono[1] = on;
                         }
                     }
                 } else if (b[0] == 0x45) {
@@ -363,6 +366,13 @@ static void refresh_hw_status(void) {
         g_st.port_a = r[5];
         g_st.port_b = r[6];
     }
+    /* Switch and thru state arrive as unsolicited 0x40 reports (parsed in hb_read), which the box
+       sends only once 0x36 has enabled them. Then ask for a state dump (0x41 SysEx F0 17 04 F7),
+       so the LINE/PHONO switch is known before it is first moved. */
+    uint8_t enable[1] = { 1 };
+    hid_cmd(0x36, enable, 1, NULL, NULL);
+    uint8_t dump[5] = { 4, 0xF0, 0x17, 0x04, 0xF7 };
+    hid_cmd(0x41, dump, 5, NULL, NULL);
 }
 
 static void send_hw_samplerate(int sr) {
