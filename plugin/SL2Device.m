@@ -163,14 +163,23 @@ static double nominal_tpf(void) {
     return ((1e9 / g_sr) * (double)g_tb.denom) / (double)g_tb.numer;
 }
 
+/* Read the timeline consistently. Bounded, because the HAL's IO thread reads it: if the writer is
+   preempted mid-update, after 64 tries use this thread's last good copy rather than spin. */
 static void clk_get(uint64_t *host, double *sample, double *tpf) {
-    uint32_t s1, s2;
-    do {
-        s1 = atomic_load_explicit(&g_clk_seq, memory_order_acquire);
-        *host = g_clk_host; *sample = g_clk_sample; *tpf = g_clk_tpf;
+    static __thread uint64_t last_h;
+    static __thread double last_s, last_tpf;
+    for (int i = 0; i < 64; i++) {
+        uint32_t s1 = atomic_load_explicit(&g_clk_seq, memory_order_acquire);
+        uint64_t h = g_clk_host; double s = g_clk_sample, t = g_clk_tpf;
         atomic_thread_fence(memory_order_acquire);
-        s2 = atomic_load_explicit(&g_clk_seq, memory_order_relaxed);
-    } while ((s1 & 1) || s1 != s2);
+        uint32_t s2 = atomic_load_explicit(&g_clk_seq, memory_order_relaxed);
+        if (!(s1 & 1) && s1 == s2) {
+            last_h = *host = h; last_s = *sample = s; last_tpf = *tpf = t;
+            return;
+        }
+    }
+    *host = last_h; *sample = last_s;
+    *tpf = last_tpf > 0 ? last_tpf : nominal_tpf();
 }
 
 static void clk_set(uint64_t host, double sample, double tpf) {
@@ -834,36 +843,48 @@ static _Atomic uint32_t dp_late, dp_unscheduled, dp_written;
 static uint32_t dp_enq_fail, dp_resync, dp_dbg_n;
 static double   dp_err_max;
 
+static double ticks_per_ms(void) {
+    return 1e6 * (double)g_tb.denom / (double)g_tb.numer;
+}
+
 static void dp_ref_refresh(void) {
     IOUSBHostTime t = 0;
     NSError *e = nil;
     uint64_t uf = [g_dev currentMicroframeWithTime:&t error:&e];
     if (!uf || !t) return;
-    atomic_fetch_add_explicit(&g_dp_ref_seq, 1, memory_order_acq_rel);
+    uint32_t s = atomic_load_explicit(&g_dp_ref_seq, memory_order_relaxed);
+    atomic_store_explicit(&g_dp_ref_seq, s + 1, memory_order_relaxed);
     atomic_thread_fence(memory_order_release);
     g_dp_ref_uframe = uf; g_dp_ref_time = t;
-    atomic_fetch_add_explicit(&g_dp_ref_seq, 1, memory_order_release);
+    atomic_store_explicit(&g_dp_ref_seq, s + 2, memory_order_release);
+}
+
+/* The microframe reference, consistently. Bounded so the IO thread never spins on a preempted
+   writer: after 64 tries it uses this thread's last good copy. */
+static void dp_ref_get(uint64_t *uf, uint64_t *ut) {
+    static __thread uint64_t last_uf, last_ut;
+    for (int i = 0; i < 64; i++) {
+        uint32_t s1 = atomic_load_explicit(&g_dp_ref_seq, memory_order_acquire);
+        uint64_t a = g_dp_ref_uframe, b = g_dp_ref_time;
+        atomic_thread_fence(memory_order_acquire);
+        uint32_t s2 = atomic_load_explicit(&g_dp_ref_seq, memory_order_relaxed);
+        if (!(s1 & 1) && s1 == s2) { last_uf = *uf = a; last_ut = *ut = b; return; }
+    }
+    *uf = last_uf; *ut = last_ut;
 }
 
 /* USB frame (1 ms, fractional) at host time t. Safe on any thread. */
 static double dp_frame_at(uint64_t t) {
-    uint32_t s1, s2;
     uint64_t uf, ut;
-    do {
-        s1 = atomic_load_explicit(&g_dp_ref_seq, memory_order_acquire);
-        uf = g_dp_ref_uframe; ut = g_dp_ref_time;
-        atomic_thread_fence(memory_order_acquire);
-        s2 = atomic_load_explicit(&g_dp_ref_seq, memory_order_relaxed);
-    } while ((s1 & 1) || s1 != s2);
-    double ticks_per_uframe = 125e3 * (double)g_tb.denom / (double)g_tb.numer;
-    return ((double)uf + ((double)t - (double)ut) / ticks_per_uframe) / 8.0;
+    dp_ref_get(&uf, &ut);
+    return ((double)uf + ((double)t - (double)ut) / (ticks_per_ms() / 8.0)) / 8.0;
 }
 
 /* Frames in the next OUT packet: the box's measured rate, steered by dp_track_capture. */
 static int dp_packet_frames(void) {
     uint64_t h; double s, tpf;
     clk_get(&h, &s, &tpf);
-    double rate = 125e3 * (double)g_tb.denom / (double)g_tb.numer / tpf;   /* frames per 125 us */
+    double rate = (ticks_per_ms() / 8.0) / tpf;   /* frames per 125 us microframe */
     rate -= g_dp_err / (8000.0 * DP_CORR_S);
     g_dp_acc += rate;
     int n = (int)g_dp_acc;
@@ -890,7 +911,9 @@ static void dp_submit(int slot) {
         }
         uint64_t f = g_dp_next_frame++;
         DPEntry *e = &g_dp_sched[f & (DP_SCHED_N - 1)];
-        atomic_store_explicit(&e->frame, 0, memory_order_release);   /* unpublish while it is rewritten */
+        /* unpublish while it is rewritten (seqlock writer) */
+        atomic_store_explicit(&e->frame, 0, memory_order_relaxed);
+        atomic_thread_fence(memory_order_release);
         uint16_t off = 0;
         for (int k = 0; k < PLAY_PKTS; k++) {
             int n = dp_packet_frames();
@@ -966,6 +989,17 @@ static void dp_track_capture(uint64_t fc, int got) {
             atomic_load(&dp_unscheduled), dp_enq_fail, dp_resync);
 }
 
+/* Read schedule entry for frame f consistently (seqlock reader). False if f is not published. */
+static bool dp_entry_get(uint64_t f, uint64_t *first, uint16_t off[PLAY_PKTS + 1], uint8_t **buf) {
+    DPEntry *c = &g_dp_sched[f & (DP_SCHED_N - 1)];
+    if (atomic_load_explicit(&c->frame, memory_order_acquire) != f) return false;
+    *first = c->first;
+    memcpy(off, c->off, sizeof c->off);
+    *buf = c->buf;
+    atomic_thread_fence(memory_order_acquire);
+    return atomic_load_explicit(&c->frame, memory_order_relaxed) == f;
+}
+
 /* WriteMix, on the HAL's IO thread: write the mix straight into the queued transfers. Lock-free;
    no IOKit calls. Samples whose frame starts too soon, or is not queued, are dropped. */
 static void dp_write(const float *buf, UInt32 frames, uint64_t pos) {
@@ -980,26 +1014,25 @@ static void dp_write(const float *buf, UInt32 frames, uint64_t pos) {
     while (i < frames) {
         uint64_t p = pos + i;
         int64_t fg = (int64_t)hint_frame + (int64_t)floor(((double)p - (double)hint_first) / per_frame);
-        DPEntry *e = NULL;
         uint64_t first = 0;
-        uint32_t total = 0;
+        uint16_t off[PLAY_PKTS + 1];
+        uint8_t *fbuf = NULL;
+        bool found = false;
         for (int tries = 0; tries < 8 && fg > 0; tries++) {
-            DPEntry *c = &g_dp_sched[(uint64_t)fg & (DP_SCHED_N - 1)];
-            if (atomic_load_explicit(&c->frame, memory_order_acquire) != (uint64_t)fg) break;
-            first = c->first; total = c->off[PLAY_PKTS];
+            if (!dp_entry_get((uint64_t)fg, &first, off, &fbuf)) break;
             if (p < first) { fg--; continue; }
-            if (p >= first + total) { fg++; continue; }
-            e = c;
+            if (p >= first + off[PLAY_PKTS]) { fg++; continue; }
+            found = true;
             break;
         }
-        if (!e) {
+        if (!found) {
             /* Frame fg is not queued (refused, or beyond the schedule). Drop only up to the next
                queued frame's samples; if none is near, drop the rest of this buffer. */
             uint32_t skip = frames - i;
             for (int64_t g = fg + 1; g > 0 && g <= fg + 4; g++) {
-                DPEntry *c = &g_dp_sched[(uint64_t)g & (DP_SCHED_N - 1)];
-                if (atomic_load_explicit(&c->frame, memory_order_acquire) == (uint64_t)g && c->first > p) {
-                    if (c->first - p < skip) skip = (uint32_t)(c->first - p);
+                uint64_t f2; uint16_t o2[PLAY_PKTS + 1]; uint8_t *b2;
+                if (dp_entry_get((uint64_t)g, &f2, o2, &b2) && f2 > p) {
+                    if (f2 - p < skip) skip = (uint32_t)(f2 - p);
                     break;
                 }
             }
@@ -1008,7 +1041,7 @@ static void dp_write(const float *buf, UInt32 frames, uint64_t pos) {
             continue;
         }
         hint_frame = (uint64_t)fg; hint_first = first;
-        uint32_t n = (uint32_t)(first + total - p);
+        uint32_t n = (uint32_t)(first + off[PLAY_PKTS] - p);
         if (n > frames - i) n = frames - i;
         if ((double)fg - now_f < DP_WRITE_GUARD) {
             atomic_fetch_add_explicit(&dp_late, n, memory_order_relaxed);
@@ -1016,8 +1049,8 @@ static void dp_write(const float *buf, UInt32 frames, uint64_t pos) {
             uint32_t j = (uint32_t)(p - first);
             int k = 0;
             for (uint32_t s = 0; s < n; s++, j++) {
-                while (k < PLAY_PKTS - 1 && j >= e->off[k + 1]) k++;
-                uint8_t *q = e->buf + k * PKT_MAX + (j - e->off[k]) * FRAME_BYTES;
+                while (k < PLAY_PKTS - 1 && j >= off[k + 1]) k++;
+                uint8_t *q = fbuf + k * PKT_MAX + (j - off[k]) * FRAME_BYTES;
                 const float *src = buf + (size_t)(i + s) * NCH;
                 for (int c = 0; c < NCH; c++) {
                     float v = src[c];
