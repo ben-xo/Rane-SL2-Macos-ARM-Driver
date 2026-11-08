@@ -22,7 +22,8 @@ SL 4 drivers, which share much of this architecture.
 
 ## Results
 
-The measurements use a loopback cable from Left Deck Out L to Left Deck In L (line level), 44.1 kHz.
+The measurements use a loopback cable from Left Deck Out L to Left Deck In L (line level), at 44.1 kHz
+unless noted.
 
 - **Unreported latency** is the delay beyond what the HAL's timestamps account for, found by playing clicks
   and locating them in the captured input (`tools/latency/rtlat.c`).
@@ -34,6 +35,7 @@ The measurements use a loopback cable from Left Deck Out L to Left Deck In L (li
 | Baseline (`0672a0e`, before the latency work) | 128 frames | 76 ms | ~105 ms | — |
 | Shallow queue, aligned timeline, 3 transfers | 128 frames | 4.2 ms | ~32 ms | dropouts about once a minute |
 | **Deep schedule with late writes** (this design), measured | 128 frames | 2.8 ms | **18.6 ms** | **none in 10 min, idle and all cores loaded** |
+| Deep schedule, 48 kHz, release build | 128 frames | 2.7 ms | **18.0 ms** | none in a 10 s check, idle |
 | Deep schedule, Serato "USB buffer size" 1 ms | ~1 ms | — | **≈15 ms** (calculated) | none heard; driver counters clean |
 
 **Blind test.** Serato DJ was run with real decks and timecode, with USB buffer size at 1 ms. The two builds,
@@ -558,5 +560,3 @@ Each was removed from the tip in its own commit.
 - Possibly lowering the input safety offset further. Capture data is written to memory on time and only the
   completion is late, so a real-time thread could detect it by marking each capture buffer's padding bytes.
   Untested.
-- Testing at 48 kHz (the latency figures) and on another USB controller or a dock (the late-write guard
-  and latency).
