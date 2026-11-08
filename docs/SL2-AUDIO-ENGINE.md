@@ -263,8 +263,9 @@ shift it slightly. Only 44.1 kHz has been measured.
   calls as Serato makes them: the hardware-check answer, the state dump through the callback, and each
   deck's thru switched and restored. Serato 2.5.5 is Intel-only, so run it as `arch -x86_64 ./sl2apitest`
   as well as natively.
-- Tested with Rane's control panel and `sl2apitest` (both slices). **Not yet tested with Serato DJ Pro
-  2.5.5.**
+- Tested with Rane's control panel, `sl2apitest` (both slices), and Serato DJ Pro 2.5.5 with turntables on
+  macOS 27: the hardware check passes, Rel/Abs are unlocked, thru switches per deck, and an unplug and
+  replug is picked up again.
 
 ## Platform facts worth knowing
 
@@ -293,7 +294,7 @@ Entries refer to the [bug catalogue](#bug-catalogue).
 |---|---|
 | **Directly**: shared code or a shared HAL/USB pattern | 1 sample-rate handshake; 2 fixed timeline anchor; 4 clock tracking; 5, 31 reporting real latency (measure with `rtlat`); 15 bus time; 19, 20 capture gaps filled with silence; 21 ReadInput's write head; 22, 23 teardown on the USB queue and stream generations; 24, 25 failed opens and unplug while streaming; 26 opening at connect; 27 property buffer sizes; 28 the `sl2h` passthrough; 30 the zero-timestamp period; 39 the status frame count; 35 device listed only while attached; 38 retry a refused first open |
 | **With the deep schedule** (late writes into queued transfers) | 7, 9, 10, 11, 12, 13, 14, 16, 17, 18 |
-| **SL 2 only, or check on the SL 3/SL 4 first** | 8 input safety value (measure); 29 the heartbeat (check the SL 3/SL 4 firmware); 36 LINE/PHONO report (note `0x61`); 37 thru at connect (board input PC7); 32–34, 40–42 SL2Api, `sl2panel` and the test tools (each device's API has its own signatures; the SL 3 uses `0x10` for its version) |
+| **SL 2 only, or check on the SL 3/SL 4 first** | 8 input safety value (measure); 29 the heartbeat (check the SL 3/SL 4 firmware); 36 LINE/PHONO report (note `0x61`); 37 thru at connect (board input PC7); 32–34, 40–43 SL2Api, `sl2panel` and the test tools (each device's API has its own signatures; the SL 3 uses `0x10` for its version) |
 
 ## Bug catalogue
 
@@ -477,8 +478,8 @@ build; *(hook)* uses `tools/latency/bin/sl2dbg`.
     - Cause: `SL2_driver_timer` and `SL2_send_hidimsg` had the wrong signatures (and most other exports had
       wrong signatures or return codes), written without Rane's framework to compare against.
     - Fix: every export matches Rane's; the control panel's disconnect event; the latency slider.
-    - Test: a client calling the seven functions Serato imports with Rane's signatures; Rane's control panel.
-      Serato 2.5.5 itself: not yet tested.
+    - Test: `sl2apitest` (the seven functions Serato imports, called as Serato does); Rane's control panel;
+      Serato DJ Pro 2.5.5 with turntables (the hardware check passes, Rel/Abs unlock, per-deck thru).
     - `014a0b2`.
 33. **`RH_get_all_controls` sent `0x42`, which the firmware doesn't implement.**
     - Fix: the state-dump SysEx, as Rane's does. `7c14d7a`.
@@ -500,6 +501,14 @@ build; *(hook)* uses `tools/latency/bin/sl2dbg`.
 41. **`sl2panel` said "driver not loaded" with the box just unplugged.** `3c5b37e`.
 42. **Test scripts passed silently against a release build, and the release build forwarded debug commands to
     the box.** `cde1bd7`.
+43. **After an unplug and replug, Serato DJ Pro 2.5.5 lost the SL 2 until it was restarted.**
+    - Cause: Serato watches USB itself and sends its hardware check about 25 ms after the box appears,
+      before the driver has opened the box and listed its device; SL2Api answered 12 (not connected), and
+      Serato doesn't retry.
+    - Fix: SL2Api waits up to 2 s for the device while the box is in the USB registry and the driver is
+      loaded.
+    - Test: replug with Serato 2.5.5 open; it picks the box up again (SL2Api's log shows the wait).
+      `de68e8d`.
 
 ## Testing
 
@@ -549,5 +558,5 @@ Each was removed from the tip in its own commit.
 - Possibly lowering the input safety offset further. Capture data is written to memory on time and only the
   completion is late, so a real-time thread could detect it by marking each capture buffer's padding bytes.
   Untested.
-- Testing with Serato DJ Pro 2.5.5 (the SL2Api fixes), at 48 kHz (the latency figures), and on another USB
-  controller or a dock (the late-write guard and latency).
+- Testing at 48 kHz (the latency figures) and on another USB controller or a dock (the late-write guard
+  and latency).
