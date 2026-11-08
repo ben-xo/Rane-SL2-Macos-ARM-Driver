@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+    body {
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+        font-size: 13px;
+        line-height: 1.5;
+        color: #222222;
+        margin: 0;
+        padding: 8px 14px;
+    }
+    @media (prefers-color-scheme: dark) {
+        body { color: #eaeaea; }
+        .card { background: rgba(255,255,255,0.06) !important; border-color: rgba(255,255,255,0.12) !important; }
+        .badge { background: #00d2ff !important; color: #0b111e !important; }
+        .footer { border-color: rgba(255,255,255,0.12) !important; color: #b0b8c4 !important; }
+    }
+    h1 {
+        font-size: 20px;
+        font-weight: 700;
+        margin: 0 0 4px 0;
+        letter-spacing: -0.3px;
+    }
+    .subtitle {
+        font-size: 12px;
+        opacity: 0.75;
+        margin-bottom: 14px;
+    }
+    .badge {
+        display: inline-block;
+        background: #007aff;
+        color: #ffffff;
+        font-size: 10px;
+        font-weight: 700;
+        padding: 2px 7px;
+        border-radius: 4px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        margin-bottom: 8px;
+    }
+    .card {
+        background: rgba(0,0,0,0.04);
+        border: 1px solid rgba(0,0,0,0.08);
+        border-radius: 8px;
+        padding: 10px 14px;
+        margin: 10px 0;
+    }
+    .card h3 {
+        margin: 0 0 6px 0;
+        font-size: 13px;
+        font-weight: 600;
+    }
+    ul {
+        margin: 0;
+        padding-left: 18px;
+    }
+    li {
+        margin-bottom: 4px;
+    }
+    .footer {
+        margin-top: 16px;
+        padding-top: 10px;
+        border-top: 1px solid rgba(0,0,0,0.1);
+        font-size: 11.5px;
+        color: #555555;
+    }
+    a {
+        color: #0096ff;
+        text-decoration: none;
+        font-weight: 600;
+    }
+</style>
+</head>
+<body>
+    <div class="badge">Apple Silicon M1 / M2 / M3 / M4 &amp; Intel</div>
+    <h1>Rane SL 2 — Native CoreAudio HAL Driver</h1>
+    <div class="subtitle">Version 1.0.0 &bull; macOS Big Sur, Monterey, Ventura, Sonoma &amp; Sequoia</div>
+
+    <p>Welcome to the modern user-space macOS driver installer for the <strong>Rane SL 2</strong> USB 2.0 DJ Audio Interface. This package replaces the discontinued legacy Kernel Extension (<code>.kext</code>) with a native Apple Silicon &amp; Intel CoreAudio HAL Plug-In.</p>
+
+    <div class="card">
+        <h3>What Will Be Installed:</h3>
+        <ul>
+            <li><strong>SL2Device.driver</strong> &mdash; 4-Channel (4 In / 4 Out) 24-bit @ 44.1 / 48 kHz CoreAudio HAL Plug-In with Implicit Feedback clock sync.</li>
+            <li><strong>SL2Api.framework</strong> &mdash; Universal bridge allowing <strong>Serato DJ Pro 2.5.5</strong> and the Rane Control Panel to communicate with the SL 2 without a kernel extension.</li>
+            <li><strong>SL 2 Audio Control Panel</strong> &mdash; System Settings panel &amp; <code>sl2panel</code> CLI utility for switching Phono / Line inputs and Analog Thru.</li>
+        </ul>
+    </div>
+
+    <p><strong>No Reduced Security or kext approval required:</strong> Because this driver runs 100% in user space via Apple's modern <code>IOUSBHost</code> framework, your Mac's security settings remain intact and no system reboot is required.</p>
+
+    <div class="footer">
+        Developed &amp; Packaged by <strong>Pepe Lee DJ</strong><br>
+        &#127760; <a href="https://pepeleedj.com">pepeleedj.com</a> &nbsp;|&nbsp;
+        &#128247; Instagram: <a href="https://instagram.com/pepe_lee_dj">@pepe_lee_dj</a>
+    </div>
+</body>
+</html>
