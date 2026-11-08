@@ -1205,6 +1205,32 @@ static void note_bootloader_device(void) {
         "audio until the box's firmware is restored.");
 }
 
+static dispatch_queue_t g_hotplug_q;
+
+/* Open a newly attached box and, with no stream running, put its decks on analogue thru (the box
+   powers up with thru on or off depending on a board input), as at stream stop, so turntables
+   reach the mixer until an app streams. The first open can be refused ("exclusive open of usb
+   object failed") while macOS is still setting the box up, about 1 connect in 30: retry for
+   about a second. */
+#define CONNECT_TRIES    10
+#define CONNECT_RETRY_MS 100
+static void connect_box(int attempt) {
+    if (!atomic_load(&g_box_present)) return;   /* unplugged meanwhile */
+    pthread_mutex_lock(&g_mutex);
+    bool ok = usb_ensure_hid();
+    if (ok && !atomic_load(&g_io_running)) set_usb_switches(false);
+    pthread_mutex_unlock(&g_mutex);
+    if (ok) {
+        if (attempt > 0) LOG("Rane SL 2 opened on attempt %d", attempt + 1);
+        return;
+    }
+    if (attempt + 1 < CONNECT_TRIES)
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, CONNECT_RETRY_MS * NSEC_PER_MSEC), g_hotplug_q,
+                       ^{ connect_box(attempt + 1); });
+    else
+        LOG("Rane SL 2: could not open the box after %d attempts", CONNECT_TRIES);
+}
+
 static void on_usb_added(void *refcon, io_iterator_t iter) {
     io_service_t s;
     bool audio = false, bootloader = false;
@@ -1219,12 +1245,7 @@ static void on_usb_added(void *refcon, io_iterator_t iter) {
         atomic_store(&g_boot_mode, false);
         atomic_store(&g_box_present, true);
         LOG("Rane SL 2 USB connected");
-        pthread_mutex_lock(&g_mutex);
-        /* The box powers up with thru on or off depending on a board input; with no stream
-           running, put the decks on analogue thru, as at stream stop, so turntables reach the
-           mixer until an app streams. */
-        if (usb_ensure_hid() && !atomic_load(&g_io_running)) set_usb_switches(false);
-        pthread_mutex_unlock(&g_mutex);
+        connect_box(0);
     }
     if (bootloader) {
         atomic_store(&g_boot_mode, true);
@@ -1254,7 +1275,7 @@ static void on_usb_removed(void *refcon, io_iterator_t iter) {
 }
 
 static void start_hotplug_monitor(void) {
-    dispatch_queue_t hq = dispatch_queue_create("com.rane.sl2.hotplug", DISPATCH_QUEUE_SERIAL);
+    dispatch_queue_t hq = g_hotplug_q = dispatch_queue_create("com.rane.sl2.hotplug", DISPATCH_QUEUE_SERIAL);
     g_notify_port = IONotificationPortCreate(kIOMainPortDefault);
     IONotificationPortSetDispatchQueue(g_notify_port, hq);
 
