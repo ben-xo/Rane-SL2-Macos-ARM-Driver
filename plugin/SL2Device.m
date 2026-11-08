@@ -1940,7 +1940,13 @@ static OSStatus get_property_data(AudioServerPlugInDriverRef d, AudioObjectID oi
                 *(UInt32*)outData = (oid == kObjStreamIn) ? kAudioStreamTerminalTypeLine : kAudioStreamTerminalTypeSpeaker;
                 *outSize = sizeof(UInt32); return 0;
             case kAudioStreamPropertyStartingChannel: *(UInt32*)outData = 1; *outSize = sizeof(UInt32); return 0;
-            case kAudioStreamPropertyLatency: *(UInt32*)outData = 32; *outSize = sizeof(UInt32); return 0;
+            case kAudioStreamPropertyLatency:
+                /* Clients add device and stream latency. With 32 frames on the output stream and
+                   none on the input, the device's total (66 + 32 out, 32 in = 130 frames, 2.95 ms
+                   at 44.1 kHz) matches the round trip measured through a loopback cable (rtlat:
+                   2.8 ms), slightly over rather than under. */
+                *(UInt32*)outData = (oid == kObjStreamOut) ? 32 : 0;
+                *outSize = sizeof(UInt32); return 0;
             case kAudioStreamPropertyVirtualFormat:
             case kAudioStreamPropertyPhysicalFormat:
                 fill_asbd((AudioStreamBasicDescription*)outData, g_sr);
