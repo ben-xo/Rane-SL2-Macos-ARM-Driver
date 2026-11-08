@@ -178,12 +178,8 @@ static bool hal_get_status(SL2StatusPacket *outSt) {
     return ok;
 }
 
-/* A box is attached: per the driver's status, or (without the driver) in the USB registry. */
-static bool is_usb_present(void) {
-    /* Ask the driver first. */
-    SL2StatusPacket st;
-    if (hal_get_status(&st) && st.connected) return true;
-    /* Otherwise look in the USB registry for a device with the SL 2's vendor and product IDs. */
+/* A box with the SL 2's vendor and product IDs is in the USB registry. */
+static bool in_usb_registry(void) {
     CFMutableDictionaryRef m = IOServiceMatching(kIOUSBDeviceClassName);
     if (!m) return false;
     int v = VID, p = PID;
@@ -198,12 +194,51 @@ static bool is_usb_present(void) {
     return false;
 }
 
+/* A box is attached: per the driver's status, or (without the driver) in the USB registry. */
+static bool is_usb_present(void) {
+    SL2StatusPacket st;
+    if (hal_get_status(&st) && st.connected) return true;
+    return in_usb_registry();
+}
+
+/* The SL 2 HAL plug-in is loaded in coreaudiod. */
+static bool driver_loaded(void) {
+    AudioObjectPropertyAddress a = { kAudioHardwarePropertyTranslateBundleIDToPlugIn, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    CFStringRef bundle = CFSTR("io.github.pepeleedj.sl2device");
+    AudioObjectID plugin = kAudioObjectUnknown;
+    UInt32 sz = sizeof plugin;
+    return AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, sizeof bundle, &bundle, &sz, &plugin) == noErr &&
+           plugin != kAudioObjectUnknown;
+}
+
+/* The driver's device, ready for commands (it has opened the box). Just after the box is plugged
+   in, it is in the USB registry before the driver has opened it and listed its device: usually
+   tens of milliseconds, about a second if macOS refuses the first open. A client that watches USB
+   itself can call in that window (Serato DJ Pro 2.5.5 sends its hardware check about 25 ms after
+   the box appears, and does not retry), so while the box is in the registry and the driver is
+   loaded, wait for the device, up to READY_WAIT_MS. */
+#define READY_WAIT_MS 2000
+#define READY_POLL_MS 20
+static AudioObjectID ready_hal_device(void) {
+    for (int waited = 0; ; waited += READY_POLL_MS) {
+        /* Ready: the device is listed and the driver reports the box open. */
+        AudioObjectID dev = find_hal_device();
+        SL2StatusPacket st;
+        if (dev != kAudioObjectUnknown && hal_get_status(&st) && st.connected) return dev;
+        /* Not ready, and not about to be (no box, or no driver to open it), or waited long enough. */
+        if (waited >= READY_WAIT_MS || !in_usb_registry() || !driver_loaded()) return kAudioObjectUnknown;
+        if (waited == 0) TRACE(": the box is attached but the driver has not opened it yet: waiting");
+        usleep(READY_POLL_MS * 1000);
+    }
+}
+
 /* Send one HID command through the driver and get the box's reply. RH_OK (reply_out holds the
    reply, which is SL2_REJECTED if the box refused the command), RH_ERR_NOT_CONNECTED or
    RH_ERR_NO_REPLY. */
 static int send_hid_cmd(uint8_t cmd, const uint8_t *args, size_t nargs, uint8_t *reply_out) {
-    /* No driver device means no box; otherwise take the lock so each command gets its own reply. */
-    AudioObjectID dev = find_hal_device();
+    /* No driver device (after waiting for one that is on its way) means no box; otherwise take the
+       lock so each command gets its own reply. */
+    AudioObjectID dev = ready_hal_device();
     if (dev == kAudioObjectUnknown) return RH_ERR_NOT_CONNECTED;
     pthread_mutex_lock(&g_lock);
 
