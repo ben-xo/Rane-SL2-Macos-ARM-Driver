@@ -848,6 +848,10 @@ static _Atomic uint32_t g_dp_ref_seq;
 static uint64_t g_dp_ref_uframe, g_dp_ref_time;
 /* DEBUG counters */
 static _Atomic uint32_t dp_late, dp_unscheduled, dp_written;
+/* DEBUG: does the HAL call WriteMix once per IO cycle with every client mixed, or once per client
+   IO context? Thread switches, concurrent calls, and samples written to positions already written. */
+static _Atomic uint32_t dbg_wm_thread_switches, dbg_wm_concurrent, dbg_wm_rewritten;
+static _Atomic uint64_t dbg_wm_last_thread, dbg_wm_high;
 static uint32_t dp_enq_fail, dp_resync, dp_retry_later, dp_dbg_n;
 static double   dp_err_max;
 
@@ -1017,9 +1021,11 @@ static void dp_track_capture(uint64_t fc, int frames) {
     if (fabs(g_dp_err) > dp_err_max) dp_err_max = fabs(g_dp_err);
     if (++dp_dbg_n % 2000 == 0)   /* DEBUG */
         LOG("DBG dp: sent-captured %.1f frames (max %.1f) | written %u, late %u, unscheduled %u | "
-            "enqueue refused %u, retried later %u, resyncs %u",
+            "enqueue refused %u, retried later %u, resyncs %u | WriteMix thread switches %u, concurrent %u, "
+            "rewritten samples %u",
             g_dp_err, dp_err_max, atomic_load(&dp_written), atomic_load(&dp_late),
-            atomic_load(&dp_unscheduled), dp_enq_fail, dp_retry_later, dp_resync);
+            atomic_load(&dp_unscheduled), dp_enq_fail, dp_retry_later, dp_resync,
+            atomic_load(&dbg_wm_thread_switches), atomic_load(&dbg_wm_concurrent), atomic_load(&dbg_wm_rewritten));
 }
 
 /* Read schedule entry for frame f consistently (seqlock reader). False if f is not published. */
@@ -1425,6 +1431,8 @@ static bool usb_open_all(void) {
     g_dp_started = false;
     atomic_store(&g_dp_active, false);
     dp_late = dp_unscheduled = dp_written = 0;   /* DEBUG */
+    dbg_wm_thread_switches = dbg_wm_concurrent = dbg_wm_rewritten = 0;
+    dbg_wm_last_thread = dbg_wm_high = 0;
     dp_enq_fail = dp_resync = dp_dbg_n = 0; dp_err_max = 0;
     LOG("DBG playback path for this stream: %{public}s", g_dp_stream ? "deep schedule" : "shallow queue");
     g_xp_mode = atomic_load(&g_dbg_xp);   /* DEBUG experiment */
@@ -2232,8 +2240,20 @@ static OSStatus SL2_DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID oi
         uint64_t pos = (uint64_t)ci->mOutputTime.mSampleTime;
         /* Register as a writer before checking g_dp_active, so dp_stop either sees this call
            or this call sees the schedule switched off. */
-        atomic_fetch_add_explicit(&g_dp_writers, 1, memory_order_seq_cst);
+        int writers = atomic_fetch_add_explicit(&g_dp_writers, 1, memory_order_seq_cst);
         if (atomic_load_explicit(&g_dp_active, memory_order_seq_cst)) {
+            {   /* DEBUG: WriteMix calling pattern */
+                uint64_t tid = (uint64_t)pthread_mach_thread_np(pthread_self());
+                if (atomic_exchange_explicit(&dbg_wm_last_thread, tid, memory_order_relaxed) != tid)
+                    atomic_fetch_add_explicit(&dbg_wm_thread_switches, 1, memory_order_relaxed);
+                if (writers > 0) atomic_fetch_add_explicit(&dbg_wm_concurrent, 1, memory_order_relaxed);
+                uint64_t hi = atomic_load_explicit(&dbg_wm_high, memory_order_relaxed);
+                if (pos < hi) {
+                    uint64_t over = hi - pos;
+                    atomic_fetch_add_explicit(&dbg_wm_rewritten, (uint32_t)(over < frames ? over : frames), memory_order_relaxed);
+                }
+                if (pos + frames > hi) atomic_store_explicit(&dbg_wm_high, pos + frames, memory_order_relaxed);
+            }
             dp_write(buf, frames, pos);
             atomic_fetch_sub_explicit(&g_dp_writers, 1, memory_order_release);
             return 0;
