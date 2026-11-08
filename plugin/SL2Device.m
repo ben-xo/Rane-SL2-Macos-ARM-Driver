@@ -50,13 +50,8 @@
 #define CAP_PKTS     8       /* 1 ms per transfer */
 #define CAP_NXF      64
 #define PLAY_PKTS    8       /* 1 ms per transfer */
-#define PLAY_NXF     20
-#define PLAY_START_MS 24     /* first playback transfer is scheduled this many USB frames (ms) ahead */
-#define PLAY_MIN_LEAD 2      /* a playback transfer is never scheduled closer than this to the current USB frame */
-#define OUT_SAFETY_MS 2      /* how far ahead of "now" the HAL writes output: one 1 ms transfer + 1 ms headroom */
 #define RING_FRAMES  65536   /* ~1.36s @ 48kHz */
 #define RING_MASK    (RING_FRAMES - 1)
-#define FIFO_N       2048
 
 /* Custom CoreAudio Property Selectors */
 #define kSL2PropHIDCommand  'sl2h'   /* CFDataRef (64B cmd in -> 64B reply out) */
@@ -90,8 +85,7 @@ static os_log_t g_log;
 #define LOG(fmt, ...) os_log(g_log, "[SL2] " fmt, ##__VA_ARGS__)
 
 /* Debug build (make plugin DEBUG=1): streaming diagnostics (counters, timing histograms, periodic
-   "DBG" log lines), the 'sl2h' debug commands 0xF0, 0xF2 and 0xF4 (intercepted, never sent to the
-   box), and the shallow-queue playback path, kept as a selectable alternative for comparison.
+   "DBG" log lines) and the 'sl2h' debug command 0xF2 (intercepted, never sent to the box).
    A release build compiles none of it. */
 #ifndef SL2_DEBUG
 #define SL2_DEBUG 0
@@ -117,9 +111,8 @@ static _Atomic bool g_hw_connected = false;
 static _Atomic bool g_boot_mode = false;     /* a bootloader-mode box (no firmware) is attached */
 static uint32_t g_ref_count = 0;
 
-/* Ring buffers (Float32 interleaved, NCH channels) */
+/* Capture ring buffer (Float32 interleaved, NCH channels), indexed by timeline position */
 static float g_in_ring[RING_FRAMES * NCH];
-static float g_out_ring[RING_FRAMES * NCH];
 
 /* The HAL's timeline (GetZeroTimeStamp), as a line: sample g_clk_sample at host time g_clk_host,
    advancing one sample every g_clk_tpf host ticks. It starts at sample 0 when streaming starts and
@@ -132,7 +125,7 @@ static float g_out_ring[RING_FRAMES * NCH];
 
    Capture begins some milliseconds after the timeline starts: the first captured frame sits at
    the timeline position matching its arrival (g_cap_base), and the box's rate is measured from
-   that frame's time (g_rate_anchor). These, g_play_base and g_clk_last_fix are touched only on g_q. */
+   that frame's time (g_rate_anchor). These and g_clk_last_fix are touched only on g_q. */
 #define CLK_FIX_FRAMES 2048
 #define CLK_CORR_S     2.0
 static mach_timebase_info_data_t g_tb;
@@ -142,30 +135,21 @@ static double   g_clk_sample = 0;
 static double   g_clk_tpf = 0;
 static uint64_t g_rate_anchor = 0;
 static uint64_t g_cap_base = 0;
-static uint64_t g_play_base = 0;     /* timeline position playback starts reading from */
 static uint64_t g_clk_last_fix = 0;  /* captured-frame count at the last clk_track correction */
 
-/* Output timing. With g_play_nxf 1 ms transfers queued, a transfer is filled when the one
-   g_play_nxf before it completes, about g_play_nxf ms before it plays. Reading each frame
-   out_latency_frames() (g_play_nxf ms) after its timeline position puts the end of each read at
-   most 1 ms (one transfer) ahead of the HAL's "now"; the HAL writes OUT_SAFETY_MS ahead. Both are
-   reported to the HAL, so clients see the true output latency: their sum. */
-static _Atomic int g_play_nxf = PLAY_NXF;   /* transfers queued; DEBUG: settable via 'sl2h' 0xF0 */
 static _Atomic int g_in_safety_ms = 8;    /* DEBUG: settable via 'sl2h' 0xF2 (the HAL only reads it at device setup) */
 static UInt32 in_safety_frames(void) {
     return (UInt32)(atomic_load(&g_in_safety_ms) * g_sr / 1000.0 + 0.5);
 }
-/* Deep-schedule playback (dp_*, see "Deep-schedule playback" below) has its own output timing. */
+/* Output timing, reported to the HAL (see "Deep-schedule playback" below): every sample plays
+   DP_OUT_LATENCY_MS after its timeline position, and the HAL writes DP_OUT_SAFETY_MS ahead. */
 #define DP_OUT_SAFETY_MS  2.0
 #define DP_OUT_LATENCY_MS 1.5
-static _Atomic bool g_dp_enabled = true;    /* DEBUG: settable via 'sl2h' 0xF4; applies from the next stream */
 static UInt32 out_safety_frames(void) {
-    double ms = atomic_load(&g_dp_enabled) ? DP_OUT_SAFETY_MS : OUT_SAFETY_MS;
-    return (UInt32)(ms * g_sr / 1000.0 + 0.5);
+    return (UInt32)(DP_OUT_SAFETY_MS * g_sr / 1000.0 + 0.5);
 }
 static UInt32 out_latency_frames(void) {
-    double ms = atomic_load(&g_dp_enabled) ? DP_OUT_LATENCY_MS : atomic_load(&g_play_nxf) * (PLAY_PKTS / 8);
-    return (UInt32)(ms * g_sr / 1000.0 + 0.5);
+    return (UInt32)(DP_OUT_LATENCY_MS * g_sr / 1000.0 + 0.5);
 }
 static _Atomic uint64_t g_total_cap_frames = 0;
 static _Atomic uint64_t g_total_play_frames = 0;
@@ -213,15 +197,8 @@ static double clk_sample_at(uint64_t t) {
     return s + ((double)t - (double)h) / tpf;
 }
 
-/* Implicit feedback packet-size FIFO */
-static int g_fifo[FIFO_N];
-static _Atomic uint32_t g_fifo_w = 0;
-static _Atomic uint32_t g_fifo_r = 0;
-static uint32_t g_faccum = 0;
-
 /* IOUSBHost state */
 static dispatch_queue_t    g_q;
-static uint32_t dbg_margin_hist[8];         /* playback submit margin: <0, 0, 1, ..., 5, >=6 frames */
 static uint32_t dbg_capdelay_hist[24];      /* capture handler time - bus start of its frame: 0.5 ms bins from -2 ms */
 static double   dbg_capdelay_min, dbg_capdelay_max, dbg_capstamp_min, dbg_capstamp_max;
 static IOUSBHostDevice    *g_dev;
@@ -235,10 +212,7 @@ typedef struct {
 } IsoXfer;
 static IsoXfer g_cap_xf[CAP_NXF];
 static uint64_t g_cap_xf_frame[CAP_NXF];   /* USB frame each capture transfer was scheduled for */
-static IsoXfer g_play_xf[PLAY_NXF];
 static uint64_t g_cap_frame = 0;
-static uint64_t g_play_frame = 0;
-static _Atomic int g_play_inflight = 0;
 
 /* HID state */
 static NSMutableData *g_hbuf_in;
@@ -508,197 +482,10 @@ static void clk_track(uint64_t count_before, int frames, uint64_t ts) {
 #endif
 }
 
-/* DEBUG (temporary): playback/capture health counters, reset per stream, logged every ~2 s */
-static uint32_t dbg_late, dbg_enq_fail, dbg_play_st_err, dbg_play_pkt_err, dbg_fifo_empty, dbg_cap_pkt_err;
-static uint32_t dbg_aborted, dbg_restarts, dbg_skipped_ms;
-/* DEBUG: are USB completions really serialised on g_q? */
-static int dbg_q_key;
-static _Atomic int dbg_in_handler;
-static _Atomic uint32_t dbg_overlap, dbg_off_queue;
-static _Atomic uint64_t dbg_last_play_done;
-static bool     dbg_slot_pending[PLAY_NXF];
-static uint32_t dbg_enq_ok, dbg_completions, dbg_double_done, dbg_reuse_pending;
-static void dbg_enter(void) {
-#if SL2_DEBUG
-    if (atomic_fetch_add(&dbg_in_handler, 1) > 0) atomic_fetch_add(&dbg_overlap, 1);
-    if (!dispatch_get_specific(&dbg_q_key)) atomic_fetch_add(&dbg_off_queue, 1);
-#endif
-}
-static void dbg_leave(void) {
-#if SL2_DEBUG
-    atomic_fetch_sub(&dbg_in_handler, 1);
-#endif
-}
-static int64_t  dbg_min_margin = 1 << 30;
-static int      dbg_enq_err_code;
+/* DEBUG: capture packets with an error status, per stream */
+static uint32_t dbg_cap_pkt_err;
 
 
-#if SL2_DEBUG
-/* ============================================================================
- * Shallow-queue playback (debug builds only; selectable with 'sl2h' 0xF4 for comparison).
- * Each playback transfer is filled from g_out_ring when the one g_play_nxf before it completes.
- * Superseded by deep-schedule playback (below), which survives the USB completion stalls this
- * path cannot: see docs/SL2-AUDIO-ENGINE.md.
- * ============================================================================ */
-
-/* Frames for the next playback packet (one USB microframe): the size the box used for the
-   matching capture packet (implicit feedback), or the nominal rate if none is queued. */
-static int play_packet_frames(void) {
-    int n;
-    uint32_t r = atomic_load_explicit(&g_fifo_r, memory_order_relaxed);
-    uint32_t w = atomic_load_explicit(&g_fifo_w, memory_order_acquire);
-    if (r < w) {
-        n = g_fifo[r % FIFO_N];
-        atomic_store_explicit(&g_fifo_r, r + 1, memory_order_release);
-    } else {
-        dbg_fifo_empty++;   /* DEBUG */
-        g_faccum += (uint32_t)g_sr;
-        n = g_faccum / 8000;
-        g_faccum %= 8000;
-    }
-    if (n < 4) n = 5;
-    if (n * FRAME_BYTES > PKT_MAX) n = PKT_MAX / FRAME_BYTES;
-    return n;
-}
-
-static void play_submit(int idx);
-
-static void play_submit_try(int idx, int attempt) {
-    if (!atomic_load(&g_io_running) || !g_ppipe) return;
-    IsoXfer *xf = &g_play_xf[idx];
-    uint8_t *buf = xf->buf.mutableBytes;
-    IOUSBHostIsochronousTransaction *tx = xf->tx;
-    uint64_t f = g_play_frame;
-    g_play_frame += PLAY_PKTS / 8;
-
-    /* A transfer has to be scheduled in the future. If the completion that triggered this one was
-       delivered late (the USB queue stalled), its frame may already have passed and the enqueue
-       would be refused, ending this transfer chain. Schedule it PLAY_MIN_LEAD frames from now
-       instead, and skip the audio for the frames that will not be played, so playback stays
-       aligned with the timeline. */
-    int64_t margin = (int64_t)f - (int64_t)[g_dev frameNumberWithTime:NULL];
-    if (margin < dbg_min_margin) dbg_min_margin = margin;   /* DEBUG */
-    dbg_margin_hist[margin < 0 ? 0 : margin >= 6 ? 7 : margin + 1]++;
-    if (margin < PLAY_MIN_LEAD) {
-        uint64_t skip = (uint64_t)(PLAY_MIN_LEAD - margin);   /* USB frames (ms) */
-        f += skip;
-        g_play_frame = f + PLAY_PKTS / 8;
-        int skipped = 0;
-        for (uint64_t k = 0; k < skip * 8; k++) skipped += play_packet_frames();
-        atomic_fetch_add_explicit(&g_total_play_frames, skipped, memory_order_acq_rel);
-        dbg_late++; dbg_skipped_ms += (uint32_t)skip;   /* DEBUG */
-        DBG_LOG("DBG play skip: slot %d due %lld frames from now (min %d), skipped %llu ms",
-            idx, (long long)margin, PLAY_MIN_LEAD, skip);
-    }
-
-    int total_frames = 0;
-    int pkt_n[PLAY_PKTS];
-    for (int k = 0; k < PLAY_PKTS; k++) {
-        int n = play_packet_frames();
-        pkt_n[k] = n;
-        total_frames += n;
-    }
-
-    uint64_t rp = g_play_base + atomic_fetch_add_explicit(&g_total_play_frames, total_frames, memory_order_acq_rel);
-
-    /* The HAL guarantees output only up to "now + output safety offset" on its timeline. Frames
-       beyond that (the burst of transfers queued when playback starts) play as silence. */
-    double tl_now = clk_sample_at(mach_absolute_time());
-    uint64_t written_to = tl_now > 0 ? (uint64_t)tl_now + out_safety_frames() : 0;
-
-    /* DEBUG (temporary): reader position vs the HAL timeline, every ~2 s */
-    static uint64_t dbg_base; static uint32_t dbg_submits, dbg_silent;
-    if (dbg_base != g_play_base) {
-        dbg_base = g_play_base; dbg_submits = 0; dbg_silent = 0;
-    }
-    if (++dbg_submits % 2000 == 0) {
-        DBG_LOG("DBG play q%d: read %.2f ms ahead (limit %.1f) | silent %u | min margin %lld fr, late %u | "
-            "enqueue fail %u (0x%x) | play err %u/%u pkts | cap pkt err %u | fifo empty %u | aborted %u | restarts %u | skipped %u ms",
-            atomic_load(&g_play_nxf), 1000.0 * ((double)(rp + total_frames) - tl_now) / g_sr,
-            1000.0 * out_safety_frames() / g_sr, dbg_silent, (long long)dbg_min_margin, dbg_late,
-            dbg_enq_fail, dbg_enq_err_code, dbg_play_st_err, dbg_play_pkt_err, dbg_cap_pkt_err, dbg_fifo_empty,
-            dbg_aborted, dbg_restarts, dbg_skipped_ms);
-        dbg_min_margin = 1 << 30;   /* per-interval minimum */
-    }
-
-    for (int k = 0; k < PLAY_PKTS; k++) {
-        int n = pkt_n[k];
-        tx[k] = (IOUSBHostIsochronousTransaction){
-            .requestCount = (uint32_t)(n * FRAME_BYTES),
-            .offset = (uint32_t)(k * PKT_MAX)
-        };
-
-        uint8_t *dst = buf + k * PKT_MAX;
-        for (int s = 0; s < n; s++) {
-            uint32_t ridx = ((uint32_t)(rp & RING_MASK)) * NCH;
-            uint8_t *q = dst + s * FRAME_BYTES;
-            bool ready = rp < written_to;
-            if (!ready && dbg_submits > (uint32_t)atomic_load(&g_play_nxf)) dbg_silent++;   /* DEBUG */
-            for (int c = 0; c < NCH; c++) {
-                float v = ready ? g_out_ring[ridx + c] : 0.0f;
-                if (ready) g_out_ring[ridx + c] = 0.0f;
-                if (v > 1.0f) v = 1.0f;
-                else if (v < -1.0f) v = -1.0f;
-                int32_t raw32 = (int32_t)(v * 2147483392.0f);
-                memcpy(q + c * 4, &raw32, 4);
-            }
-            rp++;
-        }
-    }
-
-    atomic_fetch_add(&g_play_inflight, 1);
-    if (dbg_slot_pending[idx]) dbg_reuse_pending++;   /* DEBUG */
-    NSError *e = nil;
-    BOOL queued = [g_ppipe enqueueIORequestWithData:xf->buf
-                      transactionList:tx
-                  transactionListCount:PLAY_PKTS
-                      firstFrameNumber:f
-                               options:IOUSBHostIsochronousTransferOptionsNone
-                                 error:&e
-                     completionHandler:^(IOReturn st, IOUSBHostIsochronousTransaction *done) {
-        dbg_enter();   /* DEBUG */
-        atomic_store(&dbg_last_play_done, mach_absolute_time());
-        dbg_completions++;
-        if (!dbg_slot_pending[idx]) dbg_double_done++;
-        dbg_slot_pending[idx] = false;
-        atomic_fetch_sub(&g_play_inflight, 1);
-        if (st != kIOReturnSuccess && st != kIOReturnAborted) dbg_play_st_err++;   /* DEBUG */
-        if (st == kIOReturnAborted && atomic_load(&g_io_running)) {
-            dbg_aborted++;
-            DBG_LOG("DBG playback transfer aborted while streaming (in flight now %d)", atomic_load(&g_play_inflight));
-        }
-        for (int k = 0; k < PLAY_PKTS && st != kIOReturnAborted; k++)
-            if (done[k].status != kIOReturnSuccess) dbg_play_pkt_err++;
-        if (atomic_load(&g_io_running) && st != kIOReturnAborted) {
-            uint32_t before = dbg_enq_ok + dbg_enq_fail;   /* DEBUG */
-            play_submit(idx);
-            if (dbg_enq_ok + dbg_enq_fail == before)
-                DBG_LOG("DBG play_submit(%d) returned without enqueueing (st 0x%x, running %d, ppipe %p)",
-                    idx, st, atomic_load(&g_io_running), g_ppipe);
-        } else {
-            DBG_LOG("DBG play completion not resubmitted: slot %d, st 0x%x, running %d", idx, st, atomic_load(&g_io_running));
-        }
-        dbg_leave();   /* DEBUG */
-    }];
-    if (!queued) {
-        atomic_fetch_sub(&g_play_inflight, 1);
-        dbg_enq_fail++; dbg_enq_err_code = (int)e.code;   /* DEBUG */
-        DBG_LOG("DBG play enqueue failed (attempt %d): slot %d, frame %llu is %lld frames from now, error 0x%x %{public}@",
-            attempt + 1, idx, f, (long long)f - (long long)[g_dev frameNumberWithTime:NULL], (int)e.code, e.localizedDescription);
-        /* Usually the frame passed while this call was being made. Try again: the next attempt
-           sees the frame has passed and skips ahead (the audio read for this one is dropped),
-           so this transfer chain carries on instead of ending. */
-        if (attempt < 2) play_submit_try(idx, attempt + 1);
-    } else {
-        dbg_enq_ok++; dbg_slot_pending[idx] = true;   /* DEBUG */
-    }
-}
-
-static void play_submit(int idx) {
-    play_submit_try(idx, 0);
-}
-
-#endif /* SL2_DEBUG: shallow-queue playback */
 
 /* ============================================================================
  * Deep-schedule playback
@@ -935,10 +722,11 @@ static void dp_track_capture(uint64_t fc, int frames) {
     if (++dp_dbg_n % 2000 == 0)
         DBG_LOG("DBG dp: sent-captured %.1f frames (max %.1f) | written %u, late %u, unscheduled %u | "
             "enqueue refused %u, retried later %u, resyncs %u | WriteMix thread switches %u, concurrent %u, "
-            "rewritten samples %u",
+            "rewritten samples %u | capture packet errors %u",
             g_dp_err, dp_err_max, atomic_load(&dp_written), atomic_load(&dp_late),
             atomic_load(&dp_unscheduled), dp_enq_fail, dp_retry_later, dp_resync,
-            atomic_load(&dbg_wm_thread_switches), atomic_load(&dbg_wm_concurrent), atomic_load(&dbg_wm_rewritten));
+            atomic_load(&dbg_wm_thread_switches), atomic_load(&dbg_wm_concurrent), atomic_load(&dbg_wm_rewritten),
+            dbg_cap_pkt_err);
 #endif
 }
 
@@ -1049,7 +837,6 @@ static void cap_submit(int idx) {
                                  error:&e
                      completionHandler:^(IOReturn st, IOUSBHostIsochronousTransaction *done) {
         if (!atomic_load(&g_io_running) || st == kIOReturnAborted) return;
-        dbg_enter();   /* DEBUG */
         /* Times below are bus times, from the USB frame clock (dp_ref_*): a completion's own
            timeStamp is when the stack processed it, which can be many ms after the bus. */
         if ((double)(mach_absolute_time() - g_dp_last_refresh) > 0.5 * ticks_per_ms()) dp_ref_refresh();
@@ -1099,14 +886,6 @@ static void cap_submit(int idx) {
             int n = done[k].completeCount / FRAME_BYTES;
             if (n >= 4) {
                 last_n = n;
-#if SL2_DEBUG   /* packet sizes for the shallow-queue path's implicit feedback */
-                uint32_t w = atomic_load_explicit(&g_fifo_w, memory_order_relaxed);
-                uint32_t r = atomic_load_explicit(&g_fifo_r, memory_order_acquire);
-                if (w - r < FIFO_N) {
-                    g_fifo[w % FIFO_N] = n;
-                    atomic_store_explicit(&g_fifo_w, w + 1, memory_order_release);
-                }
-#endif
             }
             if (n > 0) {
                 if (!ts) ts = dp_time_of_uframe(8.0 * (double)fc + k);
@@ -1131,36 +910,7 @@ static void cap_submit(int idx) {
             /* the box clocked errored packets too: count them at the last good size */
             dp_track_capture(fc, got + errored * last_n);
         }
-#if SL2_DEBUG
-        else if (atomic_load(&g_play_inflight) == 0 &&
-            (atomic_load(&g_fifo_w) - atomic_load(&g_fifo_r)) >= (uint32_t)(atomic_load(&g_play_nxf) * PLAY_PKTS)) {
-            uint64_t usb_now = [g_dev frameNumberWithTime:NULL];
-            g_play_frame = usb_now + PLAY_START_MS;
-            /* Read so that each frame plays out_latency_frames() after its HAL timeline position:
-               the first transfer plays PLAY_START_MS (1 ms per USB frame) from now. */
-            double tl_now = clk_sample_at(mach_absolute_time());
-            double first = tl_now + PLAY_START_MS * g_sr / 1000.0 - out_latency_frames();
-            /* the read position is g_play_base + frames already played, which a restart keeps */
-            double base = first - (double)atomic_load(&g_total_play_frames);
-            g_play_base = base > 0 ? (uint64_t)base : 0;
-            if (atomic_load(&g_total_play_frames) > 0) {   /* DEBUG */
-                dbg_restarts++;
-                uint64_t since = mach_absolute_time() - atomic_load(&dbg_last_play_done);
-                int pend = 0;
-                for (int j = 0; j < PLAY_NXF; j++) pend += dbg_slot_pending[j];
-                DBG_LOG("DBG playback restarted: in flight %d, slots pending %d, enqueued-completed %d "
-                    "(%u-%u), double completions %u, enqueue into pending slot %u, last play completion %.2f ms ago, "
-                    "handler overlaps %u, off-queue %u",
-                    atomic_load(&g_play_inflight), pend, (int)(dbg_enq_ok - dbg_completions), dbg_enq_ok,
-                    dbg_completions, dbg_double_done, dbg_reuse_pending,
-                    (double)since * g_tb.numer / g_tb.denom / 1e6,
-                    atomic_load(&dbg_overlap), atomic_load(&dbg_off_queue));
-            }
-            for (int j = 0; j < atomic_load(&g_play_nxf); j++) play_submit(j);
-        }
-#endif
         cap_submit(idx);
-        dbg_leave();   /* DEBUG */
     }];
 }
 
@@ -1218,7 +968,6 @@ static bool usb_ensure_hid(void) {
     NSError *e = nil;
     if (!g_q) {
         g_q = usb_queue_create();
-        dispatch_queue_set_specific(g_q, &dbg_q_key, &dbg_q_key, NULL);   /* DEBUG */
     }
     if (!g_hid_sem) g_hid_sem = dispatch_semaphore_create(0);
 
@@ -1261,18 +1010,17 @@ static bool usb_open_all(void) {
     if (!usb_ensure_hid()) return false;
     NSError *e = nil;
 
-    g_dp_stream = atomic_load(&g_dp_enabled);
+    g_dp_stream = true;
     g_dp_started = false;
     atomic_store(&g_dp_active, false);
 #if SL2_DEBUG
-    memset(dbg_margin_hist, 0, sizeof dbg_margin_hist);
     memset(dbg_capdelay_hist, 0, sizeof dbg_capdelay_hist);
     dbg_capdelay_min = dbg_capstamp_min = 1e9; dbg_capdelay_max = dbg_capstamp_max = -1e9;
     dp_late = dp_unscheduled = dp_written = 0;
     dbg_wm_thread_switches = dbg_wm_concurrent = dbg_wm_rewritten = 0;
     dbg_wm_last_thread = dbg_wm_high = 0;
-    dp_enq_fail = dp_resync = dp_dbg_n = 0; dp_err_max = 0;
-    DBG_LOG("DBG playback path for this stream: %{public}s", g_dp_stream ? "deep schedule" : "shallow queue");
+    dp_enq_fail = dp_resync = dp_retry_later = dp_dbg_n = 0; dp_err_max = 0;
+    dbg_cap_pkt_err = 0;
 #endif
 
     io_iterator_t it = 0;
@@ -1315,35 +1063,15 @@ static bool usb_open_all(void) {
         if (!g_cap_xf[i].buf) g_cap_xf[i].buf = [NSMutableData dataWithLength:CAP_PKTS * PKT_MAX];
         if (!g_cap_xf[i].tx)  g_cap_xf[i].tx  = calloc(CAP_PKTS, sizeof(IOUSBHostIsochronousTransaction));
     }
-#if SL2_DEBUG   /* shallow-queue playback */
-    for (int i = 0; i < PLAY_NXF; i++) {
-        if (!g_play_xf[i].buf) g_play_xf[i].buf = [NSMutableData dataWithLength:PLAY_PKTS * PKT_MAX];
-        if (!g_play_xf[i].tx)  g_play_xf[i].tx  = calloc(PLAY_PKTS, sizeof(IOUSBHostIsochronousTransaction));
-    }
-#endif
 
     set_usb_switches(true);
     hb_start();
 
     memset(g_in_ring, 0, sizeof(g_in_ring));
-#if SL2_DEBUG   /* shallow-queue playback */
-    memset(g_out_ring, 0, sizeof(g_out_ring));
-    atomic_store(&g_fifo_w, 0);
-    atomic_store(&g_fifo_r, 0);
-    atomic_store(&g_play_inflight, 0);
-    g_faccum = 0;
-#endif
 
     clk_reset();
     atomic_store(&g_total_cap_frames, 0);
     atomic_store(&g_total_play_frames, 0);
-#if SL2_DEBUG
-    dbg_aborted = dbg_restarts = dbg_skipped_ms = 0;
-    dbg_late = dbg_enq_fail = dbg_play_st_err = dbg_play_pkt_err = dbg_fifo_empty = dbg_cap_pkt_err = 0;
-    dbg_min_margin = 1 << 30; dbg_enq_err_code = 0;
-    dbg_enq_ok = dbg_completions = dbg_double_done = dbg_reuse_pending = 0;
-    memset(dbg_slot_pending, 0, sizeof dbg_slot_pending);
-#endif
 
     atomic_store(&g_io_running, true);
     g_cap_frame = [g_dev frameNumberWithTime:NULL] + 32;
@@ -1942,26 +1670,7 @@ static OSStatus SL2_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
     if (oid == kObjDevice && addr->mSelector == kSL2PropHIDCommand) {
         if (inSize == sizeof(CFDataRef) && inData) {
             CFDataRef cd = *(CFDataRef*)inData;
-#if SL2_DEBUG   /* debug commands 0xF0, 0xF2, 0xF4: handled here, never sent to the box */
-            if (cd && CFGetTypeID(cd) == CFDataGetTypeID() && CFDataGetLength(cd) >= 6 &&
-                CFDataGetBytePtr(cd)[0] == 0xF0) {
-                /* shallow-queue playback: queue size for the next stream */
-                int n = CFDataGetBytePtr(cd)[5];
-                if (n < 2) n = 2;
-                if (n > PLAY_NXF) n = PLAY_NXF;
-                atomic_store(&g_play_nxf, n);
-                DBG_LOG("DBG playback queue set to %d transfers", n);
-                return 0;
-            }
-            if (cd && CFGetTypeID(cd) == CFDataGetTypeID() && CFDataGetLength(cd) >= 6 &&
-                CFDataGetBytePtr(cd)[0] == 0xF4) {
-                /* deep-schedule playback on/off for the next stream. The reported output latency
-                   follows it, but the HAL keeps the safety offset it read at device setup. */
-                atomic_store(&g_dp_enabled, CFDataGetBytePtr(cd)[5] != 0);
-                DBG_LOG("DBG deep-schedule playback %{public}s", CFDataGetBytePtr(cd)[5] ? "on" : "off");
-                if (g_host) g_host->RequestDeviceConfigurationChange(g_host, kObjDevice, (UInt64)g_sr, NULL);
-                return 0;
-            }
+#if SL2_DEBUG   /* debug command 0xF2: handled here, never sent to the box */
             if (cd && CFGetTypeID(cd) == CFDataGetTypeID() && CFDataGetLength(cd) >= 6 &&
                 CFDataGetBytePtr(cd)[0] == 0xF2) {
                 /* input safety offset in ms. Of limited use: the HAL reads safety offsets only at
@@ -2084,14 +1793,6 @@ static OSStatus SL2_DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID oi
             return 0;
         }
         atomic_fetch_sub_explicit(&g_dp_writers, 1, memory_order_release);
-#if SL2_DEBUG   /* shallow-queue playback reads the mix from g_out_ring */
-        for (UInt32 f = 0; f < frames; f++) {
-            uint32_t idx = ((uint32_t)((pos + f) & RING_MASK)) * NCH;
-            for (int c = 0; c < NCH; c++) {
-                g_out_ring[idx + c] = buf[f * NCH + c];
-            }
-        }
-#endif
     }
     return 0;
 }

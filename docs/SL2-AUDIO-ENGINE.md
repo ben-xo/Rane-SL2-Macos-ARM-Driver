@@ -301,10 +301,15 @@ The tools are in `debug-latency/`. Build each with `clang -O2 -framework CoreAud
 | `chtone`, `chrec` | Tone on chosen channels, and cold-start capture to WAV |
 | `install-sl2.sh` | Installs a build and restarts coreaudiod and the processes that go stale |
 
-**Debug build.** `make plugin DEBUG=1` defines `SL2_DEBUG`, which compiles in the streaming diagnostics,
-the debug commands, and the code kept for reference: the shallow-queue playback path (selectable for
-comparison), the late-write experiment and the workloop / realtime-policy attempts. A plain `make plugin`
-builds none of it. Its playback is always the deep schedule, and it logs only stream start/stop and errors.
+**Debug build.** `make plugin DEBUG=1` defines `SL2_DEBUG`, which compiles in the streaming diagnostics
+(counters, the capture timing histogram, the WriteMix calling-pattern check) and one debug command. A plain
+`make plugin` builds none of it and logs only stream start/stop and errors. Both builds play through the
+deep schedule.
+
+**Superseded code, kept in history.** The shallow-queue playback path is in the history up to `c30df0d`,
+selectable there with `sl2h` 0xF4 in a debug build, along with its queue-size command (0xF0) and sweep
+scripts. The late-write experiment is in `d470c7e`, and the workloop / real-time attempts are in `10c1d87`.
+Each was removed from the tip in its own commit.
 
 **Driver counters.** The debug build logs `DBG dp` every ~2 s and a result line at stream stop. They should read:
 - `late 0`;
@@ -312,15 +317,15 @@ builds none of it. Its playback is always the deep schedule, and it logs only st
 - `enqueue refused 0`;
 - `resyncs 0`;
 - sent − captured within ±2;
-- `rewritten samples 0`.
+- `rewritten samples 0`;
+- `capture packet errors` rarely above 0.
 
-The debug build's controls are `sl2h` command bytes 0xF0–0xF4, intercepted by the driver and never sent to
-the box. They set queue size, queue mode, input safety, the late-write experiment and the playback path.
+The debug build's one control is `sl2h` command byte 0xF2 (`setinsafe`), intercepted by the driver and never
+sent to the box. It sets the input safety offset, but the HAL reads safety offsets only at device setup, so
+it only takes effect for a device that is set up again.
 
 ## Still open
 
-- Removing the old shallow-queue path and the experiment code (workloop and real-time attempts, `xp_*`)
-  from the debug build too, once they are no longer wanted for comparison.
 - Possibly lowering the input safety offset further. Capture data is written to memory on time and only the
   completion is late, so a real-time thread could detect it by marking each capture buffer's padding bytes.
   Untested.
