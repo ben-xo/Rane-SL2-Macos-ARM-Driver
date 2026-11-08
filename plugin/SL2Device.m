@@ -193,6 +193,9 @@ static float g_in_ring[RING_FRAMES * NCH];
    the timeline position matching its arrival (g_cap_base), and the box's rate is measured from
    that frame's time (g_rate_anchor). These and g_clk_last_fix are touched only on g_q. */
 #define CLK_FIX_FRAMES 2048
+/* GetZeroTimeStamp's period: AudioServerPlugIn.h requires at least 10923 frames (Apple's sample
+   drivers use 16384). Unrelated to CLK_FIX_FRAMES: the timeline itself is a continuous line. */
+#define ZTS_PERIOD_FRAMES 16384
 #define CLK_CORR_S     2.0
 static mach_timebase_info_data_t g_tb;
 static _Atomic uint32_t g_clk_seq = 0;
@@ -1810,7 +1813,7 @@ static OSStatus get_property_data(AudioServerPlugInDriverRef d, AudioObjectID oi
                 *(UInt32*)outData = (sc == kAudioObjectPropertyScopeInput) ? in_safety_frames() : out_safety_frames();
                 *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertyIsHidden: *(UInt32*)outData = 0; *outSize = sizeof(UInt32); return 0;
-            case kAudioDevicePropertyZeroTimeStampPeriod: *(UInt32*)outData = 2048; *outSize = sizeof(UInt32); return 0;
+            case kAudioDevicePropertyZeroTimeStampPeriod: *(UInt32*)outData = ZTS_PERIOD_FRAMES; *outSize = sizeof(UInt32); return 0;
             case kAudioObjectPropertyOwnedObjects:
             case kAudioDevicePropertyStreams: {
                 AudioObjectID *ids = (AudioObjectID*)outData;
@@ -2124,7 +2127,7 @@ static OSStatus SL2_GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID
     uint64_t h; double s, tpf;
     clk_get(&h, &s, &tpf);
     double pos = s + ((double)mach_absolute_time() - (double)h) / tpf;
-    double period = pos > 0 ? floor(pos / 2048.0) * 2048.0 : 0;   /* latest period boundary */
+    double period = pos > 0 ? floor(pos / ZTS_PERIOD_FRAMES) * ZTS_PERIOD_FRAMES : 0;   /* latest period boundary */
 
     *outSampleTime = period;
     *outHostTime   = (uint64_t)((double)h + (period - s) * tpf);
