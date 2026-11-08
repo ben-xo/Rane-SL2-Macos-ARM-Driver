@@ -56,7 +56,31 @@
 /* Custom CoreAudio Property Selectors */
 #define kSL2PropHIDCommand  'sl2h'   /* CFDataRef (64B cmd in -> 64B reply out) */
 #define kSL2PropStatus      'sl2s'   /* CFDataRef (SL2StatusPacket out) */
-#define kSL2PropUnsolQueue  'sl2q'   /* CFDataRef (pop queued 64B unsolicited HID reports) */
+#define kSL2PropUnsolQueue  'sl2q'   /* CFDataRef (this client's queued 64B reports, oldest first) */
+
+/* The box's HID protocol (docs/SL2-COMMANDS.md). Every command and reply is one 64-byte report:
+   [0] = command, [1..4] = tag (echoed in the reply), [5..] = arguments / results. */
+enum {
+    HID_REPORT_LEN         = 64,
+    HID_MAX_ARGS           = HID_REPORT_LEN - 5,
+    SL2_CMD_VERSION        = 0x01,   /* reply [5] major, [6] minor, [7..10] build stamp */
+    SL2_CMD_EEPROM_WRITE   = 0x02,   /* refused (0xFF, stale tag) unless 0x17 enabled it */
+    SL2_CMD_NO_REPLY       = 0x06,   /* the box sends no reply */
+    SL2_CMD_PORT_SPEED     = 0x0a,   /* reply [5]: 0 unconfigured, 1 full speed, 2 high speed */
+    SL2_CMD_SET_RATE       = 0x31,   /* [5..6] rate, big-endian: 44100 or 48000 */
+    SL2_CMD_REPORTS        = 0x36,   /* [5] non-zero: send unsolicited 0x40 reports */
+    SL2_CMD_CHALLENGE      = 0x37,   /* [5..12] challenge -> reply [5..12] response */
+    SL2_CMD_HIDI           = 0x41,   /* [5] length, [6..] MIDI-style messages */
+    SL2_CMD_PORT_STATUS    = 0x45,   /* reply [5..6], always 00 00 on the SL 2 */
+    SL2_REPORT_HIDI        = 0x40,   /* the box's only unsolicited report: [5] length, [6..] messages */
+    SL2_REJECTED           = 0xFF,   /* reply to a command the box refuses */
+    SL2_NOTE_THRU_DECK1    = 0x5C,   /* Note On = analogue thru, Note Off = USB audio */
+    SL2_NOTE_THRU_DECK2    = 0x5D,
+    SL2_NOTE_PC7           = 0x60,   /* board input PC7 (not traced) */
+    SL2_NOTE_LINE_PHONO    = 0x61,   /* the one LINE/PHONO switch: On = phono (reported only) */
+    /* Reports the driver makes itself (not from the box), queued for clients like the box's: */
+    SL2_EVT_SAMPLE_RATE    = 0x4F,   /* [5..7] rate, big-endian */
+};
 
 typedef struct {
     uint32_t connected;
@@ -270,39 +294,64 @@ static uint64_t g_cap_frame = 0;
 static NSMutableData *g_hbuf_in;
 static _Atomic uint32_t g_seq = 1;   /* bumped by hid_cmd (any thread) and the heartbeat (g_q) */
 static dispatch_semaphore_t g_hid_sem;
+/* The command hid_cmd is waiting for a reply to (g_hid_mtx serialises commands; hb_read on g_q
+   fills the reply and signals g_hid_sem) */
+static _Atomic bool g_waiting = false;
 static uint8_t  g_wait_cmd = 0;
 static uint32_t g_wait_seq = 0;
-static uint8_t  g_reply_buf[64];
-static uint8_t  g_last_cmd_in[64];
+static uint8_t  g_reply_buf[HID_REPORT_LEN];
 static SL2StatusPacket g_st;
 
 /* 0x37 heartbeat (8 random challenge bytes, the box answers with 8 derived bytes) */
 static dispatch_source_t g_hb_timer;
 static uint32_t g_hb_seq;
 
-/* Unsolicited HID packet ring buffer for SL2Api callbacks */
-#define UNSOL_Q_MAX 64
-static uint8_t  g_unsol_q[UNSOL_Q_MAX][64];
-static uint32_t g_unsol_w = 0;
-static uint32_t g_unsol_r = 0;
+/* Reports for clients (see unsol_push) */
+#define UNSOL_Q_MAX   256
+#define UNSOL_READERS 16
+typedef struct { bool used; pid_t pid; uint64_t cursor; uint64_t last; } UnsolReader;
+static uint8_t  g_unsol_q[UNSOL_Q_MAX][HID_REPORT_LEN];
+static uint64_t g_unsol_w = 0;
+static UnsolReader g_unsol_readers[UNSOL_READERS];
+
+/* 'sl2h': the last reply for each client process, returned (once) by its next read */
+#define HID_CLIENTS 16
+typedef struct { bool used, pending; pid_t pid; uint8_t reply[HID_REPORT_LEN]; uint64_t last; } HidClientReply;
+static HidClientReply g_hid_replies[HID_CLIENTS];
 
 /* IOKit Hotplug watcher */
 static IONotificationPortRef g_notify_port = NULL;
 static io_iterator_t g_added_iter = 0;
 static io_iterator_t g_removed_iter = 0;
 
-static void unsol_push(const uint8_t pkt[64]) {
+/* Reports for clients ('sl2q'): the box's unsolicited reports and the driver's own events, kept in
+   a ring with a running count. Every client process reading 'sl2q' has its own read position,
+   so each one gets every report (as Rane's driver delivers each report to every client); a client
+   that falls more than UNSOL_Q_MAX behind skips to the oldest still kept. */
+static void unsol_push(const uint8_t pkt[HID_REPORT_LEN]) {
     pthread_mutex_lock(&g_unsol_mtx);
-    if (g_unsol_w - g_unsol_r < UNSOL_Q_MAX) {
-        memcpy(g_unsol_q[g_unsol_w % UNSOL_Q_MAX], pkt, 64);
-        g_unsol_w++;
-    }
+    memcpy(g_unsol_q[g_unsol_w % UNSOL_Q_MAX], pkt, HID_REPORT_LEN);
+    g_unsol_w++;
     pthread_mutex_unlock(&g_unsol_mtx);
 }
 
+/* The read position of client process pid (registered at its first read, from now on). */
+static uint64_t *unsol_cursor(pid_t pid) {
+    int oldest = 0;
+    for (int i = 0; i < UNSOL_READERS; i++) {
+        if (g_unsol_readers[i].pid == pid && g_unsol_readers[i].used) {
+            g_unsol_readers[i].last = mach_absolute_time();
+            return &g_unsol_readers[i].cursor;
+        }
+        if (!g_unsol_readers[i].used || g_unsol_readers[i].last < g_unsol_readers[oldest].last) oldest = i;
+    }
+    g_unsol_readers[oldest] = (UnsolReader){ .used = true, .pid = pid, .cursor = g_unsol_w, .last = mach_absolute_time() };
+    return &g_unsol_readers[oldest].cursor;
+}
+
 static void push_sr_unsol(int sr) {
-    uint8_t pkt[64] = {0};
-    pkt[0] = 0x49;
+    uint8_t pkt[HID_REPORT_LEN] = {0};
+    pkt[0] = SL2_EVT_SAMPLE_RATE;
     pkt[5] = (uint8_t)((sr >> 16) & 0xFF);
     pkt[6] = (uint8_t)((sr >> 8) & 0xFF);
     pkt[7] = (uint8_t)(sr & 0xFF);
@@ -313,6 +362,9 @@ static void push_sr_unsol(int sr) {
  * USB & HID Engine
  * ============================================================================ */
 
+/* Keep one read queued on the HID IN pipe (runs on g_q). Each report is either the reply hid_cmd
+   is waiting for, the reply to the driver's own heartbeat, or an unsolicited report from the box,
+   which updates the status and is queued for clients. */
 static void hb_read(void) {
     if (!g_hpipe_in || !g_hbuf_in) return;
     [g_hpipe_in enqueueIORequestWithData:g_hbuf_in completionTimeout:0 error:nil completionHandler:^(IOReturn s, NSUInteger n) {
@@ -320,78 +372,92 @@ static void hb_read(void) {
             const uint8_t *b = g_hbuf_in.bytes;
             uint32_t rseq = 0;
             memcpy(&rseq, b + 1, 4);
-            if (g_wait_cmd && b[0] == g_wait_cmd && (g_wait_seq == 0 || rseq == g_wait_seq)) {
-                memcpy(g_reply_buf, b, 64);
-                g_wait_cmd = 0;
+
+            /* The awaited reply: its command (or a rejection) with its tag. A refused EEPROM write
+               carries a stale tag, so for that one any rejection is the answer. */
+            bool reply = atomic_load(&g_waiting) &&
+                         ((b[0] == g_wait_cmd && rseq == g_wait_seq) ||
+                          (b[0] == SL2_REJECTED && (rseq == g_wait_seq || g_wait_cmd == SL2_CMD_EEPROM_WRITE)));
+            if (reply) {
+                memcpy(g_reply_buf, b, HID_REPORT_LEN);
+                atomic_store(&g_waiting, false);
                 dispatch_semaphore_signal(g_hid_sem);
-            } else if (b[0] == 0x37 && rseq == g_hb_seq) {
-                /* reply to our own heartbeat: not a notification for clients */
-            } else {
-                /* Unsolicited notification from SL2 hardware */
-                if (b[0] == 0x40) {
-                    uint8_t len = b[5];
-                    if (len > 58) len = 58;
-                    for (uint8_t i = 0; i + 2 < len; i += 3) {
-                        uint8_t st = b[6 + i];
-                        uint8_t note = b[6 + i + 1];
-                        uint8_t vel = b[6 + i + 2];
-                        int on = ((st & 0xF0) == 0x90) ? 1 : 0;
-                        (void)vel;   /* always 0x40 in the box's reports */
-                        if (note >= 0x5C && note <= 0x5D) {
-                            g_st.thru[note - 0x5C] = on;
-                        } else if (note == 0x61) {
-                            /* the box's one LINE/PHONO switch (firmware input PE0), shared by both
-                               decks: On = phono */
-                            g_st.phono[0] = g_st.phono[1] = on;
-                        }
+
+            /* An unsolicited report: note thru and switch state, and queue it for clients. */
+            } else if (b[0] == SL2_REPORT_HIDI) {
+                uint8_t len = b[5] > HID_MAX_ARGS - 1 ? HID_MAX_ARGS - 1 : b[5];
+                for (uint8_t i = 0; i + 2 < len; i += 3) {
+                    uint8_t st = b[6 + i], note = b[6 + i + 1];   /* [6 + i + 2], the velocity, is always 0x40 */
+                    int on = ((st & 0xF0) == 0x90) ? 1 : 0;
+                    if (note == SL2_NOTE_THRU_DECK1 || note == SL2_NOTE_THRU_DECK2) {
+                        g_st.thru[note - SL2_NOTE_THRU_DECK1] = on;
+                    } else if (note == SL2_NOTE_LINE_PHONO) {
+                        /* the box's one LINE/PHONO switch (firmware input PE0), shared by both decks */
+                        g_st.phono[0] = g_st.phono[1] = on;
                     }
-                } else if (b[0] == 0x45) {
-                    g_st.port_a = b[5];
-                    g_st.port_b = b[6];
                 }
                 unsol_push(b);
             }
+            /* Anything else is the heartbeat's reply or a reply that came after hid_cmd gave up:
+               not for clients. */
         }
         if (s != kIOReturnAborted && g_hpipe_in) hb_read();
     }];
 }
 
-static bool hid_cmd(uint8_t cmd, const uint8_t *pl, size_t plen, uint8_t *reply_out, uint32_t *seq_override) {
+/* Send a command and wait up to 150 ms for its reply. Every command gets one except
+   SL2_CMD_NO_REPLY. The driver always tags the request with its own sequence number (so a reply can
+   never be confused with another's, e.g. the heartbeat's); client_tag, if given, is put back into
+   the reply returned. True if the box answered and accepted the command; reply_out then holds the
+   reply, and holds the rejection (0xFF) if it refused it. */
+static bool hid_cmd(uint8_t cmd, const uint8_t *pl, size_t plen, uint8_t *reply_out, const uint8_t *client_tag) {
     if (!g_hpipe_out || !g_hid_sem) return false;
     pthread_mutex_lock(&g_hid_mtx);
-    while (dispatch_semaphore_wait(g_hid_sem, DISPATCH_TIME_NOW) == 0) {}
+    while (dispatch_semaphore_wait(g_hid_sem, DISPATCH_TIME_NOW) == 0) {}   /* drop a late signal */
 
-    uint8_t buf[64] = {0};
+    /* Build the request. */
+    uint8_t buf[HID_REPORT_LEN] = {0};
     buf[0] = cmd;
-    uint32_t seq = seq_override ? *seq_override : g_seq++;
+    uint32_t seq = g_seq++;
     memcpy(buf + 1, &seq, 4);
-    if (pl && plen > 0 && plen <= 59) memcpy(buf + 5, pl, plen);
-
-    g_wait_cmd = (cmd >= 0x40) ? 0 : cmd;
+    if (pl && plen > 0) memcpy(buf + 5, pl, plen > HID_MAX_ARGS ? HID_MAX_ARGS : plen);
+    bool wait = cmd != SL2_CMD_NO_REPLY;
+    g_wait_cmd = cmd;
     g_wait_seq = seq;
+    atomic_store(&g_waiting, wait);
 
-    NSMutableData *d = [NSMutableData dataWithBytes:buf length:64];
+    /* Send it. */
+    NSMutableData *d = [NSMutableData dataWithBytes:buf length:HID_REPORT_LEN];
     NSUInteger sent = 0;
     NSError *e = nil;
     pthread_mutex_lock(&g_hout_mtx);
-    [g_hpipe_out sendIORequestWithData:d bytesTransferred:&sent completionTimeout:0 error:&e];
+    BOOL ok = [g_hpipe_out sendIORequestWithData:d bytesTransferred:&sent completionTimeout:0 error:&e];
     pthread_mutex_unlock(&g_hout_mtx);
+    if (!ok) {
+        atomic_store(&g_waiting, false);
+        pthread_mutex_unlock(&g_hid_mtx);
+        return false;
+    }
 
-    bool ok = true;
-    if (g_wait_cmd != 0) {
+    /* Wait for the reply. */
+    bool accepted = true;
+    if (wait) {
         if (dispatch_semaphore_wait(g_hid_sem, dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC)) == 0) {
-            if (reply_out) memcpy(reply_out, g_reply_buf, 64);
+            if (reply_out) memcpy(reply_out, g_reply_buf, HID_REPORT_LEN);
+            accepted = g_reply_buf[0] != SL2_REJECTED;
         } else {
-            g_wait_cmd = 0;
-            ok = false;
+            atomic_store(&g_waiting, false);
+            accepted = false;
+            if (reply_out) memset(reply_out, 0, HID_REPORT_LEN);
         }
     } else if (reply_out) {
-        memset(reply_out, 0, 64);
+        memset(reply_out, 0, HID_REPORT_LEN);
         reply_out[0] = cmd;
         memcpy(reply_out + 1, &seq, 4);
     }
+    if (reply_out && client_tag) memcpy(reply_out + 1, client_tag, 4);
     pthread_mutex_unlock(&g_hid_mtx);
-    return ok;
+    return accepted;
 }
 
 static void refresh_hw_status(void) {
@@ -401,7 +467,7 @@ static void refresh_hw_status(void) {
        (0x0100 = running firmware, 0x0000 = bootloader), not the version. */
     uint8_t r[64];
     for (int attempt = 0; attempt < 2; attempt++) {   /* the box may still be loading its FPGA */
-        if (hid_cmd(0x01, NULL, 0, r, NULL)) {
+        if (hid_cmd(SL2_CMD_VERSION, NULL, 0, r, NULL)) {
             g_st.version_maj = r[5];
             g_st.version_min = r[6];
             break;
@@ -409,7 +475,7 @@ static void refresh_hw_status(void) {
     }
     /* USB speed (0x0a: 1 = full speed, 2 = high speed). At full speed the box offers only its HID
        interface, so there is no audio: say so, as the only other sign is a failed stream start. */
-    if (hid_cmd(0x0a, NULL, 0, r, NULL) && r[5] == 1)
+    if (hid_cmd(SL2_CMD_PORT_SPEED, NULL, 0, r, NULL) && r[5] == 1)
         LOG("The SL 2 is on a full-speed (USB 1.1) link: no audio. Connect it to a USB 2.0 high-speed port.");
     /* Serial from the USB iSerialNumber string ("SL2.01.00"), a fixed device serial independent
        of the firmware version; c.f. the SL3, which queries it over HID 0x04. */
@@ -420,7 +486,7 @@ static void refresh_hw_status(void) {
         CFRelease(ser);
     }
     uint8_t req_ports[1] = {0};
-    if (hid_cmd(0x45, req_ports, 1, r, NULL)) {   /* 0x45 = port status */
+    if (hid_cmd(SL2_CMD_PORT_STATUS, req_ports, 1, r, NULL)) {
         g_st.port_a = r[5];
         g_st.port_b = r[6];
     }
@@ -428,33 +494,25 @@ static void refresh_hw_status(void) {
        sends only once 0x36 has enabled them. Then ask for a state dump (0x41 SysEx F0 17 04 F7),
        so the LINE/PHONO switch is known before it is first moved. */
     uint8_t enable[1] = { 1 };
-    hid_cmd(0x36, enable, 1, NULL, NULL);
+    hid_cmd(SL2_CMD_REPORTS, enable, 1, NULL, NULL);
     uint8_t dump[5] = { 4, 0xF0, 0x17, 0x04, 0xF7 };
-    hid_cmd(0x41, dump, 5, NULL, NULL);
+    hid_cmd(SL2_CMD_HIDI, dump, 5, NULL, NULL);
 }
 
 static void send_hw_samplerate(int sr) {
     uint8_t pl[2] = { (uint8_t)((sr >> 8) & 0xFF), (uint8_t)(sr & 0xFF) };
-    hid_cmd(0x31, pl, 2, NULL, NULL);
+    hid_cmd(SL2_CMD_SET_RATE, pl, 2, NULL, NULL);
     push_sr_unsol(sr);
 }
 
+/* Switch both decks to USB audio (Note Off) or analogue thru (Note On), notes 0x5C / 0x5D through
+   0x41. The box confirms each change with its own 0x40 report, which reaches clients. */
 static void set_usb_switches(bool usb_mode) {
-    /* SL2 uses Hidi Note Off (0x80 = USB Audio / Thru Off) and Note On (0x90 = Analog Thru On)
-       via HID command 0x41 on notes 0x5C (Deck 1) and 0x5D (Deck 2) */
     uint8_t status_byte = usb_mode ? 0x80 : 0x90;
     for (int i = 0; i < 2; i++) {
-        uint8_t pl[4] = { 0x03, status_byte, (uint8_t)(0x5C + i), 0x00 };
-        hid_cmd(0x41, pl, 4, NULL, NULL);
+        uint8_t pl[4] = { 0x03, status_byte, (uint8_t)(SL2_NOTE_THRU_DECK1 + i), 0x00 };
+        hid_cmd(SL2_CMD_HIDI, pl, 4, NULL, NULL);
         g_st.thru[i] = usb_mode ? 0 : 1;
-        /* Also push unsolicited 0x40 so Control Panel updates immediately */
-        uint8_t notify[64] = {0};
-        notify[0] = 0x40;
-        notify[5] = 0x03;
-        notify[6] = status_byte | 0x01;
-        notify[7] = (uint8_t)(0x5C + i);
-        notify[8] = 0x00;
-        unsol_push(notify);
     }
 }
 
@@ -468,7 +526,7 @@ static void hb_tick(void) {
     if (atomic_load(&dbg_no_heartbeat)) return;   /* test hook 0xF5 */
 #endif
     uint8_t buf[64] = {0};
-    buf[0] = 0x37;
+    buf[0] = SL2_CMD_CHALLENGE;
     g_hb_seq = g_seq++;
     memcpy(buf + 1, &g_hb_seq, 4);
     arc4random_buf(buf + 5, 8);
@@ -1864,20 +1922,21 @@ static OSStatus get_property_data(AudioServerPlugInDriverRef d, AudioObjectID oi
                 return 0;
             }
             case kSL2PropHIDCommand: {
+                /* The reply to this client's last 'sl2h' write (sent then), once; never sends. */
+                uint8_t reply[HID_REPORT_LEN] = {0};
                 pthread_mutex_lock(&g_mutex);
-                usb_ensure_hid();
-                uint8_t reply[64] = {0};
-                uint32_t seq_in = 0;
-                memcpy(&seq_in, g_last_cmd_in + 1, 4);
-                hid_cmd(g_last_cmd_in[0], g_last_cmd_in + 5, 59, reply, seq_in ? &seq_in : NULL);
+                for (int i = 0; i < HID_CLIENTS; i++)
+                    if (g_hid_replies[i].used && g_hid_replies[i].pid == pid && g_hid_replies[i].pending) {
+                        memcpy(reply, g_hid_replies[i].reply, HID_REPORT_LEN);
+                        g_hid_replies[i].pending = false;
+                    }
                 pthread_mutex_unlock(&g_mutex);
-                *(CFDataRef*)outData = CFDataCreate(kCFAllocatorDefault, reply, 64);
+                *(CFDataRef*)outData = CFDataCreate(kCFAllocatorDefault, reply, HID_REPORT_LEN);
                 *outSize = sizeof(CFDataRef);
                 return 0;
             }
             case kSL2PropStatus: {
                 pthread_mutex_lock(&g_mutex);
-                usb_ensure_hid();
                 g_st.connected = atomic_load(&g_hw_connected) ? 1 : 0;
                 g_st.streaming = atomic_load(&g_io_running) ? 1 : 0;
                 g_st.sample_rate = (uint32_t)g_sr;
@@ -1890,14 +1949,12 @@ static OSStatus get_property_data(AudioServerPlugInDriverRef d, AudioObjectID oi
                 return 0;
             }
             case kSL2PropUnsolQueue: {
+                /* This client's reports since its last read, oldest first. */
                 pthread_mutex_lock(&g_unsol_mtx);
-                uint32_t count = g_unsol_w - g_unsol_r;
-                if (count > UNSOL_Q_MAX) count = UNSOL_Q_MAX;
-                CFMutableDataRef md = CFDataCreateMutable(kCFAllocatorDefault, count * 64);
-                while (g_unsol_r < g_unsol_w) {
-                    CFDataAppendBytes(md, g_unsol_q[g_unsol_r % UNSOL_Q_MAX], 64);
-                    g_unsol_r++;
-                }
+                uint64_t *r = unsol_cursor(pid);
+                if (g_unsol_w - *r > UNSOL_Q_MAX) *r = g_unsol_w - UNSOL_Q_MAX;
+                CFMutableDataRef md = CFDataCreateMutable(kCFAllocatorDefault, (CFIndex)(g_unsol_w - *r) * HID_REPORT_LEN);
+                for (; *r < g_unsol_w; (*r)++) CFDataAppendBytes(md, g_unsol_q[*r % UNSOL_Q_MAX], HID_REPORT_LEN);
                 pthread_mutex_unlock(&g_unsol_mtx);
                 *(CFDataRef*)outData = md;
                 *outSize = sizeof(CFDataRef);
@@ -2031,22 +2088,44 @@ static OSStatus SL2_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
                 return kAudioHardwareIllegalOperationError;
 #endif
             }
-            if (cd && CFGetTypeID(cd) == CFDataGetTypeID() && CFDataGetLength(cd) <= 64) {
-                memset(g_last_cmd_in, 0, 64);
-                memcpy(g_last_cmd_in, CFDataGetBytePtr(cd), CFDataGetLength(cd));
-                if (g_last_cmd_in[0] == 0x31 && CFDataGetLength(cd) >= 7) {
-                    int sr = (g_last_cmd_in[5] << 8) | g_last_cmd_in[6];
-                    /* A client (Serato) changing the rate over HID: route it through the HAL
-                       so CoreAudio's rate and the box's stay in step. */
-                    if (sr == 44100 || sr == 48000) {
-                        if ((Float64)sr != g_sr && g_host)
-                            g_host->RequestDeviceConfigurationChange(g_host, kObjDevice, (UInt64)sr, NULL);
-                        push_sr_unsol(sr);
-                    }
-                }
+            if (!cd || CFGetTypeID(cd) != CFDataGetTypeID() || CFDataGetLength(cd) < 1 ||
+                CFDataGetLength(cd) > HID_REPORT_LEN) return kAudioHardwareBadPropertySizeError;
+            uint8_t req[HID_REPORT_LEN] = {0};
+            memcpy(req, CFDataGetBytePtr(cd), (size_t)CFDataGetLength(cd));
+            uint8_t reply[HID_REPORT_LEN] = {0};
+            bool answered;
+
+            /* A rate change (0x31) to the other supported rate goes through the HAL's handshake
+               (PerformDeviceConfigurationChange sends it to the box), so the HAL's rate and the box's
+               change together; the client gets the box's usual reply. Anything else, including the
+               current rate or an invalid one (which the box rejects), goes to the box now. */
+            int sr = (req[5] << 8) | req[6];
+            if (req[0] == SL2_CMD_SET_RATE && (sr == 44100 || sr == 48000) && (Float64)sr != g_sr && g_host) {
+                OSStatus st = g_host->RequestDeviceConfigurationChange(g_host, kObjDevice, (UInt64)sr, NULL);
+                if (st) return st;
+                reply[0] = SL2_CMD_SET_RATE;
+                memcpy(reply + 1, req + 1, 4);
+                answered = true;
+            } else {
+                pthread_mutex_lock(&g_mutex);
+                answered = usb_ensure_hid() && hid_cmd(req[0], req + 5, HID_MAX_ARGS, reply, req + 1);
+                pthread_mutex_unlock(&g_mutex);
+                if (reply[0] == SL2_REJECTED) answered = true;   /* the client sees the rejection */
             }
+
+            /* Keep the reply for this client's next read of 'sl2h'. */
+            pthread_mutex_lock(&g_mutex);
+            int slot = 0;
+            for (int i = 0; i < HID_CLIENTS; i++) {
+                if (g_hid_replies[i].used && g_hid_replies[i].pid == pid) { slot = i; break; }
+                if (!g_hid_replies[i].used || g_hid_replies[i].last < g_hid_replies[slot].last) slot = i;
+            }
+            g_hid_replies[slot] = (HidClientReply){ .used = true, .pending = true, .pid = pid, .last = mach_absolute_time() };
+            memcpy(g_hid_replies[slot].reply, reply, HID_REPORT_LEN);
+            pthread_mutex_unlock(&g_mutex);
+            return answered ? 0 : kAudioHardwareUnspecifiedError;
         }
-        return 0;
+        return kAudioHardwareBadPropertySizeError;
     }
     if (oid == kObjDevice && addr->mSelector == kAudioDevicePropertyNominalSampleRate) {
         if (inSize < sizeof(Float64) || !inData) return kAudioHardwareBadPropertySizeError;
