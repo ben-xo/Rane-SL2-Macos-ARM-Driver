@@ -805,7 +805,7 @@ static void xp_write_due(void) {
  * ============================================================================ */
 #define DP_SLOTS       64          /* transfers kept queued: 64 ms */
 #define DP_SCHED_N     256         /* schedule ring entries, power of two, > DP_SLOTS */
-#define DP_START_LEAD  4           /* the first transfer is scheduled this many frames ahead */
+#define DP_START_LEAD  8           /* the first transfer is scheduled this many frames ahead (+4 was refused) */
 #define DP_CORR_S      1.0         /* sent-vs-captured frame difference is removed over this many seconds */
 #define DP_WRITE_GUARD 0.25        /* a frame is written only if it starts at least this many ms from now */
 
