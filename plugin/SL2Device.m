@@ -1001,11 +1001,12 @@ static void dp_start(void) {
         atomic_load(&g_dp_F0), DP_SLOTS, DP_OUT_LATENCY_MS, DP_OUT_SAFETY_MS, fn, est);
 }
 
-/* A capture transfer for USB frame fc delivered `got` frames. Steer the predicted OUT sizes so
-   that the frames sent through each USB frame track the frames the box captured through it. */
-static void dp_track_capture(uint64_t fc, int got) {
+/* A capture transfer for USB frame fc covered `frames` frames (errored packets counted at their
+   expected size). Steer the predicted OUT sizes so that the frames sent through each USB frame
+   track the frames the box captured through it. */
+static void dp_track_capture(uint64_t fc, int frames) {
     if (!g_dp_started || fc < atomic_load(&g_dp_F0)) return;
-    g_dp_in_cum += got;
+    g_dp_in_cum += frames;
     DPEntry *e = &g_dp_sched[fc & (DP_SCHED_N - 1)];
     if (atomic_load_explicit(&e->frame, memory_order_acquire) != fc) return;   /* not sent */
     g_dp_err = (double)e->sent_cum - (double)g_dp_in_cum;
@@ -1148,13 +1149,21 @@ static void cap_submit(int idx) {
         }
         uint64_t ring_pos = g_cap_base + wp;   /* timeline position of this transfer's first frame */
 
+        int errored = 0;
+        static int last_n = 0;   /* size of the last good packet, for counting errored ones */
+        if (!last_n) last_n = (int)(g_sr / 8000.0 + 0.5);
         for (int k = 0; k < CAP_PKTS; k++) {
             /* Drop errored packets and impossible lengths. The first completion after a
                killed helper can carry a residual from the old request (e.g. 0xFFFFFE00),
                and the frame loop must never run past the 112-byte packet. */
-            if (done[k].status != kIOReturnSuccess || done[k].completeCount > PKT_MAX) { dbg_cap_pkt_err++; continue; }
+            if (done[k].status != kIOReturnSuccess || done[k].completeCount > PKT_MAX) {
+                dbg_cap_pkt_err++;
+                errored++;
+                continue;
+            }
             int n = done[k].completeCount / FRAME_BYTES;
             if (n >= 4) {
+                last_n = n;
                 uint32_t w = atomic_load_explicit(&g_fifo_w, memory_order_relaxed);
                 uint32_t r = atomic_load_explicit(&g_fifo_r, memory_order_acquire);
                 if (w - r < FIFO_N) {
@@ -1182,7 +1191,8 @@ static void cap_submit(int idx) {
 
         if (g_dp_stream) {   /* deep-schedule playback: start after a few ms of capture */
             if (!g_dp_started && wp >= (uint64_t)(8 * g_sr / 1000)) dp_start();
-            dp_track_capture(fc, got);
+            /* the box clocked errored packets too: count them at the last good size */
+            dp_track_capture(fc, got + errored * last_n);
         } else if (g_xp_mode) {   /* DEBUG experiment replaces normal playback; start once the rate is measured */
             if (!g_xp_started && !xp_alloc_fail && wp > (uint64_t)(g_sr / 2)) xp_start();
             else if (g_xp_started) xp_write_due();
