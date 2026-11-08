@@ -19,6 +19,10 @@ panel:
 dump:
 	$(CC) $(ARCH) $(CFLAGS) -framework Foundation -framework CoreAudio tools/sl2dump.m tools/SL2Passthrough.m -o sl2dump
 
+# sl2apitest: checks SL2Api as Serato DJ Pro 2.5.5 uses it (run the x86_64 slice with arch -x86_64)
+apitest:
+	$(CC) $(ARCH) -O2 tools/sl2apitest.c -o sl2apitest
+
 flash:
 	$(CC) $(ARCH) $(CFLAGS) -Itools -framework Foundation -framework CoreAudio -framework IOKit -framework IOUSBHost tools/firmware/sl2flash.m tools/SL2Passthrough.m -o sl2flash
 
@@ -31,7 +35,7 @@ tools/latency/bin/%: tools/latency/%.c tools/latency/common.h
 	$(CC) -O2 -framework CoreAudio -framework CoreFoundation $< -o $@
 
 clean:
-	rm -f SL2Device SL2Api sl2panel sl2dump sl2flash
+	rm -f SL2Device SL2Api sl2panel sl2dump sl2flash sl2apitest
 	rm -rf tools/latency/bin
 
-.PHONY: all plugin api panel dump flash latency clean
+.PHONY: all plugin api panel dump flash apitest latency clean

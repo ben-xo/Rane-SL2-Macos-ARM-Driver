@@ -257,7 +257,14 @@ shift it slightly. Only 44.1 kHz has been measured.
   SL2Api notices the box coming and going itself and calls the port-status callback with `{1, 0}` / `{0, 0}`.
 - Firmware update is deliberately not implemented (the functions are no-ops), and `SL2_is_C0_device` stays 0,
   so the control panel never starts an automatic update. `tools/firmware/` does that with safeguards.
-- Tested with Rane's control panel. **Not yet tested with Serato DJ Pro 2.5.5.**
+- Every exported call is logged at debug level with its result, the challenge and answer, and the Hidi
+  bytes sent and received: `log stream --level debug --predicate 'subsystem == "com.rane.sl2api"'`.
+- `sl2apitest` (`make apitest`) loads the framework from the path Serato 2.5.5 uses and checks the seven
+  calls as Serato makes them: the hardware-check answer, the state dump through the callback, and each
+  deck's thru switched and restored. Serato 2.5.5 is Intel-only, so run it as `arch -x86_64 ./sl2apitest`
+  as well as natively.
+- Tested with Rane's control panel and `sl2apitest` (both slices). **Not yet tested with Serato DJ Pro
+  2.5.5.**
 
 ## Platform facts worth knowing
 
