@@ -48,8 +48,10 @@ static OSStatus proc(AudioObjectID d, const AudioTimeStamp *now, const AudioBuff
         UInt32 nch = ab->mNumberChannels, frames = ab->mDataByteSize / (nch * sizeof(float));
         float *p = ab->mData;
         memset(p, 0, ab->mDataByteSize);
+        // The "cycle" figure: how far ahead of input this cycle's output is, in samples.
         g_cycle_gap = ot->mSampleTime - it->mSampleTime;
         if (g_next_click < 0) g_next_click = ot->mSampleTime + g_sr * 0.75;   /* let things settle first */
+        // Write every click due in this buffer [t0, t1) and step on to the next one.
         double t0 = ot->mSampleTime, t1 = t0 + frames;
         while (g_written < g_nclicks && g_next_click < t1) {
             if (g_next_click >= t0) {
@@ -66,11 +68,13 @@ static OSStatus proc(AudioObjectID d, const AudioTimeStamp *now, const AudioBuff
 
 int main(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: rtlat <device> <out-ch> <in-ch> [clicks] [buffer-frames]\n"); return 2; }
+    // Find the device and read the arguments.
     AudioObjectID d = find(argv[1]);
     if (!d) { fprintf(stderr, "device not found\n"); return 1; }
     g_out_ch = atoi(argv[2]); g_in_ch = atoi(argv[3]);
     g_nclicks = argc > 4 ? atoi(argv[4]) : 6; if (g_nclicks > MAXCLICK) g_nclicks = MAXCLICK;
 
+    // Read the sample rate (a click every 0.5 s) and apply the IO buffer size, if given.
     AudioObjectPropertyAddress ra = { kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
     UInt32 s = sizeof g_sr; AudioObjectGetPropertyData(d, &ra, 0, NULL, &s, &g_sr);
     g_interval = g_sr * 0.5;
@@ -79,14 +83,17 @@ int main(int argc, char **argv) {
         AudioObjectPropertyAddress ba = { kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
         AudioObjectSetPropertyData(d, &ba, 0, NULL, sizeof bf, &bf);
     }
+    // Read back the IO buffer size in use, for the report.
     UInt32 bufsz = 0; s = sizeof bufsz;
     AudioObjectPropertyAddress ba = { kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
     AudioObjectGetPropertyData(d, &ba, 0, NULL, &s, &bufsz);
 
+    // Capture buffer: the settling time, every click, and a second for the last one to come back.
     double secs = 0.75 + g_nclicks * 0.5 + 1.0;
     g_in_len = (size_t)(secs * g_sr) + 8192;
     g_in = calloc(g_in_len, sizeof(float));
 
+    // Start IO from cold, run until every click has had time to come back, then stop.
     AudioDeviceIOProcID id = NULL;
     if (AudioDeviceCreateIOProcID(d, proc, NULL, &id)) { fprintf(stderr, "CreateIOProcID failed\n"); return 1; }
     AudioDeviceStart(d, id);
@@ -102,9 +109,11 @@ int main(int argc, char **argv) {
     for (size_t i = (size_t)(0.3 * g_sr); i < quiet_end && i < g_in_len; i++) if (fabsf(g_in[i]) > noise) noise = fabsf(g_in[i]);
     float thresh = fmaxf(noise * 4.0f, 0.02f);
 
+    // Report the setup and the cycle gap.
     printf("rate %.0f Hz, IO buffer %u frames, out ch%d -> in ch%d, noise floor %.4f, threshold %.4f\n",
            g_sr, bufsz, g_out_ch, g_in_ch, noise, thresh);
     printf("cycle gap (outputTime - inputTime): %.0f frames = %.1f ms\n", g_cycle_gap, 1000.0 * g_cycle_gap / g_sr);
+    // Find each click: the first input sample above the threshold after the click was written.
     double sum = 0; int found = 0;
     for (int c = 0; c < g_written; c++) {
         double o = g_click_out[c] - g_in0;           /* output sample time, in input-buffer index units */
@@ -120,6 +129,7 @@ int main(int argc, char **argv) {
                c + 1, hidden, 1000.0 * hidden / g_sr, 1000.0 * (hidden + g_cycle_gap) / g_sr, pk);
         sum += hidden; found++;
     }
+    // Average the hidden latency over the clicks found.
     if (found) {
         double h = sum / found;
         printf("mean: hidden %.1f ms, DVS round trip est. %.1f ms (%d/%d clicks)\n",

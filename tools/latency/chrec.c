@@ -19,6 +19,7 @@ static OSStatus proc(AudioObjectID d, const AudioTimeStamp *now, const AudioBuff
     const AudioBuffer *ab = &in->mBuffers[0];
     UInt32 nch = ab->mNumberChannels, frames = ab->mDataByteSize / (nch * sizeof(float));
     if (!g_nch) g_nch = nch;
+    // Append each frame, keeping up to 8 channels (the buffer holds 8 per frame).
     for (UInt32 f = 0; f < frames && g_frames < g_cap_frames; f++, g_frames++)
         for (UInt32 c = 0; c < nch && c < 8; c++)
             g_buf[g_frames * 8 + c] = ((const float *)ab->mData)[f * nch + c];
@@ -32,6 +33,7 @@ int main(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: chrec <device> <seconds> <out.wav>\n"); return 2; }
     AudioObjectID d = find(argv[1]);
     if (!d) { fprintf(stderr, "device not found\n"); return 1; }
+    // Read the sample rate and allocate room for the requested time, 8 channels per frame.
     Float64 sr = 44100; UInt32 s = sizeof sr;
     AudioObjectPropertyAddress ra = { kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
     AudioObjectGetPropertyData(d, &ra, 0, NULL, &s, &sr);
@@ -39,6 +41,7 @@ int main(int argc, char **argv) {
     g_cap_frames = (size_t)(secs * sr);
     g_buf = calloc(g_cap_frames * 8, sizeof(float));
 
+    // Start IO from cold and capture, with 300 ms extra to cover start-up.
     AudioDeviceIOProcID id = NULL;
     if (AudioDeviceCreateIOProcID(d, proc, NULL, &id)) { fprintf(stderr, "CreateIOProcID failed\n"); return 1; }
     AudioDeviceStart(d, id);
@@ -46,12 +49,14 @@ int main(int argc, char **argv) {
     AudioDeviceStop(d, id);
     AudioDeviceDestroyIOProcID(d, id);
 
+    // Per channel: the peak, the first frame with signal, and the dropouts after it.
     size_t n = g_frames; UInt32 nch = g_nch > 8 ? 8 : g_nch;
     printf("captured %zu frames, %u channels at %.0f Hz\n", n, nch, sr);
     for (UInt32 c = 0; c < nch; c++) {
         size_t first = n; float peak = 0;
         for (size_t i = 0; i < n; i++) { float v = g_buf[i * 8 + c]; if (v < 0) v = -v; if (v > peak) peak = v; if (first == n && v > 1e-4f) first = i; }
         if (first == n) { printf("  ch%u: silent\n", c + 1); continue; }
+        // A dropout is a run of at least 32 all-zero frames.
         int drops = 0; size_t run = 0, longest = 0;
         for (size_t i = first; i < n; i++) {
             if (g_buf[i * 8 + c] == 0.0f) { run++; } else { if (run >= 32) { drops++; if (run > longest) longest = run; } run = 0; }
@@ -60,6 +65,7 @@ int main(int argc, char **argv) {
                c + 1, peak, first, 1000.0 * first / sr, drops, longest);
     }
 
+    // Write the captured channels as a 32-bit float WAV (format 3).
     FILE *f = fopen(argv[3], "wb");
     uint32_t data = (uint32_t)(n * nch * 4);
     fwrite("RIFF", 1, 4, f); w32(f, 36 + data); fwrite("WAVEfmt ", 1, 8, f);

@@ -5,10 +5,12 @@
 
 // The first CoreAudio device whose name contains `sub` (e.g. "SL 2"), or kAudioObjectUnknown.
 static AudioObjectID find(const char *sub) {
+    // List the devices (up to 64).
     AudioObjectPropertyAddress a = { kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
     UInt32 sz = 0; AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &a, 0, NULL, &sz);
     AudioObjectID ids[64]; if (sz > sizeof ids) sz = sizeof ids;
     AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, 0, NULL, &sz, ids);
+    // Return the first whose name contains `sub`.
     for (UInt32 i = 0; i < sz / sizeof(AudioObjectID); i++) {
         CFStringRef nm = NULL; UInt32 s = sizeof(CFStringRef);
         AudioObjectPropertyAddress na = { kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };

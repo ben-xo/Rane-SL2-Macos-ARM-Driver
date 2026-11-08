@@ -10,6 +10,7 @@ SUBSYS=${SL_LOG_SUBSYSTEM:-com.rane.sl2}     # the driver's os_log subsystem
 SECS=${1:?usage: dptest.sh <seconds>}
 NCPU=$(sysctl -n hw.ncpu)
 fail=0
+# Run twice: once idle, once with every core busy.
 for load in idle loaded; do
     # Load every core for the second run.
     pids=()

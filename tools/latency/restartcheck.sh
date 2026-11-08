@@ -22,6 +22,7 @@ sleep 1
 log=$(/usr/bin/log show --start "$start" --style compact --predicate "subsystem == \"$SUBSYS\"" 2>/dev/null \
     | grep -E 'Deep-schedule playback started|Failed to claim|enqueue refused|dp result' | sed -E 's/.*\] \[SL2\] //')
 echo "$log"
+# Pass only if all three streams started, none failed to claim, and no enqueue was refused.
 [ "$(echo "$log" | grep -c 'Deep-schedule playback started')" -ge 3 ] || { echo "FAIL: fewer than 3 streams started"; fail=1; }
 echo "$log" | grep -qE 'Failed to claim|enqueue refused for frame' && { echo "FAIL: a stream did not start cleanly"; fail=1; }
 [ $fail = 0 ] && echo "PASS" || echo "FAIL"

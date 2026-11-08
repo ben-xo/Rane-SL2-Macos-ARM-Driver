@@ -120,13 +120,16 @@ static OSStatus devices_changed(AudioObjectID o, UInt32 n, const AudioObjectProp
 }
 
 static AudioObjectID find_hal_device(void) {
+    /* Once per process: listen for changes to the device list, which drop the cache. */
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         AudioObjectPropertyAddress da = { kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
         AudioObjectAddPropertyListener(kAudioObjectSystemObject, &da, devices_changed, NULL);
     });
+    /* Use the cached device while there is one. */
     AudioObjectID dev = atomic_load(&g_dev);
     if (dev != kAudioObjectUnknown) return dev;
+    /* Otherwise look it up by the HAL plug-in's device UID, and cache it. */
     AudioObjectPropertyAddress a = {
         kAudioHardwarePropertyTranslateUIDToDevice,
         kAudioObjectPropertyScopeGlobal,
@@ -140,13 +143,17 @@ static AudioObjectID find_hal_device(void) {
 }
 
 static bool hal_get_status(SL2StatusPacket *outSt) {
+    /* Without the driver's device there is no status. */
     AudioObjectID dev = find_hal_device();
     if (dev == kAudioObjectUnknown) return false;
+    /* Read the status property, which the driver returns as a CFData. */
     AudioObjectPropertyAddress a = { kSL2PropStatus, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
     CFDataRef d = NULL;
     UInt32 sz = sizeof(d);
     bool ok = false;
     if (AudioObjectGetPropertyData(dev, &a, 0, NULL, &sz, &d) == noErr && d) {
+        /* Copy what the driver sent (zero-filling the rest if it is shorter); it counts as a status
+           if it holds every field before boot_mode. */
         memset(outSt, 0, sizeof *outSt);
         CFIndex n = CFDataGetLength(d);
         memcpy(outSt, CFDataGetBytePtr(d), (size_t)(n < (CFIndex)sizeof *outSt ? n : (CFIndex)sizeof *outSt));
@@ -158,8 +165,10 @@ static bool hal_get_status(SL2StatusPacket *outSt) {
 
 /* A box is attached: per the driver's status, or (without the driver) in the USB registry. */
 static bool is_usb_present(void) {
+    /* Ask the driver first. */
     SL2StatusPacket st;
     if (hal_get_status(&st) && st.connected) return true;
+    /* Otherwise look in the USB registry for a device with the SL 2's vendor and product IDs. */
     CFMutableDictionaryRef m = IOServiceMatching(kIOUSBDeviceClassName);
     if (!m) return false;
     int v = VID, p = PID;
@@ -168,6 +177,7 @@ static bool is_usb_present(void) {
     CFDictionarySetValue(m, CFSTR(kUSBVendorID), vn);
     CFDictionarySetValue(m, CFSTR(kUSBProductID), pn);
     CFRelease(vn); CFRelease(pn);
+    /* Any match means a box is attached. */
     io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, m);
     if (s) { IOObjectRelease(s); return true; }
     return false;
@@ -177,6 +187,7 @@ static bool is_usb_present(void) {
    reply, which is SL2_REJECTED if the box refused the command), RH_ERR_NOT_CONNECTED or
    RH_ERR_NO_REPLY. */
 static int send_hid_cmd(uint8_t cmd, const uint8_t *args, size_t nargs, uint8_t *reply_out) {
+    /* No driver device means no box; otherwise take the lock so each command gets its own reply. */
     AudioObjectID dev = find_hal_device();
     if (dev == kAudioObjectUnknown) return RH_ERR_NOT_CONNECTED;
     pthread_mutex_lock(&g_lock);
@@ -199,6 +210,7 @@ static int send_hid_cmd(uint8_t cmd, const uint8_t *args, size_t nargs, uint8_t 
         CFDataRef out = NULL;
         UInt32 sz = sizeof(CFDataRef);
         if (AudioObjectGetPropertyData(dev, &a, 0, NULL, &sz, &out) == noErr && out) {
+            /* Copy at most one report, and accept it only if it carries our tag. */
             uint8_t reply[HID_REPORT_LEN] = {0};
             CFIndex n = CFDataGetLength(out);
             memcpy(reply, CFDataGetBytePtr(out), (size_t)(n < HID_REPORT_LEN ? n : HID_REPORT_LEN));
@@ -221,6 +233,7 @@ static void dispatch_report(const uint8_t pkt[HID_REPORT_LEN]) {
     /* The box's Hidi report: thru (notes 0x5C/0x5D), the LINE/PHONO switch (0x61) and 0x60. */
     void (*hidi)(RH_hidimsg_data_t *) = atomic_load(&g_hidi_cb);
     if (pkt[0] == SL2_REPORT_HIDI && hidi) {
+        /* [5] = length of the messages (capped at what a report carries), [6..] = the messages. */
         RH_hidimsg_data_t m;
         memset(&m, 0, sizeof m);
         m.length = pkt[5] <= HIDI_MAX_LEN ? pkt[5] : HIDI_MAX_LEN;
@@ -243,12 +256,14 @@ static void poll_driver(void) {
     AudioObjectID dev = find_hal_device();
     SL2StatusPacket st;
     bool connected = dev != kAudioObjectUnknown && hal_get_status(&st) && st.connected;
+    /* Tell the client when that changes; the first poll after poll_start only records it. */
     void (*port)(RH_usb_port_status_t *) = atomic_load(&g_port_cb);
     if (!g_poll_primed) g_poll_primed = true;
     else if (connected != g_was_connected && port) {
         RH_usb_port_status_t ps = { connected ? 1 : 0, 0 };
         port(&ps);
     }
+    /* Remember the state for the next poll; without a box there are no reports to read. */
     g_was_connected = connected;
     if (!connected) return;
 
@@ -259,6 +274,7 @@ static void poll_driver(void) {
     if (AudioObjectGetPropertyData(dev, &a, 0, NULL, &sz, &d) == noErr && d) {
         CFIndex len = CFDataGetLength(d);
         const uint8_t *bytes = CFDataGetBytePtr(d);
+        /* The queue is a run of 64-byte reports: pass each one on. */
         for (CFIndex off = 0; off + HID_REPORT_LEN <= len; off += HID_REPORT_LEN) dispatch_report(bytes + off);
         CFRelease(d);
     }
@@ -266,9 +282,12 @@ static void poll_driver(void) {
 
 /* Start polling (from the first RH_open); RH_close stops it again with the last handle. */
 static void poll_start(void) {
+    /* Already polling: nothing to do. */
     if (g_poll_timer) return;
+    /* Create the serial queue once, and have the first poll only record the box's state. */
     if (!g_poll_q) g_poll_q = dispatch_queue_create("com.rane.sl2api.poll", DISPATCH_QUEUE_SERIAL);
     dispatch_async(g_poll_q, ^{ g_poll_primed = false; });
+    /* Poll every 15 ms (5 ms leeway), starting now. */
     g_poll_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, g_poll_q);
     dispatch_source_set_timer(g_poll_timer, DISPATCH_TIME_NOW, 15 * NSEC_PER_MSEC, 5 * NSEC_PER_MSEC);
     dispatch_source_set_event_handler(g_poll_timer, ^{ poll_driver(); });
@@ -335,8 +354,10 @@ EXPORT int RH_set_buffer_millisecs(void *h, int ms) {
 }
 EXPORT int RH_get_buffer_millisecs(void *h, int *ms) {
     if (!handle_ok(h) || !ms) return RH_ERR_BAD_ARG;
+    /* Needs the driver's device. */
     AudioObjectID dev = find_hal_device();
     if (dev == kAudioObjectUnknown) return RH_ERR_NOT_CONNECTED;
+    /* Read the output latency and safety offset (in frames). */
     UInt32 lat = 0, safety = 0, sz = sizeof(UInt32);
     Float64 sr = 0;
     AudioObjectPropertyAddress la = { kAudioDevicePropertyLatency, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain };
@@ -345,6 +366,8 @@ EXPORT int RH_get_buffer_millisecs(void *h, int *ms) {
     AudioObjectGetPropertyData(dev, &la, 0, NULL, &sz, &lat);
     sz = sizeof(UInt32);
     AudioObjectGetPropertyData(dev, &sa, 0, NULL, &sz, &safety);
+    /* Read the sample rate and convert the frames to ms, rounded up; without a usable rate, give
+       back the slider's stored value. */
     sz = sizeof(Float64);
     if (AudioObjectGetPropertyData(dev, &ra, 0, NULL, &sz, &sr) != noErr || sr <= 0) { *ms = g_buffer_ms; return RH_OK; }
     *ms = (int)ceil((double)(lat + safety) * 1000.0 / sr);
@@ -451,7 +474,9 @@ EXPORT int RH_send_control_change(void *h, uint8_t cc, uint8_t val) { return sen
 
 /* SysEx: Rane's wraps the bytes as F0 17 <bytes> F7. */
 EXPORT int RH_send_sys_ex(void *h, const uint8_t *d, uint8_t len) {
+    /* The wrapped message (the bytes plus F0 17 and F7) must fit in one report. */
     if (!handle_ok(h) || (!d && len) || len + 3u > HIDI_MAX_LEN) return RH_ERR_BAD_ARG;
+    /* Build F0 17 <bytes> F7 and send it as one Hidi message. */
     RH_hidimsg_data_t m = { .length = (uint8_t)(len + 3) };
     m.data[0] = 0xF0; m.data[1] = 0x17;
     if (len) memcpy(m.data + 2, d, len);

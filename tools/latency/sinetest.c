@@ -32,6 +32,7 @@ static OSStatus overload_listener(AudioObjectID o, UInt32 n, const AudioObjectPr
 
 static OSStatus proc(AudioObjectID d, const AudioTimeStamp *now, const AudioBufferList *in, const AudioTimeStamp *it,
                      AudioBufferList *out, const AudioTimeStamp *ot, void *ctx) {
+    // Input: count gaps in the input timestamps, then append the chosen channel to the capture.
     if (in && in->mNumberBuffers > 0) {
         const AudioBuffer *ab = &in->mBuffers[0];
         UInt32 nch = ab->mNumberChannels, frames = ab->mDataByteSize / (nch * sizeof(float));
@@ -40,6 +41,7 @@ static OSStatus proc(AudioObjectID d, const AudioTimeStamp *now, const AudioBuff
         for (UInt32 f = 0; f < frames && g_n < g_len; f++)
             g_in[g_n++] = ((UInt32)(g_in_ch - 1) < nch) ? ((const float *)ab->mData)[f * nch + (g_in_ch - 1)] : 0;
     }
+    // Output: a continuous sine on the chosen channel, its phase carried from cycle to cycle.
     if (out && out->mNumberBuffers > 0) {
         AudioBuffer *ab = &out->mBuffers[0];
         UInt32 nch = ab->mNumberChannels, frames = ab->mDataByteSize / (nch * sizeof(float));
@@ -59,18 +61,22 @@ static int cmpf(const void *a, const void *b) { float x = *(const float *)a, y =
 
 int main(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: sinetest <device> <out-ch> <in-ch> <seconds> [buffer-frames]\n"); return 2; }
+    // Find the device and read the arguments.
     AudioObjectID d = find(argv[1]);
     if (!d) { fprintf(stderr, "device not found\n"); return 1; }
     g_out_ch = atoi(argv[2]); g_in_ch = atoi(argv[3]);
     double secs = atof(argv[4]);
+    // Read the sample rate, apply the IO buffer size if given, and read back the size in use.
     AudioObjectPropertyAddress ra = { kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
     UInt32 s = sizeof g_sr; AudioObjectGetPropertyData(d, &ra, 0, NULL, &s, &g_sr);
     AudioObjectPropertyAddress ba = { kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
     if (argc > 5) { UInt32 bf = (UInt32)atoi(argv[5]); AudioObjectSetPropertyData(d, &ba, 0, NULL, sizeof bf, &bf); }
     UInt32 bufsz = 0; s = sizeof bufsz; AudioObjectGetPropertyData(d, &ba, 0, NULL, &s, &bufsz);
+    // Count the HAL's IO overloads while the test runs.
     AudioObjectPropertyAddress oa = { kAudioDeviceProcessorOverload, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
     AudioObjectAddPropertyListener(d, &oa, overload_listener, NULL);
 
+    // Capture for the requested time: start IO, wait, stop.
     g_len = (size_t)(secs * g_sr) + 8192;
     g_in = calloc(g_len, sizeof(float));
     AudioDeviceIOProcID id = NULL;
@@ -83,6 +89,7 @@ int main(int argc, char **argv) {
 
     size_t start = (size_t)g_sr;          /* skip the first second (stream start-up) */
     if (g_n < start + 1000) { printf("too little captured (%zu frames)\n", g_n); return 1; }
+    // Residual of the sine recurrence at every analysed sample, and the signal peak.
     double c2 = 2 * cos(2 * M_PI * FREQ / g_sr);
     size_t m = g_n - 1 - start;
     float *r = malloc(m * sizeof(float)), *sorted = malloc(m * sizeof(float));
@@ -92,10 +99,12 @@ int main(int argc, char **argv) {
         r[i] = fabsf((float)(g_in[n + 1] - c2 * g_in[n] + g_in[n - 1]));
         if (fabsf(g_in[n]) > peak) peak = fabsf(g_in[n]);
     }
+    // Glitch threshold: 30x the median residual (the noise floor) or 2% of the signal peak.
     memcpy(sorted, r, m * sizeof(float));
     qsort(sorted, m, sizeof(float), cmpf);
     float median = sorted[m / 2], p999 = sorted[(size_t)(m * 0.999)];
     float thresh = fmaxf(median * 30.0f, peak * 0.02f);
+    // Count glitches: residuals above the threshold, merging hits less than 64 samples apart.
     int glitches = 0; size_t last = 0; float worst = 0;
     for (size_t i = 0; i < m; i++) {
         if (r[i] > worst) worst = r[i];
@@ -131,6 +140,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    // Report; the exit status is 3 if any glitch or level drop was found.
     printf("rate %.0f Hz, IO buffer %u, %.1f s analysed, signal peak %.3f, typical level %.3f, residual median %.5f p99.9 %.5f max %.4f\n",
            g_sr, bufsz, (double)m / g_sr, peak, typical, median, p999, worst);
     printf("RESULT: %d glitches, %d level drops (%.2f s total), %d HAL overloads, %d input timestamp gaps\n",

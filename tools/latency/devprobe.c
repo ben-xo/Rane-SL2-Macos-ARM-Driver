@@ -43,6 +43,7 @@ int main(int argc, char **argv) {
     AudioObjectID d = find(argc > 1 ? argv[1] : "SL 2");
     if (!d) { fprintf(stderr, "not found\n"); return 1; }
     printf("device id %u\n", d);
+    // Identity and state.
     str(d, "UID", kAudioDevicePropertyDeviceUID);
     str(d, "ModelUID", kAudioDevicePropertyModelUID);
     u32(d, "TransportType", kAudioDevicePropertyTransportType, kAudioObjectPropertyScopeGlobal);
@@ -50,11 +51,13 @@ int main(int argc, char **argv) {
     u32(d, "IsHidden", kAudioDevicePropertyIsHidden, kAudioObjectPropertyScopeGlobal);
     u32(d, "CanBeDefault (out)", kAudioDevicePropertyDeviceCanBeDefaultDevice, kAudioObjectPropertyScopeOutput);
     u32(d, "CanBeDefaultSystem (out)", kAudioDevicePropertyDeviceCanBeDefaultSystemDevice, kAudioObjectPropertyScopeOutput);
+    // Streams and channel layout.
     count(d, "Streams (out)", kAudioDevicePropertyStreams, kAudioObjectPropertyScopeOutput);
     count(d, "Streams (in)", kAudioDevicePropertyStreams, kAudioObjectPropertyScopeInput);
     count(d, "Streams (global)", kAudioDevicePropertyStreams, kAudioObjectPropertyScopeGlobal);
     cfg(d, "StreamConfiguration (out)", kAudioObjectPropertyScopeOutput);
     cfg(d, "StreamConfiguration (in)", kAudioObjectPropertyScopeInput);
+    // Timing, and the stereo pair and layout pickers ask for.
     u32(d, "Latency (out)", kAudioDevicePropertyLatency, kAudioObjectPropertyScopeOutput);
     u32(d, "SafetyOffset (out)", kAudioDevicePropertySafetyOffset, kAudioObjectPropertyScopeOutput);
     u32(d, "BufferFrameSize", kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal);

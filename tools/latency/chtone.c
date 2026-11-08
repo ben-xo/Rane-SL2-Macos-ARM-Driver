@@ -14,6 +14,7 @@ static double g_phase = 0, g_sr = 44100;
 
 static OSStatus proc(AudioObjectID d, const AudioTimeStamp *now, const AudioBufferList *in, const AudioTimeStamp *it,
                      AudioBufferList *out, const AudioTimeStamp *ot, void *ctx) {
+    // Fill every output buffer: the sine on the chosen channels, silence on the rest.
     for (UInt32 b = 0; b < out->mNumberBuffers; b++) {
         AudioBuffer *ab = &out->mBuffers[b];
         UInt32 nch = ab->mNumberChannels, frames = ab->mDataByteSize / (nch * sizeof(float));
@@ -33,9 +34,12 @@ int main(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: chtone <device> <seconds> <ch...>\n"); return 2; }
     AudioObjectID d = find(argv[1]);
     if (!d) { fprintf(stderr, "device not found\n"); return 1; }
+    // Turn the 1-based channel list into a bit mask.
     for (int i = 3; i < argc; i++) g_mask |= 1 << (atoi(argv[i]) - 1);
+    // Read the sample rate, so the tone is 440 Hz at any rate.
     AudioObjectPropertyAddress ra = { kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
     UInt32 s = sizeof g_sr; AudioObjectGetPropertyData(d, &ra, 0, NULL, &s, &g_sr);
+    // Play the tone for the requested time.
     AudioDeviceIOProcID id = NULL;
     if (AudioDeviceCreateIOProcID(d, proc, NULL, &id)) { fprintf(stderr, "CreateIOProcID failed\n"); return 1; }
     AudioDeviceStart(d, id);
