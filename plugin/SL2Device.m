@@ -668,6 +668,7 @@ static void dp_submit(int slot) {
             g_dp_next_pos += off;
             g_dp_sent_cum += off;
             e->sent_cum = g_dp_sent_cum;
+            atomic_fetch_add_explicit(&g_total_play_frames, off, memory_order_relaxed);   /* status packet */
             atomic_store_explicit(&e->frame, f, memory_order_release);   /* publish */
             atomic_store_explicit(&g_dp_newest, f, memory_order_release);
             return;
