@@ -585,7 +585,7 @@ static _Atomic bool     g_dp_active;          /* WriteMix writes into the schedu
 static _Atomic int      g_dp_writers;         /* WriteMix calls currently inside dp_write */
 static _Atomic uint64_t g_dp_x0, g_dp_F0;     /* current anchor: first position / frame */
 static _Atomic uint64_t g_dp_newest;          /* newest published frame: where WriteMix starts looking */
-static bool     g_dp_stream, g_dp_started;    /* g_q only from here down */
+static bool     g_dp_started;                 /* g_q only from here down */
 static uint64_t g_dp_next_frame, g_dp_next_pos, g_dp_sent_cum, g_dp_in_cum, g_dp_last_refresh;
 static double   g_dp_acc, g_dp_err;
 /* USB frame clock: microframe g_dp_ref_uframe is associated with host time g_dp_ref_time (seqlock) */
@@ -748,8 +748,8 @@ static void dp_start(void) {
         atomic_load(&g_dp_F0), DP_SLOTS, DP_OUT_LATENCY_MS, DP_OUT_SAFETY_MS);
 }
 
-/* A capture transfer for USB frame fc covered `frames` frames (errored packets counted at their
-   expected size). Steer the predicted OUT sizes so that the frames sent through each USB frame
+/* A capture completion for USB frame fc placed `frames` frames: everything the box clocked since
+   the previous one, silence-filled frames included. Steer the predicted OUT sizes so that the frames sent through each USB frame
    track the frames the box captured through it. */
 static void dp_track_capture(uint64_t fc, int frames) {
     if (!g_dp_started || fc < atomic_load(&g_dp_F0)) return;
@@ -853,115 +853,173 @@ static void dp_write(const float *buf, UInt32 frames, uint64_t pos) {
     }
 }
 
-static void cap_submit(int idx) {
-    if (!atomic_load(&g_io_running) || !g_cpipe) return;
-    IsoXfer *xf = &g_cap_xf[idx];
-    IOUSBHostIsochronousTransaction *tx = xf->tx;
-    uint64_t f = g_cap_frame;
-    g_cap_frame += CAP_PKTS / 8;
-    g_cap_xf_frame[idx] = f;
+/* ============================================================================
+ * Capture
+ *
+ * CAP_NXF 1 ms isochronous IN transfers are kept queued, each re-queued from its own completion
+ * for the next free USB frame (g_cap_frame). Every captured frame goes into g_in_ring at its
+ * timeline position, contiguously from the first (g_cap_base), and g_cap_head publishes how far
+ * that is, so ReadInput never hands the HAL a position capture has not written.
+ *
+ * The box clocks a frame of audio whether or not the host receives it. When the host doesn't (an
+ * errored packet, or USB frames with no capture request queued after a completion stall long
+ * enough for re-queued requests to be refused), the missing frames are filled with silence and
+ * counted as captured, so the ring, the clock tracker and the playback steering all keep counting
+ * what the box clocked, and the audio that follows lands at its own timeline position.
+ * ============================================================================ */
+static uint64_t g_cap_next_fc;          /* USB frame the next capture completion should cover (g_q) */
+static int      g_cap_last_n;           /* frames in the last good capture packet (g_q) */
+static _Atomic uint64_t g_cap_head;     /* timeline position just past the last frame written to the ring */
+#define CAP_VALID_SPAN (RING_FRAMES / 2)   /* ReadInput trusts positions this far behind the head */
 
+/* Write n frames of silence into the ring from timeline position pos (at most the ring's size). */
+static void cap_fill_silence(uint64_t pos, uint64_t n) {
+    if (n > RING_FRAMES) { pos += n - RING_FRAMES; n = RING_FRAMES; }
+    for (uint64_t i = 0; i < n; i++)
+        memset(&g_in_ring[((pos + i) & RING_MASK) * NCH], 0, NCH * sizeof(float));
+}
+
+/* Audio frames the box clocks in `usb_frames` USB frames, at its measured rate. */
+static uint64_t cap_frames_in(uint64_t usb_frames) {
+    uint64_t h; double s, tpf;
+    clk_get(&h, &s, &tpf);
+    return (uint64_t)((double)usb_frames * ticks_per_ms() / tpf + 0.5);
+}
+
+static void cap_submit(int idx);
+
+/* A capture transfer for USB frame fc completed: put its frames in the ring, keep the clock and the
+   playback steering up to date, and queue the transfer again. */
+static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *done) {
+#if SL2_DEBUG
+    {   /* test hook 0xF3: hold g_q, as a stall in the USB stack's completion delivery would */
+        uint32_t ms = atomic_exchange(&dbg_stall_ms, 0);
+        if (ms) { DBG_LOG("DBG stalling the USB queue for %u ms", ms); usleep(ms * 1000); }
+    }
+#endif
+    /* Times below are bus times, from the USB frame clock (dp_ref_*): a completion's own
+       timeStamp is when the stack processed it, which can be many ms after the bus. */
+    if ((double)(mach_absolute_time() - g_dp_last_refresh) > 0.5 * ticks_per_ms()) dp_ref_refresh();
+#if SL2_DEBUG
+    {   /* when this handler runs, and the stack's completion stamp, relative to the bus
+           start of the transfer's frame (the transfer covers [0, 1) ms of it) */
+        double start = (double)dp_time_of_uframe(8.0 * (double)fc);
+        double ms = ((double)mach_absolute_time() - start) / ticks_per_ms();
+        double stamp = done[CAP_PKTS - 1].timeStamp ? ((double)done[CAP_PKTS - 1].timeStamp - start) / ticks_per_ms() : 0;
+        int bin = (int)floor((ms + 2.0) / 0.5);
+        dbg_capdelay_hist[bin < 0 ? 0 : bin > 23 ? 23 : bin]++;
+        if (ms < dbg_capdelay_min) dbg_capdelay_min = ms;
+        if (ms > dbg_capdelay_max) dbg_capdelay_max = ms;
+        if (stamp < dbg_capstamp_min) dbg_capstamp_min = stamp;
+        if (stamp > dbg_capstamp_max) dbg_capstamp_max = stamp;
+    }
+#endif
+    uint64_t before = atomic_load_explicit(&g_total_cap_frames, memory_order_relaxed);   /* frames captured so far */
+
+    /* First capture of the stream: place this transfer's first good frame on the timeline (a
+       transfer with no good packet places nothing; the next one tries again). */
+    if (before == 0) {
+        int k = 0;
+        while (k < CAP_PKTS && !(done[k].status == kIOReturnSuccess && done[k].completeCount >= FRAME_BYTES &&
+                                 done[k].completeCount <= PKT_MAX)) k++;
+        if (k == CAP_PKTS) { cap_submit(idx); return; }
+        clk_first_capture(dp_time_of_uframe(8.0 * (double)fc + k));
+        g_cap_next_fc = fc;
+    }
+    uint64_t ring_pos = g_cap_base + before;   /* timeline position of the next frame to write */
+    uint64_t got = 0;                          /* frames placed by this completion, fill included */
+    uint64_t ts = 0;                           /* bus time of the first of them */
+
+    /* USB frames between the last completion and this one carried no capture request (they were
+       refused after a stall): the box clocked them anyway, so fill them with silence. */
+    if (before > 0 && fc > g_cap_next_fc) {
+        uint64_t missed = fc - g_cap_next_fc;
+        uint64_t n = cap_frames_in(missed);
+        ts = dp_time_of_uframe(8.0 * (double)g_cap_next_fc);
+        cap_fill_silence(ring_pos, n);
+        got += n;
+        LOG("Capture: %llu ms not captured (USB frames %llu-%llu), filled with silence",
+            missed, g_cap_next_fc, fc - 1);
+    }
+    g_cap_next_fc = fc + 1;
+
+    /* Each packet: convert its frames into the ring, or fill an errored one with silence. */
+    const uint8_t *b = g_cap_xf[idx].buf.bytes;
     for (int k = 0; k < CAP_PKTS; k++) {
-        tx[k] = (IOUSBHostIsochronousTransaction){
-            .requestCount = PKT_MAX,
-            .offset = (uint32_t)(k * PKT_MAX)
-        };
+        /* An errored packet, or an impossible length (a completion can report a completeCount far
+           above the packet size, e.g. 0xFFFFFE00): the frame loop must never run past the
+           112-byte packet, and the box clocked a packet's worth of frames regardless. */
+        bool bad = done[k].status != kIOReturnSuccess || done[k].completeCount > PKT_MAX;
+#if SL2_DEBUG
+        if (!bad && dbg_take_err_pkt()) bad = true;   /* test hook 0xF4 */
+#endif
+        if (!ts) ts = dp_time_of_uframe(8.0 * (double)fc + k);
+        if (bad) {
+            DBG_DO(dbg_cap_pkt_err++);
+            cap_fill_silence(ring_pos + got, (uint64_t)g_cap_last_n);
+            got += (uint64_t)g_cap_last_n;
+            continue;
+        }
+        int n = done[k].completeCount / FRAME_BYTES;
+        if (n >= 4) g_cap_last_n = n;
+        const uint8_t *p = b + k * PKT_MAX;
+        for (int s = 0; s < n; s++) {
+            const uint8_t *q = p + s * FRAME_BYTES;
+            float *fr = &g_in_ring[((ring_pos + got) & RING_MASK) * NCH];
+            for (int c = 0; c < NCH; c++) {
+                int32_t raw32 = 0;
+                memcpy(&raw32, q + c * 4, 4);
+                int32_t s24 = raw32 >> 8;
+                fr[c] = (float)s24 * (1.0f / 8388608.0f);
+            }
+            got++;
+        }
     }
 
-    NSError *e = nil;
-    [g_cpipe enqueueIORequestWithData:xf->buf
-                      transactionList:tx
-                  transactionListCount:CAP_PKTS
-                      firstFrameNumber:f
-                               options:IOUSBHostIsochronousTransferOptionsNone
-                                 error:&e
-                     completionHandler:^(IOReturn st, IOUSBHostIsochronousTransaction *done) {
-        if (!atomic_load(&g_io_running) || st == kIOReturnAborted) return;
-#if SL2_DEBUG
-        {   /* test hook 0xF3: hold g_q, as a stall in the USB stack's completion delivery would */
-            uint32_t ms = atomic_exchange(&dbg_stall_ms, 0);
-            if (ms) { DBG_LOG("DBG stalling the USB queue for %u ms", ms); usleep(ms * 1000); }
-        }
-#endif
-        /* Times below are bus times, from the USB frame clock (dp_ref_*): a completion's own
-           timeStamp is when the stack processed it, which can be many ms after the bus. */
+    /* Publish the ring's new head for ReadInput, then keep the timeline on the box's clock. */
+    atomic_store_explicit(&g_cap_head, ring_pos + got, memory_order_release);
+    clk_track(before, (int)got, ts);
+
+    /* Playback: start after a few ms of capture, then steer it by what the box clocked. */
+    if (!g_dp_started && before >= (uint64_t)(8 * g_sr / 1000)) dp_start();
+    dp_track_capture(fc, (int)got);
+    cap_submit(idx);
+}
+
+/* Queue capture transfer idx for the next free USB frame. If the frame has already passed (after
+   a completion stall), re-anchor ahead of the bus; the frames skipped are filled with silence
+   when the next completion arrives. */
+static void cap_submit(int idx) {
+    for (int attempt = 0; attempt < DP_TRIES; attempt++) {
+        if (!atomic_load(&g_io_running) || !g_cpipe) return;
+
+        /* The next free USB frame, unless that has already passed. */
         if ((double)(mach_absolute_time() - g_dp_last_refresh) > 0.5 * ticks_per_ms()) dp_ref_refresh();
-        uint64_t fc = g_cap_xf_frame[idx];   /* USB frame this transfer covered */
-#if SL2_DEBUG
-        {   /* when this handler runs, and the stack's completion stamp, relative to the bus
-               start of the transfer's frame (the transfer covers [0, 1) ms of it) */
-            double start = (double)dp_time_of_uframe(8.0 * (double)fc);
-            double ms = ((double)mach_absolute_time() - start) / ticks_per_ms();
-            double stamp = done[CAP_PKTS - 1].timeStamp ? ((double)done[CAP_PKTS - 1].timeStamp - start) / ticks_per_ms() : 0;
-            int bin = (int)floor((ms + 2.0) / 0.5);
-            dbg_capdelay_hist[bin < 0 ? 0 : bin > 23 ? 23 : bin]++;
-            if (ms < dbg_capdelay_min) dbg_capdelay_min = ms;
-            if (ms > dbg_capdelay_max) dbg_capdelay_max = ms;
-            if (stamp < dbg_capstamp_min) dbg_capstamp_min = stamp;
-            if (stamp > dbg_capstamp_max) dbg_capstamp_max = stamp;
-        }
-#endif
-        const uint8_t *b = xf->buf.bytes;
-        uint64_t wp = atomic_load_explicit(&g_total_cap_frames, memory_order_relaxed);
-        int got = 0;
-        uint64_t ts = 0;
+        uint64_t now_f = (uint64_t)dp_frame_at(mach_absolute_time());
+        if (g_cap_frame < now_f + DP_DRY_LEAD) g_cap_frame = now_f + DP_START_LEAD;
+        uint64_t f = g_cap_frame++;
+        g_cap_xf_frame[idx] = f;
 
-        if (wp == 0) {   /* nothing captured yet: place this transfer's first frame on the timeline */
-            for (int k = 0; k < CAP_PKTS; k++) {
-                if (done[k].status == kIOReturnSuccess && done[k].completeCount >= FRAME_BYTES &&
-                    done[k].completeCount <= PKT_MAX) {
-                    clk_first_capture(dp_time_of_uframe(8.0 * (double)fc + k));
-                    break;
-                }
-            }
-        }
-        uint64_t ring_pos = g_cap_base + wp;   /* timeline position of this transfer's first frame */
+        /* One full-size packet per microframe. */
+        IOUSBHostIsochronousTransaction *tx = g_cap_xf[idx].tx;
+        for (int k = 0; k < CAP_PKTS; k++)
+            tx[k] = (IOUSBHostIsochronousTransaction){ .requestCount = PKT_MAX, .offset = (uint32_t)(k * PKT_MAX) };
 
-        int errored = 0;
-        static int last_n = 0;   /* size of the last good packet, for counting errored ones */
-        if (!last_n) last_n = (int)(g_sr / 8000.0 + 0.5);
-        for (int k = 0; k < CAP_PKTS; k++) {
-            /* Drop errored packets and impossible lengths. The first completion after a
-               killed helper can carry a residual from the old request (e.g. 0xFFFFFE00),
-               and the frame loop must never run past the 112-byte packet. */
-            bool bad = done[k].status != kIOReturnSuccess || done[k].completeCount > PKT_MAX;
-#if SL2_DEBUG
-            if (!bad && dbg_take_err_pkt()) bad = true;   /* test hook 0xF4 */
-#endif
-            if (bad) {
-                DBG_DO(dbg_cap_pkt_err++);
-                errored++;
-                continue;
-            }
-            int n = done[k].completeCount / FRAME_BYTES;
-            if (n >= 4) {
-                last_n = n;
-            }
-            if (n > 0) {
-                if (!ts) ts = dp_time_of_uframe(8.0 * (double)fc + k);
-                const uint8_t *p = b + k * PKT_MAX;
-                for (int s = 0; s < n; s++) {
-                    const uint8_t *q = p + s * FRAME_BYTES;
-                    float *fr = &g_in_ring[((ring_pos + got) & RING_MASK) * NCH];
-                    for (int c = 0; c < NCH; c++) {
-                        int32_t raw32 = 0;
-                        memcpy(&raw32, q + c * 4, 4);
-                        int32_t s24 = raw32 >> 8;
-                        fr[c] = (float)s24 * (1.0f / 8388608.0f);
-                    }
-                    got++;
-                }
-            }
-        }
-        clk_track(wp, got, ts);
-
-        if (g_dp_stream) {   /* deep-schedule playback: start after a few ms of capture */
-            if (!g_dp_started && wp >= (uint64_t)(8 * g_sr / 1000)) dp_start();
-            /* the box clocked errored packets too: count them at the last good size */
-            dp_track_capture(fc, got + errored * last_n);
-        }
-        cap_submit(idx);
-    }];
+        NSError *e = nil;
+        BOOL ok = [g_cpipe enqueueIORequestWithData:g_cap_xf[idx].buf transactionList:tx
+                                transactionListCount:CAP_PKTS firstFrameNumber:f
+                                             options:IOUSBHostIsochronousTransferOptionsNone error:&e
+                                   completionHandler:^(IOReturn st, IOUSBHostIsochronousTransaction *done) {
+            if (!atomic_load(&g_io_running) || st == kIOReturnAborted || dp_gone(st)) return;
+            cap_complete(idx, f, done);
+        }];
+        if (ok) return;
+        /* Refused (the frame passed while this ran): take the next one. */
+        LOG("Capture enqueue refused for frame %llu (now ~%llu): %{public}@", f, now_f, e.localizedDescription);
+        g_cap_frame = now_f + DP_START_LEAD + attempt + 1;
+    }
+    /* Still refused: try again shortly rather than losing this transfer for the rest of the stream. */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_MSEC), g_q, ^{ cap_submit(idx); });
 }
 
 /* ============================================================================
@@ -1060,7 +1118,6 @@ static bool usb_open_all(void) {
     if (!usb_ensure_hid()) return false;
     NSError *e = nil;
 
-    g_dp_stream = true;
     g_dp_started = false;
     atomic_store(&g_dp_active, false);
     DBG_DO(dbg_reset());
@@ -1099,7 +1156,7 @@ static bool usb_open_all(void) {
         return false;
     }
     dp_ref_refresh();   /* USB frame clock, used for bus times from the first capture on */
-    if (g_dp_stream && !dp_alloc()) g_dp_stream = false;
+    if (!dp_alloc()) return false;
 
     for (int i = 0; i < CAP_NXF; i++) {
         if (!g_cap_xf[i].buf) g_cap_xf[i].buf = [NSMutableData dataWithLength:CAP_PKTS * PKT_MAX];
@@ -1110,6 +1167,9 @@ static bool usb_open_all(void) {
     hb_start();
 
     memset(g_in_ring, 0, sizeof(g_in_ring));
+    atomic_store(&g_cap_head, 0);
+    g_cap_next_fc = 0;
+    g_cap_last_n = (int)(g_sr / 8000.0 + 0.5);
 
     clk_reset();
     atomic_store(&g_total_cap_frames, 0);
@@ -1905,10 +1965,17 @@ static OSStatus SL2_BeginIOOperation(AudioServerPlugInDriverRef d, AudioObjectID
 static OSStatus SL2_DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID oid, AudioObjectID sid, UInt32 cid, UInt32 op, UInt32 frames, const AudioServerPlugInIOCycleInfo *ci, void *ioMain, void *ioSec) {
     float *buf = (float*)ioMain;
     if (op == kAudioServerPlugInIOOperationReadInput) {
+        /* Copy each frame from the capture ring, or silence where capture has not written yet (it
+           is later than the input safety offset, or the box is gone) or wrote too long ago. */
         uint64_t pos = (uint64_t)ci->mInputTime.mSampleTime;
+        uint64_t head = atomic_load_explicit(&g_cap_head, memory_order_acquire);
         for (UInt32 f = 0; f < frames; f++) {
-            uint32_t idx = ((uint32_t)((pos + f) & RING_MASK)) * NCH;
-            memcpy(buf + f * NCH, &g_in_ring[idx], NCH * sizeof(float));
+            uint64_t p = pos + f;
+            if (p >= head || head - p > CAP_VALID_SPAN) {
+                memset(buf + f * NCH, 0, NCH * sizeof(float));
+                continue;
+            }
+            memcpy(buf + f * NCH, &g_in_ring[(p & RING_MASK) * NCH], NCH * sizeof(float));
         }
     } else if (op == kAudioServerPlugInIOOperationWriteMix) {
         uint64_t pos = (uint64_t)ci->mOutputTime.mSampleTime;
