@@ -238,19 +238,17 @@ EXPORT int RH_get_port_speed(void *h, int *sp) { if (sp) *sp = 1; return 0; }
 EXPORT int RH_set_control_point(void *h, int a, int b) { return 0; }
 EXPORT int RH_driver_timer(void *h, int *t) { if (t) *t = 1000; return 0; }
 
-EXPORT int RH_get_firmware_version(void *h, int *v) {
+/* As Rane's SL2Api: ask the box (HID 0x01) and fill four values: major, minor, 0, and the
+   32-bit build stamp from reply[7..10] (big-endian). 12 = not connected, 8 = bad argument. */
+EXPORT int RH_get_firmware_version(void *h, uint32_t v[4]) {
     if (!is_usb_present()) return 12;
-    SL2StatusPacket s;
-    if (hal_get_status(&s) && (s.version_maj || s.version_min)) {
-        if (v) *v = (s.version_maj << 8) | s.version_min;
-        return 0;
-    }
+    if (!h || !v) return 8;
     uint8_t r[64] = {0};
-    if (send_hid_cmd(0x10, NULL, 0, r)) {
-        if (v) *v = (r[5] << 8) | r[6];
-        return 0;
-    }
-    if (v) *v = 0x0101;
+    if (!send_hid_cmd(0x01, NULL, 0, r) || r[0] != 0x01) return 4;   /* no reply from the box */
+    v[0] = r[5];
+    v[1] = r[6];
+    v[2] = 0;
+    v[3] = ((uint32_t)r[7] << 24) | ((uint32_t)r[8] << 16) | ((uint32_t)r[9] << 8) | r[10];
     return 0;
 }
 
@@ -354,7 +352,7 @@ EXPORT int   SL2_set_buffer_millisecs(void *h, int m) { return RH_set_buffer_mil
 EXPORT int   SL2_get_usb_port_status(void *h, int *st) { return RH_get_usb_port_status(h, st); }
 EXPORT int   SL2_get_port_speed(void *h, int *sp) { return RH_get_port_speed(h, sp); }
 EXPORT int   SL2_driver_timer(void *h, int *t) { return RH_driver_timer(h, t); }
-EXPORT int   SL2_get_firmware_version(void *h, int *v) { return RH_get_firmware_version(h, v); }
+EXPORT int   SL2_get_firmware_version(void *h, uint32_t v[4]) { return RH_get_firmware_version(h, v); }
 EXPORT int   SL2_get_firmware_embedded_version(void *h, int *v) { return RH_get_firmware_embedded_version(h, v); }
 EXPORT int   SL2_get_all_controls(void *h) { return RH_get_all_controls(h); }
 EXPORT int   SL2_send_hidimsg(void *h, const uint8_t *msg, int len) { return RH_send_hidimsg(h, msg, len); }
