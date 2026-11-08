@@ -1,5 +1,14 @@
 # Rane SL 2 — USB command protocol
 
+> ⚠ **Commands `0x02`, `0x16` and `0x17` write the box's boot EEPROM.** `0x17` alone marks the
+> firmware non-bootable, so the box comes up in its USB bootloader at the next power-up; a wrong
+> `0x02` sequence can leave it unbootable, and recovering that has needed a SOIC clip on the EEPROM
+> chip (`tools/firmware/`). `0x1a` re-enumerates the box under another product ID until it is
+> power-cycled. Never send these to a working box except through `tools/firmware/sl2flash`.
+>
+> Any program on the Mac can send any command through the HAL driver's `'sl2h'` property (below):
+> the driver does not filter opcodes, as Rane's software did not either.
+
 The SL 2 is controlled through 64-byte reports on its HID interface. This document lists
 every command the SL 2's firmware accepts, what it does, and the unsolicited reports the
 box sends back. It covers both firmware images the box can run:
@@ -24,6 +33,12 @@ EEPROM-programming commands in depth.
 - Rane's Mac driver sent the reports through its kext's user client
   (`IOConnectCallMethod(selector=7, 60-byte struct)`); a kext-less host can open the EP1
   interrupt pipes directly or use the HID interface.
+- This project's HAL driver (`plugin/SL2Device.m`) owns the interface while it runs and
+  offers it to other programs through CoreAudio custom properties: writing a 64-byte command to
+  `'sl2h'` sends it and keeps the reply for that process, which its next read of `'sl2h'`
+  returns; `'sl2q'` gives each process the box's unsolicited reports. `tools/SL2Api.m` replaces
+  Rane's `SL2Api.framework` on top of these, with the same functions; `tools/SL2Passthrough.m`
+  is the minimal client the firmware tools use.
 
 ### Report layout
 
@@ -46,13 +61,13 @@ that image does not implement the command (it replies `0xFF`).
 |----|--------|------|-----|---------|----------------|
 | `0x00` | — | `0870` | `0175` | — | ping: reply byte 0 = `0x00`; tag **not** echoed |
 | `0x01` | `RH_get_firmware_version` | `087b` | `0180` | — | firmware version: `[5]` major, `[6]` minor, `[7..10]` 32-bit big-endian build stamp |
-| `0x02` | `UpdateFinalFirmware` | `09a2` | `05a8` | `[5..6]` EEPROM address, `[7..38]` data | write 32 EEPROM bytes, reply with them read back; requires `0x17` first |
+| ⚠ `0x02` | `UpdateFinalFirmware` | `09a2` | `05a8` | `[5..6]` EEPROM address, `[7..38]` data | write 32 EEPROM bytes, reply with them read back; requires `0x17` first |
 | `0x03` | — | `09dd` | `05e3` | `[5..6]` EEPROM address | read 32 EEPROM bytes: `[5..6]` address echoed, `[7..38]` the data; read-only, no `0x17` needed |
 | `0x06` | — | `0878` | `017d` | — | does nothing; **no reply is sent** |
 | `0x0a` | `RH_get_port_speed` | `08b0` | `01b6` | — | USB connection speed in `[5]`: 0 = not configured, 1 = full speed, 2 = high speed |
-| `0x16` | `UpdateFinalFirmware` | `0a35` | `063c` | — | finalize: write `0xC2` boot header, disconnect, restart from EEPROM |
-| `0x17` | `UpdateFinalFirmware` | `0a0d` | `0613` | — | begin: write `0xC0` (non-bootable) boot header, enable `0x02` |
-| `0x1a` | `RH_set_alt_product_id` | — | `06bf` | — | reconnect to USB as product ID `0x0014` |
+| ⚠ `0x16` | `UpdateFinalFirmware` | `0a35` | `063c` | — | finalize: write `0xC2` boot header, disconnect, restart from EEPROM. Does **not** require `0x17` first: it restarts the box whenever it is sent |
+| ⚠ `0x17` | `UpdateFinalFirmware` | `0a0d` | `0613` | — | begin: write `0xC0` (non-bootable) boot header, enable `0x02` |
+| ⚠ `0x1a` | `RH_set_alt_product_id` | — | `06bf` | — | reconnect to USB as product ID `0x0014` |
 | `0x1b` | — | — | `06bf` | — | reconnect to USB as product ID `0x0013` (the normal identity) |
 | `0x30` | `SL2_get_sample_rate` | `08d1` | `01db` | — | get the sample rate: `[5..6]`, big-endian |
 | `0x31` | — | `08e7` | `01f1` | `[5..6]` sample rate, big-endian | set the sample rate; only 44100 and 48000 are accepted, anything else → `0xFF` |
@@ -107,7 +122,10 @@ the flash of Rane's flash-based devices); the SL 2 answers all of them `0xFF`.
   its only timers are the input debounce, the `0x31` mute and the LED blink. Nothing the
   8051 sends to the FPGA (the signals in the hardware map below) depends on `0x37` either.
   So the box behaves the same whether or not the challenge arrives; its evident purpose is
-  to let the *host* software confirm it is talking to genuine Rane hardware.
+  to let the *host* software confirm it is talking to genuine Rane hardware (Serato DJ Pro
+  2.5.5 sends a random challenge through `SL2_driver_timer` and checks the answer). Confirmed
+  on the box: a 45 s loopback stream with no `0x37` at all played at full level with no
+  glitches, so this project's driver doesn't send it unless a client asks.
 - **`0x45` USB port status** returns zeros in both images, so it carries no information on
   the SL 2. SL2Api sends it (with `[5]=0`) when a box connects.
 - **`0x06`** is a no-op in both images: the handler only re-arms EP1 OUT for the next
@@ -156,7 +174,7 @@ message. PE0 is the LINE/PHONO switch (verified on the hardware by flipping it);
 | PC5 | out (only in `0x16`) | pulsed low after disconnecting in `0x16`; most likely resets the FX2 so it reboots from EEPROM |
 | PC6, PE4, PE5 | out | audio clock / power: PE4 = 44.1 kHz, PE5 = 48 kHz; all raised when powering down |
 | PC7 | in | unknown input (debounced, 6 ms); reported as note `0x60`; decides the thru default and whether the audio side is powered down on suspend |
-| PE0 | in | the LINE/PHONO switch; reported as note `0x61` (On = phono); a change also sends the word `0x8000` to the FPGA |
+| PE0 | in | the LINE/PHONO switch; reported as note `0x61` (On = phono). Any change, in either direction, also sends the constant word `0x8000` to the FPGA: a change notification, without the switch position (also sent once when the FPGA has loaded) |
 | PE1, PE2 | out | deck 2 / deck 1 analogue thru |
 | PE6 | out | select line for 16-bit writes to the FPGA over serial port 0 |
 | serial port 0 | out | FPGA configuration data and clock (LSB first), then 16-bit FPGA writes |

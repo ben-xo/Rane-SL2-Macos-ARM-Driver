@@ -38,6 +38,10 @@
                                   la Rane SL2.
 - Desinstalar-Rane-SL2.command -> Elimina el driver y sus componentes si
                                   deseas desinstalarlo.
+- Firmware-SL2.command         -> Solo para recuperar una Rane SL2 que ha
+                                  quedado en modo bootloader (sin firmware).
+                                  Necesita una copia del codigo fuente
+                                  (ver tools/firmware/README.md).
 
 
 3. COMO INSTALARLO EN CUALQUIER MAC
@@ -84,14 +88,17 @@ OPCION B (Con el asistente grafico RaneSL2-macOS-Universal.pkg):
 5. COMO FUNCIONA EL DRIVER EN EL DIA A DIA
 ------------------------------------------
 - Conexion en caliente: Puedes enchufar y desenchufar la Rane SL2 por USB en
-  cualquier momento.
+  cualquier momento. La SL2 solo aparece en la lista de dispositivos de audio
+  mientras esta conectada.
 - Canales de Audio (4 Entradas / 4 Salidas a 24-bit / 44.1 o 48 kHz):
     * Canales 1 y 2: Left Deck (Plato / CDJ Izquierdo)
     * Canales 3 y 4: Right Deck (Plato / CDJ Derecho)
 - Panel de Control en Ajustes del Sistema:
-    * En "Ajustes del Sistema" -> "SL 2" (abajo del todo) puedes consultar y
-      cambiar entre Phono / Line, activar o desactivar Thru en cada canal y
-      cambiar la frecuencia de muestreo (44100 Hz / 48000 Hz).
+    * En "Ajustes del Sistema" -> "SL 2" (abajo del todo) puedes consultar el
+      selector Phono / Line (es un interruptor fisico de la SL2, el mismo para
+      los dos platos: el panel lo muestra pero no puede cambiarlo), activar o
+      desactivar Thru en cada canal y cambiar la frecuencia de muestreo
+      (44100 Hz / 48000 Hz).
 
 ========================================================================
   Creditos: Idea original y proyecto por pepelee (PPLEE)
