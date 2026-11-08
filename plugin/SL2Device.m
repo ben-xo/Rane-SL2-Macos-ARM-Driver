@@ -109,6 +109,7 @@ static UInt32   g_io_clients = 0;
 static _Atomic bool g_io_running = false;
 static _Atomic bool g_hw_connected = false;
 static _Atomic bool g_boot_mode = false;     /* a bootloader-mode box (no firmware) is attached */
+static _Atomic bool g_box_present = false;   /* a box with running firmware is attached */
 static uint32_t g_ref_count = 0;
 
 /* Capture ring buffer (Float32 interleaved, NCH channels), indexed by timeline position */
@@ -1138,14 +1139,48 @@ static void usb_close_all(void) {
     atomic_store(&g_hw_connected, false);
 }
 
-static void notify_alive_changed(void) {
+/* The device is published (in the plug-in's device list, so it shows in the system's device
+   lists) only while a box is attached. A box in its bootloader keeps it published so clients can
+   read boot_mode from the 'sl2s' status. */
+static bool device_published(void) {
+    return atomic_load(&g_box_present) || atomic_load(&g_boot_mode);
+}
+
+/* Which boxes are attached now: running firmware and/or bootloader. */
+static void scan_attached(bool *audio, bool *bootloader) {
+    *audio = *bootloader = false;
+    CFMutableDictionaryRef m = IOServiceMatching(kIOUSBDeviceClassName);
+    if (!m) return;
+    int v = VID, p = PID;
+    CFNumberRef vn = CFNumberCreate(NULL, kCFNumberIntType, &v);
+    CFNumberRef pn = CFNumberCreate(NULL, kCFNumberIntType, &p);
+    CFDictionarySetValue(m, CFSTR(kUSBVendorID), vn);
+    CFDictionarySetValue(m, CFSTR(kUSBProductID), pn);
+    CFRelease(vn); CFRelease(pn);
+    io_iterator_t it = 0;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, m, &it) != KERN_SUCCESS) return;
+    io_service_t s;
+    while ((s = IOIteratorNext(it))) {
+        if (svc_bcd(s) == BCD_LOADER) *bootloader = true;
+        else                          *audio = true;
+        IOObjectRelease(s);
+    }
+    IOObjectRelease(it);
+}
+
+/* Tell the HAL the device list changed (the device appeared or went away), and that the device's
+   IsAlive did. */
+static void notify_device_list_changed(void) {
     if (!g_host) return;
-    AudioObjectPropertyAddress addr = {
-        kAudioDevicePropertyDeviceIsAlive,
-        kAudioObjectPropertyScopeGlobal,
-        kAudioObjectPropertyElementMain
+    AudioObjectPropertyAddress plug[2] = {
+        { kAudioPlugInPropertyDeviceList, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+        { kAudioObjectPropertyOwnedObjects, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
     };
-    g_host->PropertiesChanged(g_host, kObjDevice, 1, &addr);
+    AudioObjectPropertyAddress alive = {
+        kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
+    };
+    g_host->PropertiesChanged(g_host, kObjDevice, 1, &alive);
+    g_host->PropertiesChanged(g_host, kObjPlugIn, 2, plug);
 }
 
 /* ----------------------------------------------------------------------------
@@ -1168,31 +1203,41 @@ static void on_usb_added(void *refcon, io_iterator_t iter) {
         else                          audio = true;
         IOObjectRelease(s);
     }
+    if (!audio && !bootloader) return;
+    bool was_published = device_published();
     if (audio) {
         atomic_store(&g_boot_mode, false);
+        atomic_store(&g_box_present, true);
         LOG("Rane SL 2 USB connected");
         pthread_mutex_lock(&g_mutex);
         usb_ensure_hid();
         pthread_mutex_unlock(&g_mutex);
-        notify_alive_changed();
     }
     if (bootloader) {
         atomic_store(&g_boot_mode, true);
         note_bootloader_device();
     }
+    if (!was_published) notify_device_list_changed();
 }
 
 static void on_usb_removed(void *refcon, io_iterator_t iter) {
     io_service_t s;
     bool removed = false;
     while ((s = IOIteratorNext(iter))) { IOObjectRelease(s); removed = true; }
-    if (removed) {
+    if (!removed) return;
+    /* The removed service can no longer be asked what it was: see what is still attached. */
+    bool audio, bootloader;
+    scan_attached(&audio, &bootloader);
+    bool was_published = device_published();
+    if (!audio && atomic_load(&g_box_present)) {
         LOG("Rane SL 2 USB disconnected");
+        atomic_store(&g_box_present, false);
         pthread_mutex_lock(&g_mutex);
         usb_close_all();
         pthread_mutex_unlock(&g_mutex);
-        notify_alive_changed();
     }
+    atomic_store(&g_boot_mode, bootloader);
+    if (was_published != device_published()) notify_device_list_changed();
 }
 
 static void start_hotplug_monitor(void) {
@@ -1407,7 +1452,7 @@ static OSStatus SL2_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjec
             case kAudioObjectPropertyManufacturer:
             case kAudioPlugInPropertyResourceBundle: *outSize = sizeof(CFStringRef); return 0;
             case kAudioObjectPropertyOwnedObjects:
-            case kAudioPlugInPropertyDeviceList: *outSize = sizeof(AudioObjectID); return 0;
+            case kAudioPlugInPropertyDeviceList: *outSize = device_published() ? sizeof(AudioObjectID) : 0; return 0;
             case kAudioPlugInPropertyTranslateUIDToDevice: *outSize = sizeof(AudioObjectID); return 0;
         }
     }
@@ -1488,10 +1533,16 @@ static OSStatus SL2_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
             case kAudioPlugInPropertyResourceBundle: *(CFStringRef*)outData = CFSTR(""); *outSize = sizeof(CFStringRef); return 0;
             case kAudioObjectPropertyOwnedObjects:
             case kAudioPlugInPropertyDeviceList:
-                *(AudioObjectID*)outData = kObjDevice; *outSize = sizeof(AudioObjectID); return 0;
+                if (device_published() && inSize >= sizeof(AudioObjectID)) {
+                    *(AudioObjectID*)outData = kObjDevice; *outSize = sizeof(AudioObjectID);
+                } else {
+                    *outSize = 0;
+                }
+                return 0;
             case kAudioPlugInPropertyTranslateUIDToDevice: {
-                CFStringRef u = *(CFStringRef*)qd;
-                *(AudioObjectID*)outData = (u && CFEqual(u, CFSTR("com.rane.sl2.hal.device"))) ? kObjDevice : kAudioObjectUnknown;
+                CFStringRef u = (qd && qsz >= sizeof(CFStringRef)) ? *(CFStringRef*)qd : NULL;
+                *(AudioObjectID*)outData = (device_published() && u && CFEqual(u, CFSTR("com.rane.sl2.hal.device")))
+                                         ? kObjDevice : kAudioObjectUnknown;
                 *outSize = sizeof(AudioObjectID);
                 return 0;
             }
@@ -1511,7 +1562,7 @@ static OSStatus SL2_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
             case kAudioDevicePropertyTransportType: *(UInt32*)outData = kAudioDeviceTransportTypeUSB; *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertyRelatedDevices: *(AudioObjectID*)outData = kObjDevice; *outSize = sizeof(AudioObjectID); return 0;
             case kAudioDevicePropertyClockDomain: *(UInt32*)outData = 0x52414E32; *outSize = sizeof(UInt32); return 0;
-            case kAudioDevicePropertyDeviceIsAlive: *(UInt32*)outData = 1; *outSize = sizeof(UInt32); return 0;
+            case kAudioDevicePropertyDeviceIsAlive: *(UInt32*)outData = device_published() ? 1 : 0; *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertyDeviceIsRunning: *(UInt32*)outData = (g_io_clients > 0) ? 1 : 0; *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertyDeviceCanBeDefaultDevice:
             case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: *(UInt32*)outData = 1; *outSize = sizeof(UInt32); return 0;
