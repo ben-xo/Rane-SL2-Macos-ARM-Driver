@@ -52,6 +52,7 @@
 #define PLAY_PKTS    8       /* 1 ms per transfer */
 #define PLAY_NXF     20
 #define PLAY_START_MS 24     /* first playback transfer is scheduled this many USB frames (ms) ahead */
+#define PLAY_MIN_LEAD 2      /* a playback transfer is never scheduled closer than this to the current USB frame */
 #define OUT_SAFETY_MS 2      /* how far ahead of "now" the HAL writes output: one 1 ms transfer + 1 ms headroom */
 #define RING_FRAMES  65536   /* ~1.36s @ 48kHz */
 #define RING_MASK    (RING_FRAMES - 1)
@@ -491,7 +492,29 @@ static void dbg_leave(void) { atomic_fetch_sub(&dbg_in_handler, 1); }
 static int64_t  dbg_min_margin = 1 << 30;
 static int      dbg_enq_err_code;
 
-static void play_submit(int idx) {
+/* Frames for the next playback packet (one USB microframe): the size the box used for the
+   matching capture packet (implicit feedback), or the nominal rate if none is queued. */
+static int play_packet_frames(void) {
+    int n;
+    uint32_t r = atomic_load_explicit(&g_fifo_r, memory_order_relaxed);
+    uint32_t w = atomic_load_explicit(&g_fifo_w, memory_order_acquire);
+    if (r < w) {
+        n = g_fifo[r % FIFO_N];
+        atomic_store_explicit(&g_fifo_r, r + 1, memory_order_release);
+    } else {
+        dbg_fifo_empty++;   /* DEBUG */
+        g_faccum += (uint32_t)g_sr;
+        n = g_faccum / 8000;
+        g_faccum %= 8000;
+    }
+    if (n < 4) n = 5;
+    if (n * FRAME_BYTES > PKT_MAX) n = PKT_MAX / FRAME_BYTES;
+    return n;
+}
+
+static void play_submit(int idx);
+
+static void play_submit_try(int idx, int attempt) {
     if (!atomic_load(&g_io_running) || !g_ppipe) return;
     IsoXfer *xf = &g_play_xf[idx];
     uint8_t *buf = xf->buf.mutableBytes;
@@ -499,24 +522,30 @@ static void play_submit(int idx) {
     uint64_t f = g_play_frame;
     g_play_frame += PLAY_PKTS / 8;
 
+    /* A transfer has to be scheduled in the future. If the completion that triggered this one was
+       delivered late (the USB queue stalled), its frame may already have passed and the enqueue
+       would be refused, ending this transfer chain. Schedule it PLAY_MIN_LEAD frames from now
+       instead, and skip the audio for the frames that will not be played, so playback stays
+       aligned with the timeline. */
+    int64_t margin = (int64_t)f - (int64_t)[g_dev frameNumberWithTime:NULL];
+    if (margin < dbg_min_margin) dbg_min_margin = margin;   /* DEBUG */
+    dbg_margin_hist[margin < 0 ? 0 : margin >= 6 ? 7 : margin + 1]++;
+    if (margin < PLAY_MIN_LEAD) {
+        uint64_t skip = (uint64_t)(PLAY_MIN_LEAD - margin);   /* USB frames (ms) */
+        f += skip;
+        g_play_frame = f + PLAY_PKTS / 8;
+        int skipped = 0;
+        for (uint64_t k = 0; k < skip * 8; k++) skipped += play_packet_frames();
+        atomic_fetch_add_explicit(&g_total_play_frames, skipped, memory_order_acq_rel);
+        dbg_late++; dbg_skipped_ms += (uint32_t)skip;   /* DEBUG */
+        LOG("DBG play skip: slot %d due %lld frames from now (min %d), skipped %llu ms",
+            idx, (long long)margin, PLAY_MIN_LEAD, skip);
+    }
+
     int total_frames = 0;
     int pkt_n[PLAY_PKTS];
     for (int k = 0; k < PLAY_PKTS; k++) {
-        int n;
-        uint32_t r = atomic_load_explicit(&g_fifo_r, memory_order_relaxed);
-        uint32_t w = atomic_load_explicit(&g_fifo_w, memory_order_acquire);
-        if (r < w) {
-            n = g_fifo[r % FIFO_N];
-            atomic_store_explicit(&g_fifo_r, r + 1, memory_order_release);
-        } else {
-            dbg_fifo_empty++;   /* DEBUG */
-            uint32_t sr8 = (uint32_t)g_sr;
-            g_faccum += sr8;
-            n = g_faccum / 8000;
-            g_faccum %= 8000;
-        }
-        if (n < 4) n = 5;
-        if (n * FRAME_BYTES > PKT_MAX) n = PKT_MAX / FRAME_BYTES;
+        int n = play_packet_frames();
         pkt_n[k] = n;
         total_frames += n;
     }
@@ -605,11 +634,19 @@ static void play_submit(int idx) {
     if (!queued) {
         atomic_fetch_sub(&g_play_inflight, 1);
         dbg_enq_fail++; dbg_enq_err_code = (int)e.code;   /* DEBUG */
-        LOG("DBG play enqueue failed: slot %d, frame %llu is %lld frames from now, error 0x%x %{public}@",
-            idx, f, (long long)f - (long long)[g_dev frameNumberWithTime:NULL], (int)e.code, e.localizedDescription);
+        LOG("DBG play enqueue failed (attempt %d): slot %d, frame %llu is %lld frames from now, error 0x%x %{public}@",
+            attempt + 1, idx, f, (long long)f - (long long)[g_dev frameNumberWithTime:NULL], (int)e.code, e.localizedDescription);
+        /* Usually the frame passed while this call was being made. Try again: the next attempt
+           sees the frame has passed and skips ahead (the audio read for this one is dropped),
+           so this transfer chain carries on instead of ending. */
+        if (attempt < 2) play_submit_try(idx, attempt + 1);
     } else {
         dbg_enq_ok++; dbg_slot_pending[idx] = true;   /* DEBUG */
     }
+}
+
+static void play_submit(int idx) {
+    play_submit_try(idx, 0);
 }
 
 static void cap_submit(int idx) {
@@ -699,7 +736,22 @@ static void cap_submit(int idx) {
                the first transfer plays PLAY_START_MS (1 ms per USB frame) from now. */
             double tl_now = clk_sample_at(mach_absolute_time());
             double first = tl_now + PLAY_START_MS * g_sr / 1000.0 - out_latency_frames();
-            g_play_base = first > 0 ? (uint64_t)first : 0;
+            /* the read position is g_play_base + frames already played, which a restart keeps */
+            double base = first - (double)atomic_load(&g_total_play_frames);
+            g_play_base = base > 0 ? (uint64_t)base : 0;
+            if (atomic_load(&g_total_play_frames) > 0) {   /* DEBUG */
+                dbg_restarts++;
+                uint64_t since = mach_absolute_time() - atomic_load(&dbg_last_play_done);
+                int pend = 0;
+                for (int j = 0; j < PLAY_NXF; j++) pend += dbg_slot_pending[j];
+                LOG("DBG playback restarted: in flight %d, slots pending %d, enqueued-completed %d "
+                    "(%u-%u), double completions %u, enqueue into pending slot %u, last play completion %.2f ms ago, "
+                    "handler overlaps %u, off-queue %u",
+                    atomic_load(&g_play_inflight), pend, (int)(dbg_enq_ok - dbg_completions), dbg_enq_ok,
+                    dbg_completions, dbg_double_done, dbg_reuse_pending,
+                    (double)since * g_tb.numer / g_tb.denom / 1e6,
+                    atomic_load(&dbg_overlap), atomic_load(&dbg_off_queue));
+            }
             for (int j = 0; j < atomic_load(&g_play_nxf); j++) play_submit(j);
         }
         cap_submit(idx);
