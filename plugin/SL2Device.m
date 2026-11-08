@@ -593,7 +593,7 @@ static void clk_track(uint64_t count_before, int frames, uint64_t ts) {
  * frame's start time; because the packet sizes follow the box's clock, every sample then plays
  * DP_OUT_LATENCY_MS after its timeline position. The HAL writes each sample DP_OUT_SAFETY_MS
  * ahead of "now"; together they cover the up-to-1 ms between a sample's position and its frame's
- * start plus DP_WRITE_GUARD, with the rest as margin for a late IO thread.
+ * start plus DP_WRITE_GUARD_FRAMES, with the rest as margin for a late IO thread.
  *
  * Packet sizes are fixed when a transfer is queued, ~DP_SLOTS ms before it plays, so they cannot
  * be copied from the matching capture packets (implicit feedback). They are predicted from the
@@ -607,7 +607,8 @@ static void clk_track(uint64_t count_before, int frames, uint64_t ts) {
 #define DP_START_LEAD  8           /* (re)anchor this many frames ahead of the bus (+4 was refused) */
 #define DP_DRY_LEAD    4           /* the schedule counts as run dry when it reaches less than this far ahead */
 #define DP_CORR_S      1.0         /* sent-vs-captured frame difference is removed over this many seconds */
-#define DP_WRITE_GUARD 1.0         /* a frame is written only if it starts at least this many ms from now */
+#define DP_WRITE_GUARD_FRAMES 1.0  /* a frame is written only if it starts at least this many USB frames
+                                      (1 ms each) from now */
 #define DP_TRIES       4           /* enqueue attempts per call before retrying the slot later */
 
 typedef struct {
@@ -618,20 +619,28 @@ typedef struct {
     uint8_t *buf;                  /* the frame's transfer buffer */
 } DPEntry;
 
+/* Shared with WriteMix (the HAL's IO thread): the schedule ring (a seqlock per entry), the
+   transfer buffers it points into, and atomics. Allocated and released by usb_open_all /
+   usb_release_audio, written by dp_submit on g_q. */
 static DPEntry        g_dp_sched[DP_SCHED_N];
 static NSMutableData *g_dp_data[DP_SLOTS];
 static uint8_t       *g_dp_ptr[DP_SLOTS];
-static IOUSBHostIsochronousTransaction g_dp_tx[DP_SLOTS][PLAY_PKTS];
 static _Atomic bool     g_dp_active;          /* WriteMix writes into the schedule */
 static _Atomic int      g_dp_writers;         /* WriteMix calls currently inside dp_write */
 static _Atomic uint64_t g_dp_x0, g_dp_F0;     /* current anchor: first position / frame */
 static _Atomic uint64_t g_dp_newest;          /* newest published frame: where WriteMix starts looking */
-static bool     g_dp_started;                 /* g_q only from here down */
-static uint64_t g_dp_next_frame, g_dp_next_pos, g_dp_sent_cum, g_dp_in_cum, g_dp_last_refresh;
+
+/* The schedule's bookkeeping, used only on g_q (reset by usb_open_all before capture starts). */
+static IOUSBHostIsochronousTransaction g_dp_tx[DP_SLOTS][PLAY_PKTS];
+static bool     g_dp_started;
+static uint64_t g_dp_next_frame, g_dp_next_pos, g_dp_sent_cum, g_dp_in_cum;
 static double   g_dp_acc, g_dp_err;
-/* USB frame clock: microframe g_dp_ref_uframe is associated with host time g_dp_ref_time (seqlock) */
+
+/* The USB frame clock: microframe g_dp_ref_uframe is associated with host time g_dp_ref_time.
+   Written by dp_ref_refresh (g_q, or usb_open_all before streaming), read on any thread through
+   dp_ref_get (seqlock). */
 static _Atomic uint32_t g_dp_ref_seq;
-static uint64_t g_dp_ref_uframe, g_dp_ref_time;
+static uint64_t g_dp_ref_uframe, g_dp_ref_time, g_dp_last_refresh;
 
 static double ticks_per_ms(void) {
     return 1e6 * (double)g_tb.denom / (double)g_tb.numer;
@@ -677,11 +686,12 @@ static double dp_frame_at(uint64_t t) {
     return ((double)uf + ((double)t - (double)ut) / (ticks_per_ms() / 8.0)) / 8.0;
 }
 
-/* Host time at which (fractional) microframe uframe starts on the bus. */
-static uint64_t dp_time_of_uframe(double uframe) {
+/* Host time at which (fractional) USB frame usb_frame starts on the bus; the inverse of
+   dp_frame_at. A packet k of a frame starts k / 8 frames in (a microframe is 1/8 ms). */
+static uint64_t usb_frame_time(double usb_frame) {
     uint64_t uf, ut;
     dp_ref_get(&uf, &ut);
-    return (uint64_t)((double)ut + (uframe - (double)uf) * (ticks_per_ms() / 8.0));
+    return (uint64_t)((double)ut + (8.0 * usb_frame - (double)uf) * (ticks_per_ms() / 8.0));
 }
 
 /* Frames in the next OUT packet: the box's measured rate, steered by dp_track_capture. */
@@ -701,7 +711,7 @@ static int dp_packet_frames(void) {
 /* (Re)start the schedule at frame F: it carries the timeline position DP_OUT_LATENCY_MS before
    F's start time, and the sent-vs-captured count starts again from F. */
 static void dp_anchor(uint64_t F) {
-    double x0 = clk_sample_at(dp_time_of_uframe(8.0 * (double)F)) - DP_OUT_LATENCY_MS * g_sr / 1000.0;
+    double x0 = clk_sample_at(usb_frame_time((double)F)) - DP_OUT_LATENCY_MS * g_sr / 1000.0;
     g_dp_next_frame = F;
     g_dp_next_pos = x0 > 0 ? (uint64_t)x0 : 0;
     g_dp_sent_cum = 0; g_dp_in_cum = 0; g_dp_err = 0; g_dp_acc = 0;
@@ -878,7 +888,7 @@ static void dp_write(const float *buf, UInt32 frames, uint64_t pos) {
         hint_frame = (uint64_t)fg; hint_first = first;
         uint32_t n = (uint32_t)(first + off[PLAY_PKTS] - p);
         if (n > frames - i) n = frames - i;
-        if ((double)fg - now_f < DP_WRITE_GUARD) {
+        if ((double)fg - now_f < DP_WRITE_GUARD_FRAMES) {
             DBG_DO(atomic_fetch_add_explicit(&dbg_dp_late, n, memory_order_relaxed));
         } else {
             uint32_t j = (uint32_t)(p - first);
@@ -956,7 +966,7 @@ static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *
 #if SL2_DEBUG
     {   /* when this handler runs, and the stack's completion stamp, relative to the bus
            start of the transfer's frame (the transfer covers [0, 1) ms of it) */
-        double start = (double)dp_time_of_uframe(8.0 * (double)fc);
+        double start = (double)usb_frame_time((double)fc);
         double ms = ((double)mach_absolute_time() - start) / ticks_per_ms();
         double stamp = done[CAP_PKTS - 1].timeStamp ? ((double)done[CAP_PKTS - 1].timeStamp - start) / ticks_per_ms() : 0;
         int bin = (int)floor((ms + 2.0) / 0.5);
@@ -976,7 +986,7 @@ static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *
         while (k < CAP_PKTS && !(done[k].status == kIOReturnSuccess && done[k].completeCount >= FRAME_BYTES &&
                                  done[k].completeCount <= PKT_MAX)) k++;
         if (k == CAP_PKTS) { cap_submit(idx, gen); return; }
-        clk_first_capture(dp_time_of_uframe(8.0 * (double)fc + k));
+        clk_first_capture(usb_frame_time((double)fc + k / 8.0));
         g_cap_next_fc = fc;
     }
     uint64_t ring_pos = g_cap_base + before;   /* timeline position of the next frame to write */
@@ -988,7 +998,7 @@ static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *
     if (before > 0 && fc > g_cap_next_fc) {
         uint64_t missed = fc - g_cap_next_fc;
         uint64_t n = cap_frames_in(8 * missed);
-        ts = dp_time_of_uframe(8.0 * (double)g_cap_next_fc);
+        ts = usb_frame_time((double)g_cap_next_fc);
         cap_fill_silence(ring_pos, n);
         got += n;
         LOG("Capture: %llu ms not captured (USB frames %llu-%llu), filled with silence",
@@ -1006,7 +1016,7 @@ static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *
 #if SL2_DEBUG
         if (!bad && dbg_take_err_pkt()) bad = true;   /* test hook 0xF4 */
 #endif
-        if (!ts) ts = dp_time_of_uframe(8.0 * (double)fc + k);
+        if (!ts) ts = usb_frame_time((double)fc + k / 8.0);
         if (bad) {
             DBG_DO(dbg_cap_pkt_err++);
             uint64_t n = cap_frames_in(1);
