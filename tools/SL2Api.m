@@ -256,29 +256,15 @@ EXPORT int RH_get_firmware_version(void *h, int *v) {
 
 EXPORT int RH_get_firmware_embedded_version(void *h, int *v) { if (v) *v = 0x0101; return 0; }
 
-EXPORT int RH_get_all_controls(void *h) {
-    uint8_t pl[1] = {0};
-    send_hid_cmd(0x42, pl, 1, NULL);
-    /* Also push current Thru and Phono states from HAL status into g_hidi_cb */
-    SL2StatusPacket s;
-    if (hal_get_status(&s) && g_hidi_cb) {
-        for (int i = 0; i < 2; i++) {
-            RH_hidimsg_data_t m = {0};
-            m.length = 3;
-            m.data[0] = s.thru[i] ? 0x91 : 0x81;
-            m.data[1] = (uint8_t)(0x5C + i);
-            m.data[2] = 0x00;
-            g_hidi_cb(&m);
+EXPORT int RH_send_hidimsg(void *h, const uint8_t *msg, int len);
 
-            RH_hidimsg_data_t mp = {0};
-            mp.length = 3;
-            mp.data[0] = s.phono[i] ? 0x91 : 0x81;
-            mp.data[1] = 0x61;
-            mp.data[2] = (uint8_t)i;
-            g_hidi_cb(&mp);
-        }
-    }
-    return 0;
+/* As Rane's SL2Api does: ask the box for a state dump (Hidi SysEx F0 17 04 F7, sent with 0x41).
+   The box answers with 0x40 reports of notes 0x5C/0x5D (deck thru), 0x61 (the LINE/PHONO switch)
+   and 0x60, which reach the hidimsg callback through the unsolicited-report poll like any other. */
+EXPORT int RH_get_all_controls(void *h) {
+    ensure_poll_timer();
+    static const uint8_t dump[4] = { 0xF0, 0x17, 0x04, 0xF7 };
+    return RH_send_hidimsg(h, dump, sizeof dump);
 }
 
 EXPORT int RH_send_hidimsg(void *h, const uint8_t *msg, int len) {
@@ -292,7 +278,8 @@ EXPORT int RH_send_hidimsg(void *h, const uint8_t *msg, int len) {
 
 /* Rane's API takes (handle, note, velocity): the SL 2 Audio Control Panel calls
    SL2_send_note_on(h, 0x5C, 0) for "deck 1 thru on" and SL2_send_note_off for off
-   (0x5D = deck 2, 0x61 = phono/line with the deck in the velocity). */
+   (0x5D = deck 2). The firmware acts on notes 0x5C and 0x5D only: LINE/PHONO (note 0x61) is a
+   physical switch, reported by the box but not settable. */
 EXPORT int RH_send_note_on(void *h, uint8_t note, uint8_t vel) {
     uint8_t m[3] = { 0x90, note, vel };
     return RH_send_hidimsg(h, m, 3);
