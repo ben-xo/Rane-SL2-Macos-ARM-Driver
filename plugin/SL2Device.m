@@ -216,7 +216,8 @@ static _Atomic int  g_dbg_qmode = 0;        /* next stream: 0 = g_q, 1 = g_q_wl 
 static _Atomic bool g_dbg_rt = false;       /* next stream: request the realtime thread policy */
 static bool g_stream_wl, g_stream_rt;       /* settings of the current stream */
 static uint32_t dbg_margin_hist[8];         /* playback submit margin: <0, 0, 1, ..., 5, >=6 frames */
-static uint32_t dbg_capdelay_hist[7];       /* capture delivery delay: <1, <2, <3, <5, <10, <20, >=20 ms */
+static uint32_t dbg_capdelay_hist[24];      /* capture handler time - bus start of its frame: 0.5 ms bins from -2 ms */
+static double   dbg_capdelay_min, dbg_capdelay_max, dbg_capstamp_min, dbg_capstamp_max;
 static IOUSBHostDevice    *g_dev;
 static IOUSBHostInterface *g_play, *g_cap, *g_hid;
 static IOUSBHostPipe      *g_ppipe, *g_cpipe, *g_hpipe_in, *g_hpipe_out;
@@ -1127,12 +1128,17 @@ static void cap_submit(int idx) {
            timeStamp is when the stack processed it, which can be many ms after the bus. */
         if ((double)(mach_absolute_time() - g_dp_last_refresh) > 0.5 * ticks_per_ms()) dp_ref_refresh();
         uint64_t fc = g_cap_xf_frame[idx];   /* USB frame this transfer covered */
-        {   /* DEBUG: delivery delay, from the end of the transfer on the bus */
-            uint64_t bus_end = dp_time_of_uframe(8.0 * (double)(fc + 1)), nowt = mach_absolute_time();
-            if (nowt > bus_end) {
-                double ms = (double)(nowt - bus_end) / ticks_per_ms();
-                dbg_capdelay_hist[ms < 1 ? 0 : ms < 2 ? 1 : ms < 3 ? 2 : ms < 5 ? 3 : ms < 10 ? 4 : ms < 20 ? 5 : 6]++;
-            }
+        {   /* DEBUG: when this handler runs, and the stack's completion stamp, relative to the bus
+               start of the transfer's frame (the transfer covers [0, 1) ms of it) */
+            double start = (double)dp_time_of_uframe(8.0 * (double)fc);
+            double ms = ((double)mach_absolute_time() - start) / ticks_per_ms();
+            double stamp = done[CAP_PKTS - 1].timeStamp ? ((double)done[CAP_PKTS - 1].timeStamp - start) / ticks_per_ms() : 0;
+            int bin = (int)floor((ms + 2.0) / 0.5);
+            dbg_capdelay_hist[bin < 0 ? 0 : bin > 23 ? 23 : bin]++;
+            if (ms < dbg_capdelay_min) dbg_capdelay_min = ms;
+            if (ms > dbg_capdelay_max) dbg_capdelay_max = ms;
+            if (stamp < dbg_capstamp_min) dbg_capstamp_min = stamp;
+            if (stamp > dbg_capstamp_max) dbg_capstamp_max = stamp;
         }
         const uint8_t *b = xf->buf.bytes;
         uint64_t wp = atomic_load_explicit(&g_total_cap_frames, memory_order_relaxed);
@@ -1406,6 +1412,7 @@ static bool usb_open_all(void) {
         g_stream_rt ? "requested" : "off", atomic_load(&g_play_nxf));
     memset(dbg_margin_hist, 0, sizeof dbg_margin_hist);
     memset(dbg_capdelay_hist, 0, sizeof dbg_capdelay_hist);
+    dbg_capdelay_min = dbg_capstamp_min = 1e9; dbg_capdelay_max = dbg_capstamp_max = -1e9;
     g_dp_stream = atomic_load(&g_dp_enabled);
     g_dp_started = false;
     atomic_store(&g_dp_active, false);
@@ -1517,10 +1524,13 @@ static void usb_stop_streaming(void) {
             atomic_load(&dp_written), atomic_load(&dp_late), atomic_load(&dp_unscheduled),
             dp_enq_fail, dp_resync, g_dp_err, dp_err_max);
     {   /* DEBUG: this stream's timing histograms */
-        const uint32_t *m = dbg_margin_hist, *c = dbg_capdelay_hist;
-        LOG("DBG hist play margin (frames) <0:%u 0:%u 1:%u 2:%u 3:%u 4:%u 5:%u >=6:%u | "
-            "capture delivery <1ms:%u <2:%u <3:%u <5:%u <10:%u <20:%u >=20:%u | skipped %u ms",
-            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], c[0], c[1], c[2], c[3], c[4], c[5], c[6], dbg_skipped_ms);
+        const uint32_t *c = dbg_capdelay_hist;
+        char hb[600]; int o = 0;
+        for (int i = 0; i < 24; i++)
+            if (c[i]) o += snprintf(hb + o, sizeof hb - o, " %+.1f:%u", -2.0 + 0.5 * i, c[i]);
+        LOG("DBG capture handler vs bus start of its frame (ms, bin start:count):%{public}s | "
+            "min %.2f max %.2f | stack stamp min %.2f max %.2f",
+            hb, dbg_capdelay_min, dbg_capdelay_max, dbg_capstamp_min, dbg_capstamp_max);
         if (g_xp_mode)
             LOG("DBG xp result: mode %d lead %d | late writes %u (closest %lld frames) | missed %u | "
                 "completions %u | enqueue fail %u | resyncs %u | alloc fail %u",
