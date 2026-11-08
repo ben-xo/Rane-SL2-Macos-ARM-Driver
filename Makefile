@@ -1,7 +1,8 @@
 CC = clang
 ARCH = -arch arm64 -arch x86_64
 CFLAGS = -fobjc-arc -O2
-# make plugin DEBUG=1 builds the driver with its streaming diagnostics and debug commands
+# make plugin DEBUG=1 builds the driver with its streaming diagnostics and its debug commands
+# (tools/latency/bin/sl2dbg: input safety offset, test hooks)
 PLUGIN_DEFS = $(if $(DEBUG),-DSL2_DEBUG=1)
 
 all: plugin api panel dump flash

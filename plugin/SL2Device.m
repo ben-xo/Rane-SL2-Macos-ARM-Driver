@@ -7,11 +7,14 @@
  *
  * Capabilities:
  *   - 4-channel 24-bit (32-bit container) / 44.1 & 48 kHz Isochronous USB Audio
- *   - Implicit-feedback packet pacing from Capture to Playback
+ *   - Low-latency playback: transfers queued 128 ms ahead, audio written into them shortly
+ *     before they play; packet sizes predicted from the box's clock and steered to match capture
+ *     (docs/SL2-AUDIO-ENGINE.md)
  *   - Automatic USB Audio / Analog Thru switching on StartIO / StopIO (HID 0x41)
  *   - Full HID Command/Response + Unsolicited Report Queue ('sl2h', 'sl2s', 'sl2q')
  *     for Serato DJ Pro (SL2Api.framework) and Control Panel
- *   - Automatic USB Hotplug detection (plug / unplug at any time)
+ *   - Automatic USB Hotplug detection (plug / unplug at any time): the device is listed only
+ *     while a box is attached, and the decks are put on analogue thru when it connects
  *   - Bootloader detection: a box whose EEPROM firmware is missing/corrupt enumerates in the
  *     USB bootloader (bcdDevice 0x0000, "Unnamed Device") and passes no audio. The driver
  *     detects this and reports it — in the log and via a boot_mode flag in the 'sl2s' status —
@@ -186,8 +189,9 @@ static float g_in_ring[RING_FRAMES * NCH];
    follow the box's own clock, or playback, which runs at the box's rate, drifts against it.
    So every CLK_FIX_FRAMES captured frames, clk_track re-anchors the line where it is (keeping it
    continuous) and sets its rate to the box's measured rate plus a correction that pulls the line
-   onto the box's actual frame count over CLK_CORR_S seconds. g_q writes it; GetZeroTimeStamp
-   (the HAL's IO thread) reads it, so it is published under a sequence lock.
+   onto the box's actual frame count over CLK_CORR_S seconds. clk_track (g_q) writes it while
+   streaming and clk_reset (HAL threads, with streaming stopped) restarts it; GetZeroTimeStamp (the
+   HAL's IO thread) reads it, so it is published under a sequence lock.
 
    Capture begins some milliseconds after the timeline starts: the first captured frame sits at
    the timeline position matching its arrival (g_cap_base), and the box's rate is measured from
@@ -531,7 +535,7 @@ static IOUSBHostPipe *copy_isoch_pipe(IOUSBHostInterface *intf, uint8_t dir, uin
 }
 
 /* ============================================================================
- * Isochronous Audio Streaming (Capture + Implicit-Feedback Playback)
+ * Timeline clock: following the box's clock (clk_first_capture, clk_track)
  * ============================================================================ */
 
 /* First capture of a stream: note when it arrived, and where on the HAL's timeline it belongs. */
@@ -584,16 +588,18 @@ static void clk_track(uint64_t count_before, int frames, uint64_t ts) {
  * zero-filled, and the HAL's IO thread (WriteMix) writes each sample straight into the queued
  * transfer that will carry it, shortly before that transfer starts. This works because the
  * controller reads a transfer's buffer when the transfer starts: audio written into a queued
- * ioDataWithCapacity: buffer before then is what gets sent. Completions only recycle transfers
- * at the far end of the schedule, so a stall shorter than the schedule costs nothing.
+ * ioDataWithCapacity: buffer before then is what gets sent. Completions only queue new transfers
+ * at the far end of the schedule, so a stall in completion delivery does not interrupt the audio
+ * unless it outlasts the queue: about 120 ms at small IO buffers (the 128 ms queued, less how far
+ * ahead the HAL writes: about two IO buffers plus the safety offset).
  *
  * Each queued USB frame carries a contiguous run of HAL timeline positions, published in
  * g_dp_sched (indexed by frame number) for the IO thread to look up. When the schedule is
  * anchored (dp_anchor), its first frame carries the position DP_OUT_LATENCY_MS before that
  * frame's start time; because the packet sizes follow the box's clock, every sample then plays
  * DP_OUT_LATENCY_MS after its timeline position. The HAL writes each sample DP_OUT_SAFETY_MS
- * ahead of "now"; together they cover the up-to-1 ms between a sample's position and its frame's
- * start plus DP_WRITE_GUARD_FRAMES, with the rest as margin for a late IO thread.
+ * ahead of "now". Together (3.5 ms) they cover the up-to-1 ms span of positions within a frame
+ * plus DP_WRITE_GUARD_FRAMES (1 ms), leaving 1.5 ms of margin for a late IO thread.
  *
  * Packet sizes are fixed when a transfer is queued, ~DP_SLOTS ms before it plays, so they cannot
  * be copied from the matching capture packets (implicit feedback). They are predicted from the
@@ -602,9 +608,11 @@ static void clk_track(uint64_t count_before, int frames, uint64_t ts) {
  * sent: its positions move to the next frame (the audio stays continuous) and it does not count
  * as sent, so the steering makes up the frames the box missed.
  * ============================================================================ */
-#define DP_SLOTS       128         /* transfers kept queued: 128 ms (the HAL writes up to ~2 IO buffers ahead) */
+#define DP_SLOTS       128         /* transfers kept queued: 128 ms, covering both how far ahead the HAL
+                                      writes (~2 IO buffers + safety) and completion stalls */
 #define DP_SCHED_N     512         /* schedule ring entries: power of two, >= 2 x (DP_SLOTS + HAL lead) */
-#define DP_START_LEAD  8           /* (re)anchor this many frames ahead of the bus (+4 was refused) */
+#define DP_START_LEAD  8           /* (re)anchor this many frames ahead of the bus (a transfer only
+                                      4 frames ahead can be refused: 0xe00002ee) */
 #define DP_DRY_LEAD    4           /* the schedule counts as run dry when it reaches less than this far ahead */
 #define DP_CORR_S      1.0         /* sent-vs-captured frame difference is removed over this many seconds */
 #define DP_WRITE_GUARD_FRAMES 1.0  /* a frame is written only if it starts at least this many USB frames
@@ -731,7 +739,8 @@ static void dp_submit(int slot, uint32_t gen) {
         if ((double)(mach_absolute_time() - g_dp_last_refresh) > 0.5 * ticks_per_ms()) dp_ref_refresh();
         uint64_t now_f = (uint64_t)dp_frame_at(mach_absolute_time());
         if (g_dp_next_frame < now_f + DP_DRY_LEAD) {
-            /* The schedule ran dry: a stall longer than DP_SLOTS ms. Re-anchor ahead of the bus. */
+            /* The schedule has (almost) run dry: under DP_DRY_LEAD frames ahead of the bus, after
+               a completion stall of nearly DP_SLOTS ms (or repeated refusals). Re-anchor ahead. */
             dp_anchor(now_f + DP_START_LEAD);
             DBG_DO(dbg_dp_resync++);
         }
@@ -2182,8 +2191,9 @@ static OSStatus SL2_DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID oi
         if (atomic_load_explicit(&g_dp_active, memory_order_seq_cst)) {
 #if SL2_DEBUG
             {   /* WriteMix calling pattern: with several clients the HAL calls it from more than one
-                   IO thread; it was measured never to overlap or repeat a position (each call carries
-                   the full mix), which is what lets dp_write overwrite rather than mix */
+                   IO thread, but never concurrently and never for a position already written (each
+                   call carries the full mix; these counters check that), which is what lets
+                   dp_write overwrite rather than mix */
                 uint64_t tid = (uint64_t)pthread_mach_thread_np(pthread_self());
                 if (atomic_exchange_explicit(&dbg_wm_last_thread, tid, memory_order_relaxed) != tid)
                     atomic_fetch_add_explicit(&dbg_wm_thread_switches, 1, memory_order_relaxed);
