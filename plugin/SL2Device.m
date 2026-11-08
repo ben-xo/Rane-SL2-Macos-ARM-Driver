@@ -47,8 +47,6 @@
 #define FRAME_BYTES  16      /* 4 ch * 4 bytes (24-bit left-justified in 32-bit int) */
 #define PKT_MAX      112     /* wMaxPacketSize of EP 0x06/0x82: 7 frames * 16 bytes per microframe */
 #define HEARTBEAT_MS 100
-#define IN_SAFETY_44 900     /* input safety offset in frames at 44.1 kHz (~20 ms): capture
-                                completions can arrive 10-20 ms late, the HAL must read behind */
 #define CAP_PKTS     8       /* 1 ms per transfer */
 #define CAP_NXF      64
 #define PLAY_PKTS    8       /* 1 ms per transfer */
@@ -131,16 +129,21 @@ static uint64_t g_cap_base = 0;
 static uint64_t g_play_base = 0;     /* timeline position playback starts reading from */
 static uint64_t g_clk_last_fix = 0;  /* captured-frame count at the last clk_track correction */
 
-/* Output timing. With PLAY_NXF 1 ms transfers queued, a transfer is filled when the one
-   PLAY_NXF before it completes, about PLAY_NXF ms before it plays. Reading each frame
-   out_latency_frames() (PLAY_NXF ms) after its timeline position puts the end of each read at
+/* Output timing. With g_play_nxf 1 ms transfers queued, a transfer is filled when the one
+   g_play_nxf before it completes, about g_play_nxf ms before it plays. Reading each frame
+   out_latency_frames() (g_play_nxf ms) after its timeline position puts the end of each read at
    most 1 ms (one transfer) ahead of the HAL's "now"; the HAL writes OUT_SAFETY_MS ahead. Both are
    reported to the HAL, so clients see the true output latency: their sum. */
+static _Atomic int g_play_nxf = PLAY_NXF;   /* transfers queued; DEBUG: settable via 'sl2h' 0xF0 */
+static _Atomic int g_in_safety_ms = 20;   /* DEBUG: settable via 'sl2h' 0xF2 */
+static UInt32 in_safety_frames(void) {
+    return (UInt32)(atomic_load(&g_in_safety_ms) * g_sr / 1000.0 + 0.5);
+}
 static UInt32 out_safety_frames(void) {
     return (UInt32)(OUT_SAFETY_MS * g_sr / 1000.0 + 0.5);
 }
 static UInt32 out_latency_frames(void) {
-    return (UInt32)(PLAY_NXF * (PLAY_PKTS / 8) * g_sr / 1000.0 + 0.5);
+    return (UInt32)(atomic_load(&g_play_nxf) * (PLAY_PKTS / 8) * g_sr / 1000.0 + 0.5);
 }
 static _Atomic uint64_t g_total_cap_frames = 0;
 static _Atomic uint64_t g_total_play_frames = 0;
@@ -187,6 +190,8 @@ static uint32_t g_faccum = 0;
 
 /* IOUSBHost state */
 static dispatch_queue_t    g_q;
+static uint32_t dbg_margin_hist[8];         /* playback submit margin: <0, 0, 1, ..., 5, >=6 frames */
+static uint32_t dbg_capdelay_hist[7];       /* capture delivery delay: <1, <2, <3, <5, <10, <20, >=20 ms */
 static IOUSBHostDevice    *g_dev;
 static IOUSBHostInterface *g_play, *g_cap, *g_hid;
 static IOUSBHostPipe      *g_ppipe, *g_cpipe, *g_hpipe_in, *g_hpipe_out;
@@ -461,7 +466,30 @@ static void clk_track(uint64_t count_before, int frames, uint64_t ts) {
     if (rate > nom_rate * 1.005) rate = nom_rate * 1.005;
     if (rate < nom_rate * 0.995) rate = nom_rate * 0.995;
     clk_set(ts, here, 1.0 / rate);
+
+    static uint32_t dbg_n;   /* DEBUG (temporary) */
+    if (++dbg_n % 40 == 0)
+        LOG("DBG clk: phase error %.1f frames (%.3f ms), rate %.1f ppm vs nominal",
+            err, 1000.0 * err / g_sr, (rate / nom_rate - 1.0) * 1e6);
 }
+
+/* DEBUG (temporary): playback/capture health counters, reset per stream, logged every ~2 s */
+static uint32_t dbg_late, dbg_enq_fail, dbg_play_st_err, dbg_play_pkt_err, dbg_fifo_empty, dbg_cap_pkt_err;
+static uint32_t dbg_aborted, dbg_restarts, dbg_skipped_ms;
+/* DEBUG: are USB completions really serialised on g_q? */
+static int dbg_q_key;
+static _Atomic int dbg_in_handler;
+static _Atomic uint32_t dbg_overlap, dbg_off_queue;
+static _Atomic uint64_t dbg_last_play_done;
+static bool     dbg_slot_pending[PLAY_NXF];
+static uint32_t dbg_enq_ok, dbg_completions, dbg_double_done, dbg_reuse_pending;
+static void dbg_enter(void) {
+    if (atomic_fetch_add(&dbg_in_handler, 1) > 0) atomic_fetch_add(&dbg_overlap, 1);
+    if (!dispatch_get_specific(&dbg_q_key)) atomic_fetch_add(&dbg_off_queue, 1);
+}
+static void dbg_leave(void) { atomic_fetch_sub(&dbg_in_handler, 1); }
+static int64_t  dbg_min_margin = 1 << 30;
+static int      dbg_enq_err_code;
 
 static void play_submit(int idx) {
     if (!atomic_load(&g_io_running) || !g_ppipe) return;
@@ -481,6 +509,7 @@ static void play_submit(int idx) {
             n = g_fifo[r % FIFO_N];
             atomic_store_explicit(&g_fifo_r, r + 1, memory_order_release);
         } else {
+            dbg_fifo_empty++;   /* DEBUG */
             uint32_t sr8 = (uint32_t)g_sr;
             g_faccum += sr8;
             n = g_faccum / 8000;
@@ -499,6 +528,21 @@ static void play_submit(int idx) {
     double tl_now = clk_sample_at(mach_absolute_time());
     uint64_t written_to = tl_now > 0 ? (uint64_t)tl_now + out_safety_frames() : 0;
 
+    /* DEBUG (temporary): reader position vs the HAL timeline, every ~2 s */
+    static uint64_t dbg_base; static uint32_t dbg_submits, dbg_silent;
+    if (dbg_base != g_play_base) {
+        dbg_base = g_play_base; dbg_submits = 0; dbg_silent = 0;
+    }
+    if (++dbg_submits % 2000 == 0) {
+        LOG("DBG play q%d: read %.2f ms ahead (limit %.1f) | silent %u | min margin %lld fr, late %u | "
+            "enqueue fail %u (0x%x) | play err %u/%u pkts | cap pkt err %u | fifo empty %u | aborted %u | restarts %u | skipped %u ms",
+            atomic_load(&g_play_nxf), 1000.0 * ((double)(rp + total_frames) - tl_now) / g_sr,
+            1000.0 * out_safety_frames() / g_sr, dbg_silent, (long long)dbg_min_margin, dbg_late,
+            dbg_enq_fail, dbg_enq_err_code, dbg_play_st_err, dbg_play_pkt_err, dbg_cap_pkt_err, dbg_fifo_empty,
+            dbg_aborted, dbg_restarts, dbg_skipped_ms);
+        dbg_min_margin = 1 << 30;   /* per-interval minimum */
+    }
+
     for (int k = 0; k < PLAY_PKTS; k++) {
         int n = pkt_n[k];
         tx[k] = (IOUSBHostIsochronousTransaction){
@@ -511,6 +555,7 @@ static void play_submit(int idx) {
             uint32_t ridx = ((uint32_t)(rp & RING_MASK)) * NCH;
             uint8_t *q = dst + s * FRAME_BYTES;
             bool ready = rp < written_to;
+            if (!ready && dbg_submits > (uint32_t)atomic_load(&g_play_nxf)) dbg_silent++;   /* DEBUG */
             for (int c = 0; c < NCH; c++) {
                 float v = ready ? g_out_ring[ridx + c] : 0.0f;
                 if (ready) g_out_ring[ridx + c] = 0.0f;
@@ -524,6 +569,7 @@ static void play_submit(int idx) {
     }
 
     atomic_fetch_add(&g_play_inflight, 1);
+    if (dbg_slot_pending[idx]) dbg_reuse_pending++;   /* DEBUG */
     NSError *e = nil;
     BOOL queued = [g_ppipe enqueueIORequestWithData:xf->buf
                       transactionList:tx
@@ -532,12 +578,38 @@ static void play_submit(int idx) {
                                options:IOUSBHostIsochronousTransferOptionsNone
                                  error:&e
                      completionHandler:^(IOReturn st, IOUSBHostIsochronousTransaction *done) {
+        dbg_enter();   /* DEBUG */
+        atomic_store(&dbg_last_play_done, mach_absolute_time());
+        dbg_completions++;
+        if (!dbg_slot_pending[idx]) dbg_double_done++;
+        dbg_slot_pending[idx] = false;
         atomic_fetch_sub(&g_play_inflight, 1);
-        if (atomic_load(&g_io_running) && st != kIOReturnAborted) {
-            play_submit(idx);
+        if (st != kIOReturnSuccess && st != kIOReturnAborted) dbg_play_st_err++;   /* DEBUG */
+        if (st == kIOReturnAborted && atomic_load(&g_io_running)) {
+            dbg_aborted++;
+            LOG("DBG playback transfer aborted while streaming (in flight now %d)", atomic_load(&g_play_inflight));
         }
+        for (int k = 0; k < PLAY_PKTS && st != kIOReturnAborted; k++)
+            if (done[k].status != kIOReturnSuccess) dbg_play_pkt_err++;
+        if (atomic_load(&g_io_running) && st != kIOReturnAborted) {
+            uint32_t before = dbg_enq_ok + dbg_enq_fail;   /* DEBUG */
+            play_submit(idx);
+            if (dbg_enq_ok + dbg_enq_fail == before)
+                LOG("DBG play_submit(%d) returned without enqueueing (st 0x%x, running %d, ppipe %p)",
+                    idx, st, atomic_load(&g_io_running), g_ppipe);
+        } else {
+            LOG("DBG play completion not resubmitted: slot %d, st 0x%x, running %d", idx, st, atomic_load(&g_io_running));
+        }
+        dbg_leave();   /* DEBUG */
     }];
-    if (!queued) atomic_fetch_sub(&g_play_inflight, 1);
+    if (!queued) {
+        atomic_fetch_sub(&g_play_inflight, 1);
+        dbg_enq_fail++; dbg_enq_err_code = (int)e.code;   /* DEBUG */
+        LOG("DBG play enqueue failed: slot %d, frame %llu is %lld frames from now, error 0x%x %{public}@",
+            idx, f, (long long)f - (long long)[g_dev frameNumberWithTime:NULL], (int)e.code, e.localizedDescription);
+    } else {
+        dbg_enq_ok++; dbg_slot_pending[idx] = true;   /* DEBUG */
+    }
 }
 
 static void cap_submit(int idx) {
@@ -563,6 +635,14 @@ static void cap_submit(int idx) {
                                  error:&e
                      completionHandler:^(IOReturn st, IOUSBHostIsochronousTransaction *done) {
         if (!atomic_load(&g_io_running) || st == kIOReturnAborted) return;
+        dbg_enter();   /* DEBUG */
+        {   /* DEBUG: how long after its last packet this capture transfer was delivered */
+            uint64_t last = done[CAP_PKTS - 1].timeStamp, nowt = mach_absolute_time();
+            if (last && nowt > last) {
+                double ms = (double)(nowt - last) * g_tb.numer / g_tb.denom / 1e6;
+                dbg_capdelay_hist[ms < 1 ? 0 : ms < 2 ? 1 : ms < 3 ? 2 : ms < 5 ? 3 : ms < 10 ? 4 : ms < 20 ? 5 : 6]++;
+            }
+        }
         const uint8_t *b = xf->buf.bytes;
         uint64_t wp = atomic_load_explicit(&g_total_cap_frames, memory_order_relaxed);
         int got = 0;
@@ -583,7 +663,7 @@ static void cap_submit(int idx) {
             /* Drop errored packets and impossible lengths. The first completion after a
                killed helper can carry a residual from the old request (e.g. 0xFFFFFE00),
                and the frame loop must never run past the 112-byte packet. */
-            if (done[k].status != kIOReturnSuccess || done[k].completeCount > PKT_MAX) continue;
+            if (done[k].status != kIOReturnSuccess || done[k].completeCount > PKT_MAX) { dbg_cap_pkt_err++; continue; }
             int n = done[k].completeCount / FRAME_BYTES;
             if (n >= 4) {
                 uint32_t w = atomic_load_explicit(&g_fifo_w, memory_order_relaxed);
@@ -612,7 +692,7 @@ static void cap_submit(int idx) {
         clk_track(wp, got, ts);
 
         if (atomic_load(&g_play_inflight) == 0 &&
-            (atomic_load(&g_fifo_w) - atomic_load(&g_fifo_r)) >= PLAY_NXF * PLAY_PKTS) {
+            (atomic_load(&g_fifo_w) - atomic_load(&g_fifo_r)) >= (uint32_t)(atomic_load(&g_play_nxf) * PLAY_PKTS)) {
             uint64_t usb_now = [g_dev frameNumberWithTime:NULL];
             g_play_frame = usb_now + PLAY_START_MS;
             /* Read so that each frame plays out_latency_frames() after its HAL timeline position:
@@ -620,9 +700,10 @@ static void cap_submit(int idx) {
             double tl_now = clk_sample_at(mach_absolute_time());
             double first = tl_now + PLAY_START_MS * g_sr / 1000.0 - out_latency_frames();
             g_play_base = first > 0 ? (uint64_t)first : 0;
-            for (int j = 0; j < PLAY_NXF; j++) play_submit(j);
+            for (int j = 0; j < atomic_load(&g_play_nxf); j++) play_submit(j);
         }
         cap_submit(idx);
+        dbg_leave();   /* DEBUG */
     }];
 }
 
@@ -672,6 +753,7 @@ static bool usb_ensure_hid(void) {
     if (!g_q) {
         dispatch_queue_attr_t qa = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
         g_q = dispatch_queue_create("com.rane.sl2.usb", qa);
+        dispatch_queue_set_specific(g_q, &dbg_q_key, &dbg_q_key, NULL);   /* DEBUG */
     }
     if (!g_hid_sem) g_hid_sem = dispatch_semaphore_create(0);
 
@@ -713,6 +795,10 @@ static bool usb_ensure_hid(void) {
 static bool usb_open_all(void) {
     if (!usb_ensure_hid()) return false;
     NSError *e = nil;
+
+    LOG("DBG playback queue %d", atomic_load(&g_play_nxf));
+    memset(dbg_margin_hist, 0, sizeof dbg_margin_hist);
+    memset(dbg_capdelay_hist, 0, sizeof dbg_capdelay_hist);
 
     io_iterator_t it = 0;
     IORegistryEntryGetChildIterator(g_dev.ioService, kIOServicePlane, &it);
@@ -770,6 +856,11 @@ static bool usb_open_all(void) {
     clk_reset();
     atomic_store(&g_total_cap_frames, 0);
     atomic_store(&g_total_play_frames, 0);
+    dbg_aborted = dbg_restarts = dbg_skipped_ms = 0;   /* DEBUG */
+    dbg_late = dbg_enq_fail = dbg_play_st_err = dbg_play_pkt_err = dbg_fifo_empty = dbg_cap_pkt_err = 0;
+    dbg_min_margin = 1 << 30; dbg_enq_err_code = 0;
+    dbg_enq_ok = dbg_completions = dbg_double_done = dbg_reuse_pending = 0;
+    memset(dbg_slot_pending, 0, sizeof dbg_slot_pending);
 
     atomic_store(&g_io_running, true);
     g_cap_frame = [g_dev frameNumberWithTime:NULL] + 32;
@@ -782,6 +873,12 @@ static bool usb_open_all(void) {
 static void usb_stop_streaming(void) {
     if (!atomic_exchange(&g_io_running, false)) return;
     hb_stop();
+    {   /* DEBUG: this stream's timing histograms */
+        const uint32_t *m = dbg_margin_hist, *c = dbg_capdelay_hist;
+        LOG("DBG hist play margin (frames) <0:%u 0:%u 1:%u 2:%u 3:%u 4:%u 5:%u >=6:%u | "
+            "capture delivery <1ms:%u <2:%u <3:%u <5:%u <10:%u <20:%u >=20:%u | skipped %u ms",
+            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], c[0], c[1], c[2], c[3], c[4], c[5], c[6], dbg_skipped_ms);
+    }
     if (g_cpipe) [g_cpipe abortWithError:nil];
     if (g_ppipe) [g_ppipe abortWithError:nil];
     if (g_cap)   [g_cap selectAlternateSetting:0 error:nil];
@@ -1183,7 +1280,7 @@ static OSStatus SL2_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
                 *(UInt32*)outData = (sc == kAudioObjectPropertyScopeOutput) ? out_latency_frames() : 32;
                 *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertySafetyOffset:
-                *(UInt32*)outData = (sc == kAudioObjectPropertyScopeInput) ? (UInt32)(IN_SAFETY_44 * g_sr / 44100.0) : out_safety_frames();
+                *(UInt32*)outData = (sc == kAudioObjectPropertyScopeInput) ? in_safety_frames() : out_safety_frames();
                 *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertyIsHidden: *(UInt32*)outData = 0; *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertyZeroTimeStampPeriod: *(UInt32*)outData = 2048; *outSize = sizeof(UInt32); return 0;
@@ -1335,6 +1432,28 @@ static OSStatus SL2_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
     if (oid == kObjDevice && addr->mSelector == kSL2PropHIDCommand) {
         if (inSize == sizeof(CFDataRef) && inData) {
             CFDataRef cd = *(CFDataRef*)inData;
+            if (cd && CFGetTypeID(cd) == CFDataGetTypeID() && CFDataGetLength(cd) >= 6 &&
+                CFDataGetBytePtr(cd)[0] == 0xF0) {
+                /* DEBUG (temporary): set the playback queue size for the next stream; not sent to the box */
+                int n = CFDataGetBytePtr(cd)[5];
+                if (n < 2) n = 2;
+                if (n > PLAY_NXF) n = PLAY_NXF;
+                atomic_store(&g_play_nxf, n);
+                LOG("DBG playback queue set to %d transfers", n);
+                return 0;
+            }
+            if (cd && CFGetTypeID(cd) == CFDataGetTypeID() && CFDataGetLength(cd) >= 6 &&
+                CFDataGetBytePtr(cd)[0] == 0xF2) {
+                /* DEBUG (temporary): input safety offset in ms; tell the HAL so it re-reads it */
+                int ms = CFDataGetBytePtr(cd)[5];
+                if (ms < 1) ms = 1;
+                atomic_store(&g_in_safety_ms, ms);
+                LOG("DBG input safety offset set to %d ms (%u frames)", ms, in_safety_frames());
+                /* the HAL caches the safety offset; a (no-op) configuration change makes it re-read
+                   the device's properties */
+                if (g_host) g_host->RequestDeviceConfigurationChange(g_host, kObjDevice, (UInt64)g_sr, NULL);
+                return 0;
+            }
             if (cd && CFGetTypeID(cd) == CFDataGetTypeID() && CFDataGetLength(cd) <= 64) {
                 memset(g_last_cmd_in, 0, 64);
                 memcpy(g_last_cmd_in, CFDataGetBytePtr(cd), CFDataGetLength(cd));
