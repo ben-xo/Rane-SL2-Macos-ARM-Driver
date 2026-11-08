@@ -1220,7 +1220,10 @@ static void on_usb_added(void *refcon, io_iterator_t iter) {
         atomic_store(&g_box_present, true);
         LOG("Rane SL 2 USB connected");
         pthread_mutex_lock(&g_mutex);
-        usb_ensure_hid();
+        /* The box powers up with thru on or off depending on a board input; with no stream
+           running, put the decks on analogue thru, as at stream stop, so turntables reach the
+           mixer until an app streams. */
+        if (usb_ensure_hid() && !atomic_load(&g_io_running)) set_usb_switches(false);
         pthread_mutex_unlock(&g_mutex);
     }
     if (bootloader) {
