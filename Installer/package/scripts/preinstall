@@ -1,0 +1,3 @@
+#!/bin/sh
+rm -rf "/Library/Audio/Plug-Ins/HAL/SL2Device.driver"
+exit 0
