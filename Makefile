@@ -5,7 +5,7 @@ CFLAGS = -fobjc-arc -O2
 # (tools/latency/bin/sl2dbg: input safety offset, test hooks)
 PLUGIN_DEFS = $(if $(DEBUG),-DSL2_DEBUG=1)
 
-all: plugin api panel dump flash
+all: plugin api panel dump flash controlpanel
 
 plugin:
 	$(CC) $(ARCH) -bundle $(CFLAGS) $(PLUGIN_DEFS) -framework Foundation -framework CoreAudio -framework IOKit -framework IOUSBHost plugin/SL2Device.m -o SL2Device
@@ -18,6 +18,14 @@ panel:
 
 dump:
 	$(CC) $(ARCH) $(CFLAGS) -framework Foundation -framework CoreAudio tools/sl2dump.m tools/SL2Passthrough.m -o sl2dump
+
+# SL 2 Control Panel.app (SwiftUI, universal), in the repository root
+controlpanel:
+	tools/controlpanel/build-app.sh
+
+# the installer package and download zip, built into build/ (VERSION=x.y.z, default 1.3.0)
+package:
+	Installer/build-pkg.sh $(VERSION)
 
 # sl2apitest: checks SL2Api as Serato DJ Pro 2.5.5 uses it (run the x86_64 slice with arch -x86_64)
 apitest:
@@ -42,6 +50,6 @@ hwtest: panel apitest latency
 
 clean:
 	rm -f SL2Device SL2Api sl2panel sl2dump sl2flash sl2apitest
-	rm -rf tools/latency/bin
+	rm -rf tools/latency/bin "SL 2 Control Panel.app" build
 
-.PHONY: all plugin api panel dump flash apitest latency hwtest clean
+.PHONY: all plugin api panel dump flash controlpanel package apitest latency hwtest clean

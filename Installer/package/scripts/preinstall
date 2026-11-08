@@ -1,3 +1,7 @@
 #!/bin/sh
+# Remove the previous driver (it is replaced whole) and Rane's "SL 2 Audio Control Panel" System
+# Settings pane, which earlier versions of this package installed; the SL 2 Control Panel app
+# replaces it.
 rm -rf "/Library/Audio/Plug-Ins/HAL/SL2Device.driver"
+rm -rf "/Library/PreferencePanes/SL 2 Audio Control Panel.prefPane"
 exit 0
