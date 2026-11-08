@@ -206,22 +206,30 @@ static double nominal_tpf(void) {
 }
 
 /* Read the timeline consistently. Bounded, because the HAL's IO thread reads it: if the writer is
-   preempted mid-update, after 64 tries use this thread's last good copy rather than spin. */
+   preempted mid-update, after 64 tries use the last copy any reader got rather than spin. (That
+   copy is a plain static, not thread-local: thread-local storage in a loaded bundle can allocate
+   on first use, which the real-time IO thread must not do. A torn fallback is harmless: it is
+   only used in that rare case, and the line it describes moves by a fraction of a frame.) */
+static _Atomic uint64_t g_clk_last_h;
+static _Atomic double   g_clk_last_s, g_clk_last_tpf;
 static void clk_get(uint64_t *host, double *sample, double *tpf) {
-    static __thread uint64_t last_h;
-    static __thread double last_s, last_tpf;
     for (int i = 0; i < 64; i++) {
         uint32_t s1 = atomic_load_explicit(&g_clk_seq, memory_order_acquire);
         uint64_t h = g_clk_host; double s = g_clk_sample, t = g_clk_tpf;
         atomic_thread_fence(memory_order_acquire);
         uint32_t s2 = atomic_load_explicit(&g_clk_seq, memory_order_relaxed);
         if (!(s1 & 1) && s1 == s2) {
-            last_h = *host = h; last_s = *sample = s; last_tpf = *tpf = t;
+            *host = h; *sample = s; *tpf = t;
+            atomic_store_explicit(&g_clk_last_h, h, memory_order_relaxed);
+            atomic_store_explicit(&g_clk_last_s, s, memory_order_relaxed);
+            atomic_store_explicit(&g_clk_last_tpf, t, memory_order_relaxed);
             return;
         }
     }
-    *host = last_h; *sample = last_s;
-    *tpf = last_tpf > 0 ? last_tpf : nominal_tpf();
+    *host = atomic_load_explicit(&g_clk_last_h, memory_order_relaxed);
+    *sample = atomic_load_explicit(&g_clk_last_s, memory_order_relaxed);
+    double t = atomic_load_explicit(&g_clk_last_tpf, memory_order_relaxed);
+    *tpf = t > 0 ? t : nominal_tpf();
 }
 
 static void clk_set(uint64_t host, double sample, double tpf) {
@@ -624,17 +632,23 @@ static void dp_ref_refresh(void) {
 }
 
 /* The microframe reference, consistently. Bounded so the IO thread never spins on a preempted
-   writer: after 64 tries it uses this thread's last good copy. */
+   writer: after 64 tries it uses the last copy any reader got (a plain static: see clk_get). */
+static _Atomic uint64_t g_dp_ref_last_uf, g_dp_ref_last_ut;
 static void dp_ref_get(uint64_t *uf, uint64_t *ut) {
-    static __thread uint64_t last_uf, last_ut;
     for (int i = 0; i < 64; i++) {
         uint32_t s1 = atomic_load_explicit(&g_dp_ref_seq, memory_order_acquire);
         uint64_t a = g_dp_ref_uframe, b = g_dp_ref_time;
         atomic_thread_fence(memory_order_acquire);
         uint32_t s2 = atomic_load_explicit(&g_dp_ref_seq, memory_order_relaxed);
-        if (!(s1 & 1) && s1 == s2) { last_uf = *uf = a; last_ut = *ut = b; return; }
+        if (!(s1 & 1) && s1 == s2) {
+            *uf = a; *ut = b;
+            atomic_store_explicit(&g_dp_ref_last_uf, a, memory_order_relaxed);
+            atomic_store_explicit(&g_dp_ref_last_ut, b, memory_order_relaxed);
+            return;
+        }
     }
-    *uf = last_uf; *ut = last_ut;
+    *uf = atomic_load_explicit(&g_dp_ref_last_uf, memory_order_relaxed);
+    *ut = atomic_load_explicit(&g_dp_ref_last_ut, memory_order_relaxed);
 }
 
 /* USB frame (1 ms, fractional) at host time t. Safe on any thread. */
@@ -1617,6 +1631,17 @@ static OSStatus SL2_IsPropertySettable(AudioServerPlugInDriverRef d, AudioObject
     return kAudioHardwareNoError;
 }
 
+/* kAudioObjectPropertyOwnedObjects can carry a qualifier: a list of class IDs. Only objects of
+   one of those classes (or of a class derived from it) are returned; no qualifier means all. */
+static bool owned_class_wanted(UInt32 qsz, const void *qd, AudioClassID cls) {
+    UInt32 n = qd ? qsz / sizeof(AudioClassID) : 0;
+    if (n == 0) return true;
+    const AudioClassID *c = (const AudioClassID *)qd;
+    for (UInt32 i = 0; i < n; i++)
+        if (c[i] == cls || c[i] == kAudioObjectClassID) return true;
+    return false;
+}
+
 static void fill_asbd(AudioStreamBasicDescription *a, Float64 sr) {
     memset(a, 0, sizeof(*a));
     a->mSampleRate       = sr;
@@ -1641,6 +1666,8 @@ static OSStatus SL2_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjec
             case kAudioObjectPropertyManufacturer:
             case kAudioPlugInPropertyResourceBundle: *outSize = sizeof(CFStringRef); return 0;
             case kAudioObjectPropertyOwnedObjects:
+                *outSize = (device_published() && owned_class_wanted(qsz, qd, kAudioDeviceClassID)) ? sizeof(AudioObjectID) : 0;
+                return 0;
             case kAudioPlugInPropertyDeviceList: *outSize = device_published() ? sizeof(AudioObjectID) : 0; return 0;
             case kAudioPlugInPropertyTranslateUIDToDevice: *outSize = sizeof(AudioObjectID); return 0;
         }
@@ -1668,8 +1695,9 @@ static OSStatus SL2_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjec
             case kAudioDevicePropertyZeroTimeStampPeriod: *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertyRelatedDevices: *outSize = sizeof(AudioObjectID); return 0;
             case kAudioObjectPropertyOwnedObjects:
-                *outSize = (sc == kAudioObjectPropertyScopeInput || sc == kAudioObjectPropertyScopeOutput)
-                         ? sizeof(AudioObjectID) : 2 * sizeof(AudioObjectID);
+                if (!owned_class_wanted(qsz, qd, kAudioStreamClassID)) *outSize = 0;
+                else *outSize = (sc == kAudioObjectPropertyScopeInput || sc == kAudioObjectPropertyScopeOutput)
+                              ? sizeof(AudioObjectID) : 2 * sizeof(AudioObjectID);
                 return 0;
             case kAudioDevicePropertyStreams:
                 if (sc == kAudioObjectPropertyScopeInput || sc == kAudioObjectPropertyScopeOutput) *outSize = sizeof(AudioObjectID);
@@ -1709,7 +1737,7 @@ static OSStatus SL2_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjec
     return kAudioHardwareUnknownPropertyError;
 }
 
-static OSStatus SL2_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID oid, pid_t pid, const AudioObjectPropertyAddress *addr, UInt32 qsz, const void *qd, UInt32 inSize, UInt32 *outSize, void *outData) {
+static OSStatus get_property_data(AudioServerPlugInDriverRef d, AudioObjectID oid, pid_t pid, const AudioObjectPropertyAddress *addr, UInt32 qsz, const void *qd, UInt32 inSize, UInt32 *outSize, void *outData) {
     AudioObjectPropertySelector s = addr->mSelector;
     AudioObjectPropertyScope sc = addr->mScope;
 
@@ -1722,7 +1750,9 @@ static OSStatus SL2_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
             case kAudioPlugInPropertyResourceBundle: *(CFStringRef*)outData = CFSTR(""); *outSize = sizeof(CFStringRef); return 0;
             case kAudioObjectPropertyOwnedObjects:
             case kAudioPlugInPropertyDeviceList:
-                if (device_published() && inSize >= sizeof(AudioObjectID)) {
+                if (s == kAudioObjectPropertyOwnedObjects && !owned_class_wanted(qsz, qd, kAudioDeviceClassID)) {
+                    *outSize = 0;
+                } else if (device_published() && inSize >= sizeof(AudioObjectID)) {
                     *(AudioObjectID*)outData = kObjDevice; *outSize = sizeof(AudioObjectID);
                 } else {
                     *outSize = 0;
@@ -1766,6 +1796,10 @@ static OSStatus SL2_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
             case kAudioObjectPropertyOwnedObjects:
             case kAudioDevicePropertyStreams: {
                 AudioObjectID *ids = (AudioObjectID*)outData;
+                if (s == kAudioObjectPropertyOwnedObjects && !owned_class_wanted(qsz, qd, kAudioStreamClassID)) {
+                    *outSize = 0;
+                    return 0;
+                }
                 if (sc == kAudioObjectPropertyScopeInput) { ids[0] = kObjStreamIn; *outSize = sizeof(AudioObjectID); }
                 else if (sc == kAudioObjectPropertyScopeOutput) { ids[0] = kObjStreamOut; *outSize = sizeof(AudioObjectID); }
                 else { ids[0] = kObjStreamIn; ids[1] = kObjStreamOut; *outSize = 2 * sizeof(AudioObjectID); }
@@ -1905,6 +1939,49 @@ static OSStatus SL2_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
         }
     }
     return kAudioHardwareUnknownPropertyError;
+}
+
+/* The size of one element of an array-valued property, or 0 if the property is a single value. */
+static UInt32 property_element_size(AudioObjectPropertySelector s) {
+    switch (s) {
+        case kAudioObjectPropertyOwnedObjects:
+        case kAudioPlugInPropertyDeviceList:
+        case kAudioDevicePropertyStreams:
+        case kAudioDevicePropertyRelatedDevices:
+        case kAudioObjectPropertyControlList:                 return sizeof(AudioObjectID);
+        case kAudioDevicePropertyAvailableNominalSampleRates: return sizeof(AudioValueRange);
+        case kAudioDevicePropertyPreferredChannelsForStereo:  return sizeof(UInt32);
+        case kAudioStreamPropertyAvailableVirtualFormats:
+        case kAudioStreamPropertyAvailablePhysicalFormats:    return sizeof(AudioStreamRangedDescription);
+        case kAudioObjectPropertyCustomPropertyInfoList:      return sizeof(AudioServerPlugInCustomPropertyInfo);
+    }
+    return 0;
+}
+
+/* GetPropertyData: never write past the caller's buffer (inSize). A buffer big enough for the whole
+   property gets it; a smaller one gets as many whole elements of an array as fit; a single value
+   that doesn't fit is an error. */
+static OSStatus SL2_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID oid, pid_t pid, const AudioObjectPropertyAddress *addr, UInt32 qsz, const void *qd, UInt32 inSize, UInt32 *outSize, void *outData) {
+    if (!addr || !outSize || !outData) return kAudioHardwareIllegalOperationError;
+
+    /* How much the property needs, and the common case: the buffer is big enough. */
+    UInt32 need = 0;
+    OSStatus st = SL2_GetPropertyDataSize(d, oid, pid, addr, qsz, qd, &need);
+    if (st) return st;
+    if (inSize >= need) return get_property_data(d, oid, pid, addr, qsz, qd, inSize, outSize, outData);
+
+    /* Too small: produce the whole array in a scratch buffer and copy the elements that fit. */
+    UInt32 elem = property_element_size(addr->mSelector);
+    uint8_t tmp[1024];
+    if (!elem || need > sizeof tmp) return kAudioHardwareBadPropertySizeError;
+    UInt32 got = 0;
+    st = get_property_data(d, oid, pid, addr, qsz, qd, need, &got, tmp);
+    if (st) return st;
+    UInt32 n = (inSize / elem) * elem;
+    if (n > got) n = got;
+    memcpy(outData, tmp, n);
+    *outSize = n;
+    return 0;
 }
 
 #if SL2_DEBUG
