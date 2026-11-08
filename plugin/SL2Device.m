@@ -967,19 +967,23 @@ static void dp_track_capture(uint64_t fc, int got) {
 }
 
 /* WriteMix, on the HAL's IO thread: write the mix straight into the queued transfers. Lock-free;
-   no IOKit calls. Samples whose frame has already started, or is not yet scheduled, are dropped. */
+   no IOKit calls. Samples whose frame starts too soon, or is not queued, are dropped. */
 static void dp_write(const float *buf, UInt32 frames, uint64_t pos) {
+    /* Where to start looking: the frame found last time (this thread only), so the estimate never
+       drifts from the schedule; re-seeded from the anchor when it changes. */
+    static __thread uint64_t hint_frame, hint_first, hint_anchor;
+    uint64_t F0 = atomic_load(&g_dp_F0);
+    if (hint_anchor != F0) { hint_anchor = F0; hint_frame = F0; hint_first = atomic_load(&g_dp_x0); }
     double now_f = dp_frame_at(mach_absolute_time());
-    uint64_t x0 = atomic_load(&g_dp_x0), F0 = atomic_load(&g_dp_F0);
     double per_frame = g_sr / 1000.0;
-    int64_t fg = (int64_t)F0 + (int64_t)(((double)pos - (double)x0) / per_frame);
     UInt32 i = 0;
     while (i < frames) {
         uint64_t p = pos + i;
+        int64_t fg = (int64_t)hint_frame + (int64_t)floor(((double)p - (double)hint_first) / per_frame);
         DPEntry *e = NULL;
         uint64_t first = 0;
         uint32_t total = 0;
-        for (int tries = 0; tries < 6 && fg >= 0; tries++) {
+        for (int tries = 0; tries < 8 && fg > 0; tries++) {
             DPEntry *c = &g_dp_sched[(uint64_t)fg & (DP_SCHED_N - 1)];
             if (atomic_load_explicit(&c->frame, memory_order_acquire) != (uint64_t)fg) break;
             first = c->first; total = c->off[PLAY_PKTS];
@@ -988,7 +992,22 @@ static void dp_write(const float *buf, UInt32 frames, uint64_t pos) {
             e = c;
             break;
         }
-        if (!e) { atomic_fetch_add_explicit(&dp_unscheduled, 1, memory_order_relaxed); i++; continue; }
+        if (!e) {
+            /* Frame fg is not queued (refused, or beyond the schedule). Drop only up to the next
+               queued frame's samples; if none is near, drop the rest of this buffer. */
+            uint32_t skip = frames - i;
+            for (int64_t g = fg + 1; g > 0 && g <= fg + 4; g++) {
+                DPEntry *c = &g_dp_sched[(uint64_t)g & (DP_SCHED_N - 1)];
+                if (atomic_load_explicit(&c->frame, memory_order_acquire) == (uint64_t)g && c->first > p) {
+                    if (c->first - p < skip) skip = (uint32_t)(c->first - p);
+                    break;
+                }
+            }
+            atomic_fetch_add_explicit(&dp_unscheduled, skip, memory_order_relaxed);
+            i += skip;
+            continue;
+        }
+        hint_frame = (uint64_t)fg; hint_first = first;
         uint32_t n = (uint32_t)(first + total - p);
         if (n > frames - i) n = frames - i;
         if ((double)fg - now_f < DP_WRITE_GUARD) {
@@ -1011,7 +1030,6 @@ static void dp_write(const float *buf, UInt32 frames, uint64_t pos) {
             atomic_fetch_add_explicit(&dp_written, n, memory_order_relaxed);
         }
         i += n;
-        fg++;
     }
 }
 
