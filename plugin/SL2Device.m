@@ -26,6 +26,9 @@
 #import <IOKit/usb/IOUSBLib.h>
 #import <IOUSBHost/IOUSBHost.h>
 #include <mach/mach_time.h>
+#include <mach/thread_policy.h>
+#include <AudioToolbox/AudioWorkInterval.h>
+#include <os/workgroup.h>
 #include <pthread.h>
 #include <os/log.h>
 #include <stdatomic.h>
@@ -191,6 +194,12 @@ static uint32_t g_faccum = 0;
 
 /* IOUSBHost state */
 static dispatch_queue_t    g_q;
+static os_workgroup_interval_t g_wi;   /* audio work interval g_q's worker threads run in */
+/* DEBUG (experiment): the audio interfaces can run on a different queue per stream */
+static dispatch_queue_t    g_q_wl;          /* serial queue on a workloop joined to g_wi */
+static _Atomic int  g_dbg_qmode = 0;        /* next stream: 0 = g_q, 1 = g_q_wl */
+static _Atomic bool g_dbg_rt = false;       /* next stream: request the realtime thread policy */
+static bool g_stream_wl, g_stream_rt;       /* settings of the current stream */
 static uint32_t dbg_margin_hist[8];         /* playback submit margin: <0, 0, 1, ..., 5, >=6 frames */
 static uint32_t dbg_capdelay_hist[7];       /* capture delivery delay: <1, <2, <3, <5, <10, <20, >=20 ms */
 static IOUSBHostDevice    *g_dev;
@@ -492,6 +501,10 @@ static void dbg_leave(void) { atomic_fetch_sub(&dbg_in_handler, 1); }
 static int64_t  dbg_min_margin = 1 << 30;
 static int      dbg_enq_err_code;
 
+static void usb_cycle_begin(void);
+static void usb_cycle_end(void);
+static void dbg_log_thread_policy(void);   /* DEBUG */
+
 /* Frames for the next playback packet (one USB microframe): the size the box used for the
    matching capture packet (implicit feedback), or the nominal rate if none is queued. */
 static int play_packet_frames(void) {
@@ -607,6 +620,7 @@ static void play_submit_try(int idx, int attempt) {
                                options:IOUSBHostIsochronousTransferOptionsNone
                                  error:&e
                      completionHandler:^(IOReturn st, IOUSBHostIsochronousTransaction *done) {
+        usb_cycle_begin();
         dbg_enter();   /* DEBUG */
         atomic_store(&dbg_last_play_done, mach_absolute_time());
         dbg_completions++;
@@ -630,6 +644,7 @@ static void play_submit_try(int idx, int attempt) {
             LOG("DBG play completion not resubmitted: slot %d, st 0x%x, running %d", idx, st, atomic_load(&g_io_running));
         }
         dbg_leave();   /* DEBUG */
+        usb_cycle_end();
     }];
     if (!queued) {
         atomic_fetch_sub(&g_play_inflight, 1);
@@ -672,7 +687,9 @@ static void cap_submit(int idx) {
                                  error:&e
                      completionHandler:^(IOReturn st, IOUSBHostIsochronousTransaction *done) {
         if (!atomic_load(&g_io_running) || st == kIOReturnAborted) return;
+        usb_cycle_begin();
         dbg_enter();   /* DEBUG */
+        dbg_log_thread_policy();
         {   /* DEBUG: how long after its last packet this capture transfer was delivered */
             uint64_t last = done[CAP_PKTS - 1].timeStamp, nowt = mach_absolute_time();
             if (last && nowt > last) {
@@ -756,6 +773,7 @@ static void cap_submit(int idx) {
         }
         cap_submit(idx);
         dbg_leave();   /* DEBUG */
+        usb_cycle_end();
     }];
 }
 
@@ -796,6 +814,86 @@ static io_service_t find_sl2_service(void) {
     return found;
 }
 
+/* The USB queue (g_q) does the time-critical streaming work: every 1 ms it handles a capture
+   completion and resubmits playback, which has only a few ms of transfers queued. As an ordinary
+   queue its worker threads can be held off for 5-10 ms, long enough for queued playback to run
+   out. So it runs on a dispatch workloop joined to an audio work interval (the scheme
+   <AudioToolbox/AudioWorkInterval.h> describes for realtime work on its own cadence), and each
+   completion handler is one work cycle (usb_cycle_begin/end). If the interval cannot be created,
+   it falls back to an ordinary high-priority serial queue. */
+static dispatch_queue_t usb_queue_create(void) {
+    dispatch_queue_attr_t qa = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
+    g_wi = AudioWorkIntervalCreate("com.rane.sl2.usb", OS_CLOCK_MACH_ABSOLUTE_TIME, NULL);
+    if (g_wi) {
+        dispatch_workloop_t wl = dispatch_workloop_create_inactive("com.rane.sl2.usb.workloop");
+        dispatch_workloop_set_os_workgroup(wl, (os_workgroup_t)g_wi);
+        dispatch_activate(wl);
+        g_q_wl = dispatch_queue_create_with_target("com.rane.sl2.usb.wl", qa, wl);
+        dispatch_queue_set_specific(g_q_wl, &dbg_q_key, &dbg_q_key, NULL);   /* DEBUG */
+        LOG("Audio work interval created");
+    } else {
+        LOG("Could not create an audio work interval");
+    }
+    return dispatch_queue_create("com.rane.sl2.usb", qa);
+}
+
+static bool g_wi_err_logged;
+static void usb_cycle_check(const char *what, int r) {
+    if (r && !g_wi_err_logged) {
+        g_wi_err_logged = true;
+        LOG("Audio work interval %{public}s failed: %d (%{public}s)", what, r, strerror(r));
+    }
+}
+
+/* Joining the work interval does not by itself make a thread realtime: the thread has to request
+   the time-constraint policy too. g_q's worker threads come from a pool, so each handler applies it
+   on a thread's first cycle and re-applies it about once a second (1000 cycles) in case the pool
+   has reset it. 1 ms period, up to 0.25 ms of work, done within the period. */
+static bool g_rt_err_logged;
+static void usb_thread_make_realtime(void) {
+    double ticks_per_ms = 1e6 * (double)g_tb.denom / (double)g_tb.numer;
+    thread_time_constraint_policy_data_t p = {
+        .period      = (uint32_t)ticks_per_ms,
+        .computation = (uint32_t)(ticks_per_ms / 4),
+        .constraint  = (uint32_t)ticks_per_ms,
+        .preemptible = 1,
+    };
+    kern_return_t kr = thread_policy_set(mach_thread_self(), THREAD_TIME_CONSTRAINT_POLICY,
+                                         (thread_policy_t)&p, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+    if (kr != KERN_SUCCESS && !g_rt_err_logged) {
+        g_rt_err_logged = true;
+        LOG("Could not make the USB thread realtime: %d", kr);
+    }
+}
+
+static void usb_cycle_begin(void) {
+    static __thread uint32_t t_cycles;
+    if (g_stream_rt && t_cycles++ % 1000 == 0) usb_thread_make_realtime();
+    if (!g_wi || !g_stream_wl) return;
+    uint64_t now = mach_absolute_time();
+    uint64_t one_ms = (uint64_t)(1e6 * (double)g_tb.denom / (double)g_tb.numer);
+    usb_cycle_check("start", os_workgroup_interval_start(g_wi, now, now + one_ms, NULL));
+}
+
+static void usb_cycle_end(void) {
+    if (g_wi && g_stream_wl) usb_cycle_check("finish", os_workgroup_interval_finish(g_wi, NULL));
+}
+
+/* DEBUG (temporary): log the scheduling policy of the thread running a handler, once per stream */
+static bool dbg_policy_logged;
+static void dbg_log_thread_policy(void) {
+    if (dbg_policy_logged) return;
+    dbg_policy_logged = true;
+    thread_time_constraint_policy_data_t p;
+    mach_msg_type_number_t cnt = THREAD_TIME_CONSTRAINT_POLICY_COUNT;
+    boolean_t def = FALSE;
+    kern_return_t kr = thread_policy_get(mach_thread_self(), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&p, &cnt, &def);
+    double tick_us = (double)g_tb.numer / g_tb.denom / 1000.0;
+    LOG("DBG USB handler thread: %{public}s (period %.0f us, computation %.0f us, constraint %.0f us), qos %d",
+        (kr == KERN_SUCCESS && !def) ? "REALTIME" : "not realtime",
+        p.period * tick_us, p.computation * tick_us, p.constraint * tick_us, (int)qos_class_self());
+}
+
 static bool usb_ensure_hid(void) {
     if (g_dev && g_hid && g_hpipe_in && g_hpipe_out) return true;
     io_service_t svc = find_sl2_service();
@@ -803,8 +901,7 @@ static bool usb_ensure_hid(void) {
 
     NSError *e = nil;
     if (!g_q) {
-        dispatch_queue_attr_t qa = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
-        g_q = dispatch_queue_create("com.rane.sl2.usb", qa);
+        g_q = usb_queue_create();
         dispatch_queue_set_specific(g_q, &dbg_q_key, &dbg_q_key, NULL);   /* DEBUG */
     }
     if (!g_hid_sem) g_hid_sem = dispatch_semaphore_create(0);
@@ -848,7 +945,13 @@ static bool usb_open_all(void) {
     if (!usb_ensure_hid()) return false;
     NSError *e = nil;
 
-    LOG("DBG playback queue %d", atomic_load(&g_play_nxf));
+    /* DEBUG (experiment): pick the queue and thread policy for this stream */
+    g_stream_wl = (atomic_load(&g_dbg_qmode) == 1 && g_q_wl);
+    g_stream_rt = atomic_load(&g_dbg_rt);
+    dispatch_queue_t sq = g_stream_wl ? g_q_wl : g_q;
+    LOG("DBG stream queue: %{public}s, realtime policy %{public}s, playback queue %d",
+        g_stream_wl ? "workloop + audio work interval" : "plain serial (user interactive)",
+        g_stream_rt ? "requested" : "off", atomic_load(&g_play_nxf));
     memset(dbg_margin_hist, 0, sizeof dbg_margin_hist);
     memset(dbg_capdelay_hist, 0, sizeof dbg_capdelay_hist);
 
@@ -861,8 +964,8 @@ static bool usb_open_all(void) {
             int idx = -1;
             CFNumberGetValue(n, kCFNumberIntType, &idx);
             CFRelease(n);
-            if (idx == IF_PLAY && !g_play) g_play = [[IOUSBHostInterface alloc] initWithIOService:ch options:IOUSBHostObjectInitOptionsNone queue:g_q error:&e interestHandler:nil];
-            if (idx == IF_CAP  && !g_cap)  g_cap  = [[IOUSBHostInterface alloc] initWithIOService:ch options:IOUSBHostObjectInitOptionsNone queue:g_q error:&e interestHandler:nil];
+            if (idx == IF_PLAY && !g_play) g_play = [[IOUSBHostInterface alloc] initWithIOService:ch options:IOUSBHostObjectInitOptionsNone queue:sq error:&e interestHandler:nil];
+            if (idx == IF_CAP  && !g_cap)  g_cap  = [[IOUSBHostInterface alloc] initWithIOService:ch options:IOUSBHostObjectInitOptionsNone queue:sq error:&e interestHandler:nil];
         }
         IOObjectRelease(ch);
     }
@@ -909,6 +1012,7 @@ static bool usb_open_all(void) {
     atomic_store(&g_total_cap_frames, 0);
     atomic_store(&g_total_play_frames, 0);
     dbg_aborted = dbg_restarts = dbg_skipped_ms = 0;   /* DEBUG */
+    dbg_policy_logged = false;
     dbg_late = dbg_enq_fail = dbg_play_st_err = dbg_play_pkt_err = dbg_fifo_empty = dbg_cap_pkt_err = 0;
     dbg_min_margin = 1 << 30; dbg_enq_err_code = 0;
     dbg_enq_ok = dbg_completions = dbg_double_done = dbg_reuse_pending = 0;
@@ -1492,6 +1596,14 @@ static OSStatus SL2_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
                 if (n > PLAY_NXF) n = PLAY_NXF;
                 atomic_store(&g_play_nxf, n);
                 LOG("DBG playback queue set to %d transfers", n);
+                return 0;
+            }
+            if (cd && CFGetTypeID(cd) == CFDataGetTypeID() && CFDataGetLength(cd) >= 7 &&
+                CFDataGetBytePtr(cd)[0] == 0xF1) {
+                /* DEBUG (temporary): queue mode and realtime policy for the next stream */
+                atomic_store(&g_dbg_qmode, CFDataGetBytePtr(cd)[5]);
+                atomic_store(&g_dbg_rt, CFDataGetBytePtr(cd)[6] != 0);
+                LOG("DBG next stream: queue mode %d, realtime %d", CFDataGetBytePtr(cd)[5], CFDataGetBytePtr(cd)[6]);
                 return 0;
             }
             if (cd && CFGetTypeID(cd) == CFDataGetTypeID() && CFDataGetLength(cd) >= 6 &&
