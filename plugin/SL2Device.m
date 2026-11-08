@@ -53,6 +53,8 @@
 #define CAP_NXF      64
 #define PLAY_PKTS    8       /* 1 ms per transfer */
 #define PLAY_NXF     20
+#define PLAY_START_MS 24     /* first playback transfer is scheduled this many USB frames (ms) ahead */
+#define OUT_SAFETY_MS 2      /* how far ahead of "now" the HAL writes output: one 1 ms transfer + 1 ms headroom */
 #define RING_FRAMES  65536   /* ~1.36s @ 48kHz */
 #define RING_MASK    (RING_FRAMES - 1)
 #define FIFO_N       2048
@@ -116,7 +118,7 @@ static float g_out_ring[RING_FRAMES * NCH];
 
    Capture begins some milliseconds after the timeline starts: the first captured frame sits at
    the timeline position matching its arrival (g_cap_base), and the box's rate is measured from
-   that frame's time (g_rate_anchor). These and g_clk_last_fix are touched only on g_q. */
+   that frame's time (g_rate_anchor). These, g_play_base and g_clk_last_fix are touched only on g_q. */
 #define CLK_FIX_FRAMES 2048
 #define CLK_CORR_S     2.0
 static mach_timebase_info_data_t g_tb;
@@ -126,8 +128,20 @@ static double   g_clk_sample = 0;
 static double   g_clk_tpf = 0;
 static uint64_t g_rate_anchor = 0;
 static uint64_t g_cap_base = 0;
+static uint64_t g_play_base = 0;     /* timeline position playback starts reading from */
 static uint64_t g_clk_last_fix = 0;  /* captured-frame count at the last clk_track correction */
 
+/* Output timing. With PLAY_NXF 1 ms transfers queued, a transfer is filled when the one
+   PLAY_NXF before it completes, about PLAY_NXF ms before it plays. Reading each frame
+   out_latency_frames() (PLAY_NXF ms) after its timeline position puts the end of each read at
+   most 1 ms (one transfer) ahead of the HAL's "now"; the HAL writes OUT_SAFETY_MS ahead. Both are
+   reported to the HAL, so clients see the true output latency: their sum. */
+static UInt32 out_safety_frames(void) {
+    return (UInt32)(OUT_SAFETY_MS * g_sr / 1000.0 + 0.5);
+}
+static UInt32 out_latency_frames(void) {
+    return (UInt32)(PLAY_NXF * (PLAY_PKTS / 8) * g_sr / 1000.0 + 0.5);
+}
 static _Atomic uint64_t g_total_cap_frames = 0;
 static _Atomic uint64_t g_total_play_frames = 0;
 static _Atomic uint64_t g_zts_seed = 1;     /* GetZeroTimeStamp seed: bumped when the timeline changes */
@@ -478,7 +492,13 @@ static void play_submit(int idx) {
         total_frames += n;
     }
 
-    uint64_t rp = atomic_fetch_add_explicit(&g_total_play_frames, total_frames, memory_order_acq_rel);
+    uint64_t rp = g_play_base + atomic_fetch_add_explicit(&g_total_play_frames, total_frames, memory_order_acq_rel);
+
+    /* The HAL guarantees output only up to "now + output safety offset" on its timeline. Frames
+       beyond that (the burst of transfers queued when playback starts) play as silence. */
+    double tl_now = clk_sample_at(mach_absolute_time());
+    uint64_t written_to = tl_now > 0 ? (uint64_t)tl_now + out_safety_frames() : 0;
+
     for (int k = 0; k < PLAY_PKTS; k++) {
         int n = pkt_n[k];
         tx[k] = (IOUSBHostIsochronousTransaction){
@@ -490,9 +510,10 @@ static void play_submit(int idx) {
         for (int s = 0; s < n; s++) {
             uint32_t ridx = ((uint32_t)(rp & RING_MASK)) * NCH;
             uint8_t *q = dst + s * FRAME_BYTES;
+            bool ready = rp < written_to;
             for (int c = 0; c < NCH; c++) {
-                float v = g_out_ring[ridx + c];
-                g_out_ring[ridx + c] = 0.0f;
+                float v = ready ? g_out_ring[ridx + c] : 0.0f;
+                if (ready) g_out_ring[ridx + c] = 0.0f;
                 if (v > 1.0f) v = 1.0f;
                 else if (v < -1.0f) v = -1.0f;
                 int32_t raw32 = (int32_t)(v * 2147483392.0f);
@@ -592,7 +613,13 @@ static void cap_submit(int idx) {
 
         if (atomic_load(&g_play_inflight) == 0 &&
             (atomic_load(&g_fifo_w) - atomic_load(&g_fifo_r)) >= PLAY_NXF * PLAY_PKTS) {
-            g_play_frame = [g_dev frameNumberWithTime:NULL] + 24;
+            uint64_t usb_now = [g_dev frameNumberWithTime:NULL];
+            g_play_frame = usb_now + PLAY_START_MS;
+            /* Read so that each frame plays out_latency_frames() after its HAL timeline position:
+               the first transfer plays PLAY_START_MS (1 ms per USB frame) from now. */
+            double tl_now = clk_sample_at(mach_absolute_time());
+            double first = tl_now + PLAY_START_MS * g_sr / 1000.0 - out_latency_frames();
+            g_play_base = first > 0 ? (uint64_t)first : 0;
             for (int j = 0; j < PLAY_NXF; j++) play_submit(j);
         }
         cap_submit(idx);
@@ -1152,9 +1179,11 @@ static OSStatus SL2_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
             case kAudioDevicePropertyDeviceIsRunning: *(UInt32*)outData = (g_io_clients > 0) ? 1 : 0; *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertyDeviceCanBeDefaultDevice:
             case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: *(UInt32*)outData = 1; *outSize = sizeof(UInt32); return 0;
-            case kAudioDevicePropertyLatency: *(UInt32*)outData = 32; *outSize = sizeof(UInt32); return 0;
+            case kAudioDevicePropertyLatency:
+                *(UInt32*)outData = (sc == kAudioObjectPropertyScopeOutput) ? out_latency_frames() : 32;
+                *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertySafetyOffset:
-                *(UInt32*)outData = (sc == kAudioObjectPropertyScopeInput) ? (UInt32)(IN_SAFETY_44 * g_sr / 44100.0) : 64;
+                *(UInt32*)outData = (sc == kAudioObjectPropertyScopeInput) ? (UInt32)(IN_SAFETY_44 * g_sr / 44100.0) : out_safety_frames();
                 *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertyIsHidden: *(UInt32*)outData = 0; *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertyZeroTimeStampPeriod: *(UInt32*)outData = 2048; *outSize = sizeof(UInt32); return 0;
