@@ -15,7 +15,8 @@
   * Funciona nativamente con Serato DJ Pro 2.5.5 (ultima version de Serato
     compatible con Rane SL2; versiones posteriores eliminaron el soporte de
     la SL2).
-  * Funciona con el panel oficial "SL 2" en Ajustes del Sistema de macOS.
+  * Incluye la app "SL 2 Control Panel" (en Aplicaciones; necesita macOS 13
+    Ventura o posterior) y la utilidad de Terminal sl2panel.
   * Funciona como tarjeta de sonido de 4 entradas y 4 salidas (24-bit,
     44.1 / 48 kHz) en Ableton Live, Traktor, Mixxx, Logic Pro, Rekordbox y
     el audio del sistema de macOS.
@@ -31,11 +32,13 @@
                                   y creditos de pepelee (@pepeleedj). Instala
                                   automaticamente el driver CoreAudio, la
                                   libreria SL2Api.framework para Serato DJ
-                                  Pro 2.5.5 y el panel de Ajustes del Sistema.
+                                  Pro 2.5.5, la app SL 2 Control Panel y la
+                                  utilidad sl2panel.
 - Instalar-Rane-SL2.command    -> Instalador automatico en 1 clic (elimina
                                   la cuarentena de Gatekeeper e instala todo).
-- Panel-Control-SL2.command    -> Utilidad en Terminal para ver el estado de
-                                  la Rane SL2.
+- Panel-Control-SL2.command    -> Abre la app SL 2 Control Panel (o, si no
+                                  esta, muestra el estado de la Rane SL2 en
+                                  Terminal).
 - Desinstalar-Rane-SL2.command -> Elimina el driver y sus componentes si
                                   deseas desinstalarlo.
 - Firmware-SL2.command         -> Solo para recuperar una Rane SL2 que ha
@@ -93,12 +96,14 @@ OPCION B (Con el asistente grafico RaneSL2-macOS-Universal.pkg):
 - Canales de Audio (4 Entradas / 4 Salidas a 24-bit / 44.1 o 48 kHz):
     * Canales 1 y 2: Left Deck (Plato / CDJ Izquierdo)
     * Canales 3 y 4: Right Deck (Plato / CDJ Derecho)
-- Panel de Control en Ajustes del Sistema:
-    * En "Ajustes del Sistema" -> "SL 2" (abajo del todo) puedes consultar el
-      selector Phono / Line (es un interruptor fisico de la SL2, el mismo para
-      los dos platos: el panel lo muestra pero no puede cambiarlo), activar o
-      desactivar Thru en cada canal y cambiar la frecuencia de muestreo
-      (44100 Hz / 48000 Hz).
+- App SL 2 Control Panel (en Aplicaciones):
+    * Muestra el estado de la SL2, su firmware, el driver y la latencia;
+      consulta el selector Phono / Line (es un interruptor fisico de la SL2,
+      el mismo para los dos platos: la app lo muestra pero no puede
+      cambiarlo); activa o desactiva Thru en cada plato y cambia la
+      frecuencia de muestreo (44100 Hz / 48000 Hz).
+    * Sustituye al panel "SL 2" de Ajustes del Sistema de Rane: el
+      instalador lo elimina si estaba instalado.
 
 ========================================================================
   Creditos: Idea original y proyecto por pepelee (PPLEE)
