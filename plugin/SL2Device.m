@@ -392,10 +392,17 @@ static void refresh_hw_status(void) {
        reply[7..10]); c.f. the SL3, which uses 0x10. bcdDevice is only a mode marker
        (0x0100 = running firmware, 0x0000 = bootloader), not the version. */
     uint8_t r[64];
-    if (hid_cmd(0x01, NULL, 0, r, NULL)) {
-        g_st.version_maj = r[5];
-        g_st.version_min = r[6];
+    for (int attempt = 0; attempt < 2; attempt++) {   /* the box may still be loading its FPGA */
+        if (hid_cmd(0x01, NULL, 0, r, NULL)) {
+            g_st.version_maj = r[5];
+            g_st.version_min = r[6];
+            break;
+        }
     }
+    /* USB speed (0x0a: 1 = full speed, 2 = high speed). At full speed the box offers only its HID
+       interface, so there is no audio: say so, as the only other sign is a failed stream start. */
+    if (hid_cmd(0x0a, NULL, 0, r, NULL) && r[5] == 1)
+        LOG("The SL 2 is on a full-speed (USB 1.1) link: no audio. Connect it to a USB 2.0 high-speed port.");
     /* Serial from the USB iSerialNumber string ("SL2.01.00"), a fixed device serial independent
        of the firmware version; c.f. the SL3, which queries it over HID 0x04. */
     CFTypeRef ser = IORegistryEntryCreateCFProperty(g_dev.ioService, CFSTR("USB Serial Number"), kCFAllocatorDefault, 0);
@@ -1076,50 +1083,55 @@ static dispatch_queue_t usb_queue_create(void) {
     return dispatch_queue_create("com.rane.sl2.usb", qa);
 }
 
+/* Open the box's HID side (device, HID interface, its two pipes), if not already open. The device
+   is opened once and kept: if its HID interface isn't registered yet (interfaces appear
+   asynchronously after the device is configured), a later call only looks for it again. */
 static bool usb_ensure_hid(void) {
     if (g_dev && g_hid && g_hpipe_in && g_hpipe_out) return true;
-    io_service_t svc = find_sl2_service();
-    if (!svc) return false;
-
     NSError *e = nil;
-    if (!g_q) {
-        g_q = usb_queue_create();
-    }
+    if (!g_q) g_q = usb_queue_create();
     if (!g_hid_sem) g_hid_sem = dispatch_semaphore_create(0);
 
-    g_dev = [[IOUSBHostDevice alloc] initWithIOService:svc options:IOUSBHostObjectInitOptionsNone queue:g_q error:&e interestHandler:nil];
-    IOObjectRelease(svc);
-    if (!g_dev) { LOG("Failed to open IOUSBHostDevice: %{public}@", e); return false; }
-    [g_dev configureWithValue:1 matchInterfaces:YES error:&e];
+    /* The device: open it and select configuration 1, unless already done. */
+    if (!g_dev) {
+        io_service_t svc = find_sl2_service();
+        if (!svc) return false;
+        g_dev = [[IOUSBHostDevice alloc] initWithIOService:svc options:IOUSBHostObjectInitOptionsNone queue:g_q error:&e interestHandler:nil];
+        IOObjectRelease(svc);
+        if (!g_dev) { LOG("Failed to open IOUSBHostDevice: %{public}@", e); return false; }
+    }
+    if (!g_dev.configurationDescriptor) [g_dev configureWithValue:1 matchInterfaces:YES error:&e];
 
-    io_iterator_t it = 0;
-    IORegistryEntryGetChildIterator(g_dev.ioService, kIOServicePlane, &it);
-    io_service_t ch;
-    while ((ch = IOIteratorNext(it))) {
-        CFNumberRef n = IORegistryEntryCreateCFProperty(ch, CFSTR("bInterfaceNumber"), kCFAllocatorDefault, 0);
-        if (n) {
-            int idx = -1;
-            CFNumberGetValue(n, kCFNumberIntType, &idx);
-            CFRelease(n);
-            if (idx == IF_HID) {
-                g_hid = [[IOUSBHostInterface alloc] initWithIOService:ch options:IOUSBHostObjectInitOptionsNone queue:g_q error:&e interestHandler:nil];
+    /* The HID interface. */
+    if (!g_hid) {
+        io_iterator_t it = 0;
+        IORegistryEntryGetChildIterator(g_dev.ioService, kIOServicePlane, &it);
+        io_service_t ch;
+        while ((ch = IOIteratorNext(it))) {
+            CFNumberRef n = IORegistryEntryCreateCFProperty(ch, CFSTR("bInterfaceNumber"), kCFAllocatorDefault, 0);
+            if (n) {
+                int idx = -1;
+                CFNumberGetValue(n, kCFNumberIntType, &idx);
+                CFRelease(n);
+                if (idx == IF_HID && !g_hid)
+                    g_hid = [[IOUSBHostInterface alloc] initWithIOService:ch options:IOUSBHostObjectInitOptionsNone queue:g_q error:&e interestHandler:nil];
             }
+            IOObjectRelease(ch);
         }
-        IOObjectRelease(ch);
+        IOObjectRelease(it);
+        if (!g_hid) return false;
     }
-    IOObjectRelease(it);
 
-    if (g_hid) {
-        g_hpipe_out = [g_hid copyPipeWithAddress:EP_HID_OUT error:&e];
-        g_hpipe_in  = [g_hid copyPipeWithAddress:EP_HID_IN error:&e];
-        g_hbuf_in   = [NSMutableData dataWithLength:64];
-        hb_read();
-        refresh_hw_status();
-        atomic_store(&g_hw_connected, true);
-        atomic_store(&g_boot_mode, false);
-        return true;
-    }
-    return false;
+    /* Its pipes; start reading the box's reports and replies, then read its status. */
+    g_hpipe_out = [g_hid copyPipeWithAddress:EP_HID_OUT error:&e];
+    g_hpipe_in  = [g_hid copyPipeWithAddress:EP_HID_IN error:&e];
+    if (!g_hpipe_out || !g_hpipe_in) return false;
+    g_hbuf_in   = [NSMutableData dataWithLength:64];
+    hb_read();
+    refresh_hw_status();
+    atomic_store(&g_hw_connected, true);
+    atomic_store(&g_boot_mode, false);
+    return true;
 }
 
 /* Switch the deep schedule off and wait for any WriteMix still writing into it, after which its
@@ -1347,7 +1359,10 @@ static void connect_box(int attempt) {
     if (!atomic_load(&g_box_present)) return;   /* unplugged meanwhile */
     pthread_mutex_lock(&g_mutex);
     bool ok = usb_ensure_hid();
-    if (ok && !atomic_load(&g_io_running)) set_usb_switches(false);
+    if (ok && !atomic_load(&g_io_running)) {
+        set_usb_switches(false);
+        send_hw_samplerate((int)g_sr);   /* the box powers up at 44.1 kHz */
+    }
     pthread_mutex_unlock(&g_mutex);
     if (ok) {
         if (attempt > 0) LOG("Rane SL 2 opened on attempt %d", attempt + 1);
@@ -1416,19 +1431,26 @@ static void start_hotplug_monitor(void) {
     CFNumberRef vn = CFNumberCreate(NULL, kCFNumberIntType, &v);
     CFNumberRef pn = CFNumberCreate(NULL, kCFNumberIntType, &p);
 
+    /* Notifications for the box arriving and leaving (both delivered on the hot-plug queue). */
     CFMutableDictionaryRef m1 = IOServiceMatching(kIOUSBDeviceClassName);
     CFDictionarySetValue(m1, CFSTR(kUSBVendorID), vn);
     CFDictionarySetValue(m1, CFSTR(kUSBProductID), pn);
-    IOServiceAddMatchingNotification(g_notify_port, kIOFirstMatchNotification, m1, on_usb_added, NULL, &g_added_iter);
-    on_usb_added(NULL, g_added_iter);
-
+    kern_return_t k1 = IOServiceAddMatchingNotification(g_notify_port, kIOFirstMatchNotification, m1, on_usb_added, NULL, &g_added_iter);
     CFMutableDictionaryRef m2 = IOServiceMatching(kIOUSBDeviceClassName);
     CFDictionarySetValue(m2, CFSTR(kUSBVendorID), vn);
     CFDictionarySetValue(m2, CFSTR(kUSBProductID), pn);
-    IOServiceAddMatchingNotification(g_notify_port, kIOTerminatedNotification, m2, on_usb_removed, NULL, &g_removed_iter);
-    while (IOIteratorNext(g_removed_iter)) {}
-
+    kern_return_t k2 = IOServiceAddMatchingNotification(g_notify_port, kIOTerminatedNotification, m2, on_usb_removed, NULL, &g_removed_iter);
     CFRelease(vn); CFRelease(pn);
+    if (k1 != KERN_SUCCESS || k2 != KERN_SUCCESS)
+        LOG("USB hot-plug notifications could not be set up (0x%x, 0x%x): plug and unplug won't be seen", k1, k2);
+
+    /* Each iterator must be drained once to arm it. Do that on the hot-plug queue too, so a box
+       already attached is handled there like any later arrival (not inside Initialize). */
+    dispatch_async(hq, ^{
+        on_usb_added(NULL, g_added_iter);
+        io_service_t o;
+        while ((o = IOIteratorNext(g_removed_iter))) IOObjectRelease(o);
+    });
 }
 
 /* ============================================================================
