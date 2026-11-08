@@ -6,24 +6,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "common.h"
 
 static int g_mask = 0;
 static double g_phase = 0, g_sr = 44100;
 
-static AudioObjectID find(const char *sub) {
-    AudioObjectPropertyAddress a = { kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
-    UInt32 sz = 0; AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &a, 0, NULL, &sz);
-    AudioObjectID ids[64]; if (sz > sizeof ids) sz = sizeof ids;
-    AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, 0, NULL, &sz, ids);
-    for (UInt32 i = 0; i < sz / sizeof(AudioObjectID); i++) {
-        CFStringRef nm = NULL; UInt32 s = sizeof(CFStringRef);
-        AudioObjectPropertyAddress na = { kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
-        if (AudioObjectGetPropertyData(ids[i], &na, 0, NULL, &s, &nm) || !nm) continue;
-        char buf[256]; CFStringGetCString(nm, buf, sizeof buf, kCFStringEncodingUTF8); CFRelease(nm);
-        if (strstr(buf, sub)) return ids[i];
-    }
-    return kAudioObjectUnknown;
-}
 
 static OSStatus proc(AudioObjectID d, const AudioTimeStamp *now, const AudioBufferList *in, const AudioTimeStamp *it,
                      AudioBufferList *out, const AudioTimeStamp *ot, void *ctx) {

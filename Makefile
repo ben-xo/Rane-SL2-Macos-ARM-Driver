@@ -25,7 +25,7 @@ flash:
 LATENCY_TOOLS = rtlat sinetest chtone chrec devprobe setrate sl2dbg
 latency: $(addprefix tools/latency/bin/,$(LATENCY_TOOLS))
 
-tools/latency/bin/%: tools/latency/%.c
+tools/latency/bin/%: tools/latency/%.c tools/latency/common.h
 	@mkdir -p tools/latency/bin
 	$(CC) -O2 -framework CoreAudio -framework CoreFoundation $< -o $@
 

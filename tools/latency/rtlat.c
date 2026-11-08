@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "common.h"
 
 #define MAXCLICK 64
 #define CLICK_LEN 48
@@ -27,20 +28,6 @@ static float *g_in;                         /* captured input channel, indexed b
 static double g_in0 = -1;
 static size_t g_in_len;
 
-static AudioObjectID find(const char *sub) {
-    AudioObjectPropertyAddress a = { kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
-    UInt32 sz = 0; AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &a, 0, NULL, &sz);
-    AudioObjectID ids[64]; if (sz > sizeof ids) sz = sizeof ids;
-    AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, 0, NULL, &sz, ids);
-    for (UInt32 i = 0; i < sz / sizeof(AudioObjectID); i++) {
-        CFStringRef nm = NULL; UInt32 s = sizeof(CFStringRef);
-        AudioObjectPropertyAddress na = { kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
-        if (AudioObjectGetPropertyData(ids[i], &na, 0, NULL, &s, &nm) || !nm) continue;
-        char buf[256]; CFStringGetCString(nm, buf, sizeof buf, kCFStringEncodingUTF8); CFRelease(nm);
-        if (strstr(buf, sub)) return ids[i];
-    }
-    return kAudioObjectUnknown;
-}
 
 static OSStatus proc(AudioObjectID d, const AudioTimeStamp *now, const AudioBufferList *in, const AudioTimeStamp *it,
                      AudioBufferList *out, const AudioTimeStamp *ot, void *ctx) {

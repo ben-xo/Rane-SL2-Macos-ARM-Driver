@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "common.h"
 
 #define FREQ 997.0
 #define AMP  0.4
@@ -23,20 +24,6 @@ static double g_in0 = -1, g_last_in_end = -1;
 static int g_in_gaps;              /* input cycles whose sample time did not follow the previous one */
 static _Atomic int g_overloads;
 
-static AudioObjectID find(const char *sub) {
-    AudioObjectPropertyAddress a = { kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
-    UInt32 sz = 0; AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &a, 0, NULL, &sz);
-    AudioObjectID ids[64]; if (sz > sizeof ids) sz = sizeof ids;
-    AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, 0, NULL, &sz, ids);
-    for (UInt32 i = 0; i < sz / sizeof(AudioObjectID); i++) {
-        CFStringRef nm = NULL; UInt32 s = sizeof(CFStringRef);
-        AudioObjectPropertyAddress na = { kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
-        if (AudioObjectGetPropertyData(ids[i], &na, 0, NULL, &s, &nm) || !nm) continue;
-        char buf[256]; CFStringGetCString(nm, buf, sizeof buf, kCFStringEncodingUTF8); CFRelease(nm);
-        if (strstr(buf, sub)) return ids[i];
-    }
-    return kAudioObjectUnknown;
-}
 
 static OSStatus overload_listener(AudioObjectID o, UInt32 n, const AudioObjectPropertyAddress *a, void *c) {
     g_overloads++;
