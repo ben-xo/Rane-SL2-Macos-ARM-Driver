@@ -21,6 +21,7 @@
 #import <IOKit/usb/IOUSBLib.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <os/log.h>
 
 #define VID 0x1cc5
 #define PID 0x0013
@@ -106,6 +107,20 @@ static bool g_was_connected;         /* box connected at the last poll (g_poll_q
 static bool g_poll_primed;           /* the first poll only records the state (g_poll_q) */
 
 static bool handle_ok(void *h) { return h == &g_handle; }
+
+/* Every exported call is logged at debug level with its result, plus what was sent to and received
+   from the box, so a client's use of the API can be followed without a debugger:
+     log stream --level debug --predicate 'subsystem == "com.rane.sl2api"'
+   Debug-level messages cost almost nothing unless a log stream asks for them. The SL2_* functions
+   forward to RH_*, so they log under the RH_* name. */
+static os_log_t api_log(void) {
+    static os_log_t log;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ log = os_log_create("com.rane.sl2api", "api"); });
+    return log;
+}
+#define TRACE(fmt, ...) os_log_debug(api_log(), "%{public}s" fmt, __func__, ##__VA_ARGS__)
+#define RET(e) ({ int ret_ = (e); TRACE(" -> %d", ret_); ret_; })
 
 /* ============================================================================
  * The driver: its device, status and properties
@@ -238,6 +253,7 @@ static void dispatch_report(const uint8_t pkt[HID_REPORT_LEN]) {
         memset(&m, 0, sizeof m);
         m.length = pkt[5] <= HIDI_MAX_LEN ? pkt[5] : HIDI_MAX_LEN;
         memcpy(m.data, pkt + 6, m.length);
+        TRACE(": hidimsg callback %{public}.*P", (int)m.length, m.data);
         hidi(&m);
         return;
     }
@@ -245,6 +261,7 @@ static void dispatch_report(const uint8_t pkt[HID_REPORT_LEN]) {
     void (*sr)(SL2_samplerate_t *) = atomic_load(&g_sr_cb);
     if (pkt[0] == SL2_EVT_SAMPLE_RATE && sr) {
         SL2_samplerate_t s = { .sample_rate = (pkt[5] << 16) | (pkt[6] << 8) | pkt[7] };
+        TRACE(": sample-rate callback %d", s.sample_rate);
         sr(&s);
     }
 }
@@ -261,6 +278,7 @@ static void poll_driver(void) {
     if (!g_poll_primed) g_poll_primed = true;
     else if (connected != g_was_connected && port) {
         RH_usb_port_status_t ps = { connected ? 1 : 0, 0 };
+        TRACE(": port-status callback {%d, %d}", ps.this_port, ps.other_port);
         port(&ps);
     }
     /* Remember the state for the next poll; without a box there are no reports to read. */
@@ -309,37 +327,39 @@ static void poll_stop(void) {
 EXPORT void *RH_open(void) {
     pthread_mutex_lock(&g_lock);
     g_open_count++;
+    TRACE(": open handles %d", g_open_count);
     poll_start();
     pthread_mutex_unlock(&g_lock);
     return &g_handle;
 }
 EXPORT void *RH_open_private(int v) { (void)v; return RH_open(); }
-EXPORT int   RH_private_last_connection_error(void) { return 0; }
+EXPORT int   RH_private_last_connection_error(void) { return RET(0); }
 
 EXPORT int RH_close(void *h) {
-    if (!handle_ok(h)) return RH_ERR_BAD_ARG;
+    if (!handle_ok(h)) return RET(RH_ERR_BAD_ARG);
     pthread_mutex_lock(&g_lock);
     if (g_open_count > 0 && --g_open_count == 0) poll_stop();
+    TRACE(": open handles %d", g_open_count);
     pthread_mutex_unlock(&g_lock);
-    return RH_OK;
+    return RET(RH_OK);
 }
 
-EXPORT int RH_get_vendor_id(void *h, int *v)  { if (!handle_ok(h) || !v) return RH_ERR_BAD_ARG; *v = VID; return RH_OK; }
-EXPORT int RH_get_product_id(void *h, int *p) { if (!handle_ok(h) || !p) return RH_ERR_BAD_ARG; *p = PID; return RH_OK; }
+EXPORT int RH_get_vendor_id(void *h, int *v)  { if (!handle_ok(h) || !v) return RET(RH_ERR_BAD_ARG); *v = VID; return RET(RH_OK); }
+EXPORT int RH_get_product_id(void *h, int *p) { if (!handle_ok(h) || !p) return RET(RH_ERR_BAD_ARG); *p = PID; return RET(RH_OK); }
 
 /* Rane's takes only the output: four values, {1, 1, 2, 5}. */
 EXPORT int RH_get_api_version(uint32_t v[4]) {
-    if (!v) return RH_ERR_BAD_ARG;
+    if (!v) return RET(RH_ERR_BAD_ARG);
     v[0] = 1; v[1] = 1; v[2] = 2; v[3] = 5;
-    return RH_OK;
+    return RET(RH_OK);
 }
 
 /* Rane's reports its kernel extension's version (16 bytes). There is no kernel extension here:
    report 1.0.0.0. */
 EXPORT int RH_get_driver_version(void *h, uint32_t v[4]) {
-    if (!handle_ok(h) || !v) return RH_ERR_BAD_ARG;
+    if (!handle_ok(h) || !v) return RET(RH_ERR_BAD_ARG);
     v[0] = 1; v[1] = 0; v[2] = 0; v[3] = 0;
-    return RH_OK;
+    return RET(RH_OK);
 }
 
 /* The control panel's latency slider. Rane's kernel extension used it as the USB buffer size; the
@@ -347,16 +367,16 @@ EXPORT int RH_get_driver_version(void *h, uint32_t v[4]) {
    validated (1-50 ms) and kept, and reading it back gives the plug-in's real output latency plus
    safety offset, rounded up. */
 EXPORT int RH_set_buffer_millisecs(void *h, int ms) {
-    if (!handle_ok(h) || ms < 1 || ms > 50) return RH_ERR_BAD_ARG;
-    if (!is_usb_present()) return RH_ERR_NOT_CONNECTED;
+    if (!handle_ok(h) || ms < 1 || ms > 50) return RET(RH_ERR_BAD_ARG);
+    if (!is_usb_present()) return RET(RH_ERR_NOT_CONNECTED);
     g_buffer_ms = ms;
-    return RH_OK;
+    return RET(RH_OK);
 }
 EXPORT int RH_get_buffer_millisecs(void *h, int *ms) {
-    if (!handle_ok(h) || !ms) return RH_ERR_BAD_ARG;
+    if (!handle_ok(h) || !ms) return RET(RH_ERR_BAD_ARG);
     /* Needs the driver's device. */
     AudioObjectID dev = find_hal_device();
-    if (dev == kAudioObjectUnknown) return RH_ERR_NOT_CONNECTED;
+    if (dev == kAudioObjectUnknown) return RET(RH_ERR_NOT_CONNECTED);
     /* Read the output latency and safety offset (in frames). */
     UInt32 lat = 0, safety = 0, sz = sizeof(UInt32);
     Float64 sr = 0;
@@ -369,85 +389,88 @@ EXPORT int RH_get_buffer_millisecs(void *h, int *ms) {
     /* Read the sample rate and convert the frames to ms, rounded up; without a usable rate, give
        back the slider's stored value. */
     sz = sizeof(Float64);
-    if (AudioObjectGetPropertyData(dev, &ra, 0, NULL, &sz, &sr) != noErr || sr <= 0) { *ms = g_buffer_ms; return RH_OK; }
+    if (AudioObjectGetPropertyData(dev, &ra, 0, NULL, &sz, &sr) != noErr || sr <= 0) { *ms = g_buffer_ms; return RET(RH_OK); }
     *ms = (int)ceil((double)(lat + safety) * 1000.0 / sr);
-    return RH_OK;
+    return RET(RH_OK);
 }
 
 /* {this port, other port}: the SL 2 has one USB port, so {1, 0} while connected. */
 EXPORT int RH_get_usb_port_status(void *h, int st[2]) {
-    if (!handle_ok(h) || !st) return RH_ERR_BAD_ARG;
-    if (!is_usb_present()) return RH_ERR_NOT_CONNECTED;
+    if (!handle_ok(h) || !st) return RET(RH_ERR_BAD_ARG);
+    if (!is_usb_present()) return RET(RH_ERR_NOT_CONNECTED);
     st[0] = 1; st[1] = 0;
-    return RH_OK;
+    return RET(RH_OK);
 }
 
 /* The box's USB link speed (0x0a): 0 unconfigured, 1 full speed (no audio), 2 high speed. */
 EXPORT int RH_get_port_speed(void *h, int *speed) {
-    if (!handle_ok(h) || !speed) return RH_ERR_BAD_ARG;
+    if (!handle_ok(h) || !speed) return RET(RH_ERR_BAD_ARG);
     uint8_t r[HID_REPORT_LEN];
     int e = send_hid_cmd(SL2_CMD_PORT_SPEED, NULL, 0, r);
-    if (e) return e;
-    if (r[0] != SL2_CMD_PORT_SPEED) return RH_ERR_NO_REPLY;
+    if (e) return RET(e);
+    if (r[0] != SL2_CMD_PORT_SPEED) return RET(RH_ERR_NO_REPLY);
     *speed = r[5];
-    return RH_OK;
+    return RET(RH_OK);
 }
 
 /* Rane's sends SysEx F0 17 52 <cp> F7 for control point 1 or 2; the SL 2's firmware implements no
    such message, so this only checks its arguments. */
 EXPORT int RH_set_control_point(void *h, const int *cp) {
-    if (!handle_ok(h) || !cp || *cp < 1 || *cp > 2) return RH_ERR_BAD_ARG;
-    if (!is_usb_present()) return RH_ERR_NOT_CONNECTED;
-    return RH_OK;
+    if (!handle_ok(h) || !cp || *cp < 1 || *cp > 2) return RET(RH_ERR_BAD_ARG);
+    if (!is_usb_present()) return RET(RH_ERR_NOT_CONNECTED);
+    return RET(RH_OK);
 }
 
 /* The challenge Serato uses to check it is talking to genuine Rane hardware: send the 8-byte
    challenge with 0x37 and return the box's 8-byte answer. */
 EXPORT int RH_driver_timer(void *h, const uint8_t *in, uint32_t inlen, uint8_t *out, uint32_t outlen) {
-    if (!handle_ok(h) || !in || !out || inlen != 8 || outlen != 8) return RH_ERR_BAD_ARG;
+    TRACE(": challenge %{public}.*P (%u bytes, answer buffer %u)", in && inlen <= HID_MAX_ARGS ? (int)inlen : 0, in, inlen, outlen);
+    if (!handle_ok(h) || !in || !out || inlen != 8 || outlen != 8) return RET(RH_ERR_BAD_ARG);
     uint8_t r[HID_REPORT_LEN];
     int e = send_hid_cmd(SL2_CMD_CHALLENGE, in, 8, r);
-    if (e) return e;
-    if (r[0] != SL2_CMD_CHALLENGE) return RH_ERR_NO_REPLY;
+    if (e) return RET(e);
+    if (r[0] != SL2_CMD_CHALLENGE) return RET(RH_ERR_NO_REPLY);
     memcpy(out, r + 5, 8);
-    return RH_OK;
+    TRACE(": answer %{public}.*P", 8, out);
+    return RET(RH_OK);
 }
 
 /* Ask the box (0x01): four values, major, minor, 0, and the 32-bit build stamp from reply[7..10]
    (big-endian). */
 EXPORT int RH_get_firmware_version(void *h, uint32_t v[4]) {
-    if (!handle_ok(h) || !v) return RH_ERR_BAD_ARG;
+    if (!handle_ok(h) || !v) return RET(RH_ERR_BAD_ARG);
     uint8_t r[HID_REPORT_LEN];
     int e = send_hid_cmd(SL2_CMD_VERSION, NULL, 0, r);
-    if (e) return e;
-    if (r[0] != SL2_CMD_VERSION) return RH_ERR_NO_REPLY;
+    if (e) return RET(e);
+    if (r[0] != SL2_CMD_VERSION) return RET(RH_ERR_NO_REPLY);
     v[0] = r[5];
     v[1] = r[6];
     v[2] = 0;
     v[3] = ((uint32_t)r[7] << 24) | ((uint32_t)r[8] << 16) | ((uint32_t)r[9] << 8) | r[10];
-    return RH_OK;
+    return RET(RH_OK);
 }
 
 /* The firmware Rane's framework embeds is v1.10: two values {major, minor}. */
 EXPORT int RH_get_firmware_embedded_version(void *h, uint32_t v[2]) {
-    if (!handle_ok(h) || !v) return RH_ERR_BAD_ARG;
+    if (!handle_ok(h) || !v) return RET(RH_ERR_BAD_ARG);
     v[0] = 1;
     v[1] = 10;
-    return RH_OK;
+    return RET(RH_OK);
 }
 
 /* Send MIDI-style messages to the box with 0x41: m->length bytes from m->data. The firmware acts
    on Note On / Note Off of notes 0x5C and 0x5D (deck thru) and on the state-dump SysEx; it stops
    reading the message at anything else. */
 EXPORT int RH_send_hidimsg(void *h, const RH_hidimsg_data_t *m) {
-    if (!handle_ok(h) || !m || m->length == 0 || m->length > HIDI_MAX_LEN) return RH_ERR_BAD_ARG;
+    TRACE(": %{public}.*P", m && m->length <= HIDI_MAX_LEN ? (int)m->length : 0, m ? m->data : NULL);
+    if (!handle_ok(h) || !m || m->length == 0 || m->length > HIDI_MAX_LEN) return RET(RH_ERR_BAD_ARG);
     uint8_t args[1 + HIDI_MAX_LEN];
     args[0] = m->length;
     memcpy(args + 1, m->data, m->length);
     uint8_t r[HID_REPORT_LEN];
     int e = send_hid_cmd(SL2_CMD_HIDI, args, 1u + m->length, r);
-    if (e) return e;
-    return r[0] == SL2_CMD_HIDI ? RH_OK : RH_ERR_NO_REPLY;
+    if (e) return RET(e);
+    return RET(r[0] == SL2_CMD_HIDI ? RH_OK : RH_ERR_NO_REPLY);
 }
 
 static int send_three(void *h, uint8_t a, uint8_t b, uint8_t c) {
@@ -459,6 +482,7 @@ static int send_three(void *h, uint8_t a, uint8_t b, uint8_t c) {
    reports of notes 0x5C/0x5D (deck thru), 0x61 (the LINE/PHONO switch) and 0x60, which reach the
    hidimsg callback like any other report. */
 EXPORT int RH_get_all_controls(void *h) {
+    TRACE(": state dump requested");
     RH_hidimsg_data_t m = { .length = 4, .data = { 0xF0, 0x17, 0x04, 0xF7 } };
     return RH_send_hidimsg(h, &m);
 }
@@ -475,7 +499,7 @@ EXPORT int RH_send_control_change(void *h, uint8_t cc, uint8_t val) { return sen
 /* SysEx: Rane's wraps the bytes as F0 17 <bytes> F7. */
 EXPORT int RH_send_sys_ex(void *h, const uint8_t *d, uint8_t len) {
     /* The wrapped message (the bytes plus F0 17 and F7) must fit in one report. */
-    if (!handle_ok(h) || (!d && len) || len + 3u > HIDI_MAX_LEN) return RH_ERR_BAD_ARG;
+    if (!handle_ok(h) || (!d && len) || len + 3u > HIDI_MAX_LEN) return RET(RH_ERR_BAD_ARG);
     /* Build F0 17 <bytes> F7 and send it as one Hidi message. */
     RH_hidimsg_data_t m = { .length = (uint8_t)(len + 3) };
     m.data[0] = 0xF0; m.data[1] = 0x17;
@@ -485,56 +509,56 @@ EXPORT int RH_send_sys_ex(void *h, const uint8_t *d, uint8_t len) {
 }
 
 EXPORT int RH_set_hidimsg_callback(void *h, void *cb) {
-    if (!handle_ok(h)) return RH_ERR_BAD_ARG;
+    if (!handle_ok(h)) return RET(RH_ERR_BAD_ARG);
     atomic_store(&g_hidi_cb, (void (*)(RH_hidimsg_data_t *))cb);
-    return RH_OK;
+    return RET(RH_OK);
 }
 
 /* Bridge packets: Rane's sends HID 0x42, which the SL 2's firmware does not implement, and the box
    never sends one. Kept for the API: arguments are checked, nothing is sent, the callback never
    fires. */
 EXPORT int RH_send_bridge_packet(void *h, const RH_bridgepacket_data_t *d) {
-    if (!handle_ok(h) || !d) return RH_ERR_BAD_ARG;
-    return is_usb_present() ? RH_OK : RH_ERR_NOT_CONNECTED;
+    if (!handle_ok(h) || !d) return RET(RH_ERR_BAD_ARG);
+    return RET(is_usb_present() ? RH_OK : RH_ERR_NOT_CONNECTED);
 }
 EXPORT int RH_set_bridgepacket_callback(void *h, void *cb) {
-    if (!handle_ok(h)) return RH_ERR_BAD_ARG;
+    if (!handle_ok(h)) return RET(RH_ERR_BAD_ARG);
     atomic_store(&g_bridge_cb, (void (*)(RH_bridgepacket_data_t *))cb);
-    return RH_OK;
+    return RET(RH_OK);
 }
 
 /* Stored only, as Rane's: it is called when the box appears ({1, 0}) or goes ({0, 0}). */
 EXPORT int RH_set_usb_port_status_callback(void *h, void *cb) {
-    if (!handle_ok(h)) return RH_ERR_BAD_ARG;
+    if (!handle_ok(h)) return RET(RH_ERR_BAD_ARG);
     atomic_store(&g_port_cb, (void (*)(RH_usb_port_status_t *))cb);
-    return RH_OK;
+    return RET(RH_OK);
 }
 
 /* Firmware update and re-enumeration are deliberately not implemented: the firmware tools
    (tools/firmware/) do that with safeguards, and a client must never trigger it by accident. */
-EXPORT int RH_set_update_firmware(void *h, const void *d, int len, void *cb) { return handle_ok(h) ? RH_OK : RH_ERR_BAD_ARG; }
-EXPORT int RH_set_update_firmware_from_embedded(void *h, void *cb)            { return handle_ok(h) ? RH_OK : RH_ERR_BAD_ARG; }
-EXPORT int RH_set_alt_product_id(void *h, int pid)                            { return handle_ok(h) ? RH_OK : RH_ERR_BAD_ARG; }
+EXPORT int RH_set_update_firmware(void *h, const void *d, int len, void *cb) { return RET(handle_ok(h) ? RH_OK : RH_ERR_BAD_ARG); }
+EXPORT int RH_set_update_firmware_from_embedded(void *h, void *cb)            { return RET(handle_ok(h) ? RH_OK : RH_ERR_BAD_ARG); }
+EXPORT int RH_set_alt_product_id(void *h, int pid)                            { return RET(handle_ok(h) ? RH_OK : RH_ERR_BAD_ARG); }
 
 /* Rane's asks the box (0x13), which the SL 2 rejects: never a boot device by that test. */
 EXPORT int RH_is_boot_device(void *h, int *b) {
-    if (!handle_ok(h) || !b) return RH_ERR_BAD_ARG;
-    if (!is_usb_present()) return RH_ERR_NOT_CONNECTED;
+    if (!handle_ok(h) || !b) return RET(RH_ERR_BAD_ARG);
+    if (!is_usb_present()) return RET(RH_ERR_NOT_CONNECTED);
     *b = 0;
-    return RH_OK;
+    return RET(RH_OK);
 }
 
 /* MIDI channels belonged to Rane's kernel extension; the SL 2 has no MIDI ports. */
 EXPORT int RH_get_midi_channels(void *h, uint32_t ch[2]) {
-    if (!handle_ok(h) || !ch) return RH_ERR_BAD_ARG;
+    if (!handle_ok(h) || !ch) return RET(RH_ERR_BAD_ARG);
     ch[0] = ch[1] = 0;
-    return RH_OK;
+    return RET(RH_OK);
 }
-EXPORT int RH_set_midi_channels(void *h, const uint32_t ch[2]) { return handle_ok(h) && ch ? RH_OK : RH_ERR_BAD_ARG; }
-EXPORT int RH_set_midi_ch_callback(void *h, void *cb)          { return handle_ok(h) ? RH_OK : RH_ERR_BAD_ARG; }
+EXPORT int RH_set_midi_channels(void *h, const uint32_t ch[2]) { return RET(handle_ok(h) && ch ? RH_OK : RH_ERR_BAD_ARG); }
+EXPORT int RH_set_midi_ch_callback(void *h, void *cb)          { return RET(handle_ok(h) ? RH_OK : RH_ERR_BAD_ARG); }
 
 /* Rane's flushes its queue of outgoing messages; every message here is sent at once. */
-EXPORT int RH_flush_hidi_queue(void *h) { return handle_ok(h) ? RH_OK : RH_ERR_BAD_ARG; }
+EXPORT int RH_flush_hidi_queue(void *h) { return RET(handle_ok(h) ? RH_OK : RH_ERR_BAD_ARG); }
 
 /* ============================================================================
  * Exported SL2_* functions: Rane's forward to the RH_* ones, except the sample rate and
@@ -575,39 +599,39 @@ EXPORT int SL2_flush_hidi_queue(void *h)                             { return RH
    would start the control panel's automatic firmware update, which is deliberately not
    implemented here. A box in its bootloader shows up in the driver's status (boot_mode) and log. */
 EXPORT int SL2_is_C0_device(void *h, int *b) {
-    if (!handle_ok(h) || !b) return RH_ERR_BAD_ARG;
-    if (!is_usb_present()) return RH_ERR_NOT_CONNECTED;
+    if (!handle_ok(h) || !b) return RET(RH_ERR_BAD_ARG);
+    if (!is_usb_present()) return RET(RH_ERR_NOT_CONNECTED);
     *b = 0;
-    return RH_OK;
+    return RET(RH_OK);
 }
 
 /* The box's sample rate, asked from the box (0x30): [5..6], big-endian. */
 EXPORT int SL2_get_sample_rate(void *h, int *rate) {
-    if (!handle_ok(h) || !rate) return RH_ERR_BAD_ARG;
+    if (!handle_ok(h) || !rate) return RET(RH_ERR_BAD_ARG);
     uint8_t r[HID_REPORT_LEN];
     int e = send_hid_cmd(SL2_CMD_GET_RATE, NULL, 0, r);
-    if (e) return e;
-    if (r[0] != SL2_CMD_GET_RATE) return RH_ERR_NO_REPLY;
+    if (e) return RET(e);
+    if (r[0] != SL2_CMD_GET_RATE) return RET(RH_ERR_NO_REPLY);
     *rate = (r[5] << 8) | r[6];
-    return RH_OK;
+    return RET(RH_OK);
 }
 
 /* Change the rate through CoreAudio: the HAL plug-in then changes the HAL's rate and the box's
    together (a rate set only on the box would leave the HAL rendering at the old one). */
 EXPORT int SL2_set_sample_rate(void *h, const int *rate) {
-    if (!handle_ok(h) || !rate || (*rate != 44100 && *rate != 48000)) return RH_ERR_BAD_ARG;
+    if (!handle_ok(h) || !rate || (*rate != 44100 && *rate != 48000)) return RET(RH_ERR_BAD_ARG);
     AudioObjectID dev = find_hal_device();
-    if (dev == kAudioObjectUnknown) return RH_ERR_NOT_CONNECTED;
+    if (dev == kAudioObjectUnknown) return RET(RH_ERR_NOT_CONNECTED);
     AudioObjectPropertyAddress a = { kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
     Float64 fsr = (Float64)*rate;
-    return AudioObjectSetPropertyData(dev, &a, 0, NULL, sizeof(Float64), &fsr) == noErr ? RH_OK : RH_ERR_NO_REPLY;
+    return RET(AudioObjectSetPropertyData(dev, &a, 0, NULL, sizeof(Float64), &fsr) == noErr ? RH_OK : RH_ERR_NO_REPLY);
 }
 
 /* Not in Rane's API: this library's own callback for the driver's sample-rate event. */
 EXPORT int SL2_set_samplerate_callback(void *h, void *cb) {
-    if (!handle_ok(h)) return RH_ERR_BAD_ARG;
+    if (!handle_ok(h)) return RET(RH_ERR_BAD_ARG);
     atomic_store(&g_sr_cb, (void (*)(SL2_samplerate_t *))cb);
-    return RH_OK;
+    return RET(RH_OK);
 }
 
 /* C++ entry points Rane's framework also exports */
