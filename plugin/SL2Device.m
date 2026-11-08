@@ -145,6 +145,13 @@ static pthread_mutex_t g_unsol_mtx = PTHREAD_MUTEX_INITIALIZER;
 static Float64  g_sr = 44100.0;
 static UInt32   g_io_clients = 0;
 static _Atomic bool g_io_running = false;
+/* Stream generation: bumped when a stream starts and when it stops. Every USB completion and
+   retry carries the generation it was queued in and does nothing once it has moved on, so work
+   left over from a stopped stream can never touch the next one. */
+static _Atomic uint32_t g_stream_gen = 0;
+static bool stream_live(uint32_t gen) {
+    return atomic_load(&g_io_running) && atomic_load(&g_stream_gen) == gen;
+}
 static _Atomic bool g_hw_connected = false;
 static _Atomic bool g_boot_mode = false;     /* a bootloader-mode box (no firmware) is attached */
 static _Atomic bool g_box_present = false;   /* a box with running firmware is attached */
@@ -668,9 +675,9 @@ static bool dp_gone(IOReturn st) {
 }
 
 /* Queue `slot` for the next frame of the schedule, zero-filled, and publish where its samples go. */
-static void dp_submit(int slot) {
+static void dp_submit(int slot, uint32_t gen) {
     for (int attempt = 0; attempt < DP_TRIES; attempt++) {
-        if (!atomic_load(&g_io_running) || !g_ppipe || !g_dp_ptr[slot]) return;
+        if (!stream_live(gen) || !g_ppipe || !g_dp_ptr[slot]) return;
         if ((double)(mach_absolute_time() - g_dp_last_refresh) > 0.5 * ticks_per_ms()) dp_ref_refresh();
         uint64_t now_f = (uint64_t)dp_frame_at(mach_absolute_time());
         if (g_dp_next_frame < now_f + DP_DRY_LEAD) {
@@ -701,7 +708,7 @@ static void dp_submit(int slot) {
                                transactionListCount:PLAY_PKTS firstFrameNumber:f
                                             options:IOUSBHostIsochronousTransferOptionsNone error:&err
                                   completionHandler:^(IOReturn st, IOUSBHostIsochronousTransaction *done) {
-            if (atomic_load(&g_io_running) && st != kIOReturnAborted && !dp_gone(st)) dp_submit(slot);
+            if (stream_live(gen) && st != kIOReturnAborted && !dp_gone(st)) dp_submit(slot, gen);
         }];
         if (ok) {
             g_dp_next_pos += off;
@@ -718,7 +725,7 @@ static void dp_submit(int slot) {
     }
     /* Still refused: try this slot again shortly rather than losing it from the schedule. */
     DBG_DO(dbg_dp_retry_later++);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_MSEC), g_q, ^{ dp_submit(slot); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_MSEC), g_q, ^{ dp_submit(slot, gen); });
 }
 
 /* Allocate the transfer buffers (from the playback interface; dp_release frees them). */
@@ -733,7 +740,8 @@ static bool dp_alloc(void) {
     return true;
 }
 
-static void dp_start(void) {
+static void dp_start(uint32_t gen) {
+    if (!stream_live(gen)) return;
     dp_ref_refresh();
 #if SL2_DEBUG   /* check frameNumberWithTime: and the microframe reference agree */
     IOUSBHostTime t = 0;
@@ -742,7 +750,7 @@ static void dp_start(void) {
 #endif
     dp_anchor((uint64_t)dp_frame_at(mach_absolute_time()) + DP_START_LEAD);
     atomic_store_explicit(&g_dp_active, true, memory_order_release);
-    for (int i = 0; i < DP_SLOTS; i++) dp_submit(i);
+    for (int i = 0; i < DP_SLOTS; i++) dp_submit(i, gen);
     g_dp_started = true;
     LOG("Deep-schedule playback started at frame %llu, %d x 1 ms queued, output latency %.1f + safety %.1f ms",
         atomic_load(&g_dp_F0), DP_SLOTS, DP_OUT_LATENCY_MS, DP_OUT_SAFETY_MS);
@@ -886,11 +894,11 @@ static uint64_t cap_frames_in(uint64_t usb_frames) {
     return (uint64_t)((double)usb_frames * ticks_per_ms() / tpf + 0.5);
 }
 
-static void cap_submit(int idx);
+static void cap_submit(int idx, uint32_t gen);
 
 /* A capture transfer for USB frame fc completed: put its frames in the ring, keep the clock and the
    playback steering up to date, and queue the transfer again. */
-static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *done) {
+static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *done, uint32_t gen) {
 #if SL2_DEBUG
     {   /* test hook 0xF3: hold g_q, as a stall in the USB stack's completion delivery would */
         uint32_t ms = atomic_exchange(&dbg_stall_ms, 0);
@@ -922,7 +930,7 @@ static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *
         int k = 0;
         while (k < CAP_PKTS && !(done[k].status == kIOReturnSuccess && done[k].completeCount >= FRAME_BYTES &&
                                  done[k].completeCount <= PKT_MAX)) k++;
-        if (k == CAP_PKTS) { cap_submit(idx); return; }
+        if (k == CAP_PKTS) { cap_submit(idx, gen); return; }
         clk_first_capture(dp_time_of_uframe(8.0 * (double)fc + k));
         g_cap_next_fc = fc;
     }
@@ -981,17 +989,17 @@ static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *
     clk_track(before, (int)got, ts);
 
     /* Playback: start after a few ms of capture, then steer it by what the box clocked. */
-    if (!g_dp_started && before >= (uint64_t)(8 * g_sr / 1000)) dp_start();
+    if (!g_dp_started && before >= (uint64_t)(8 * g_sr / 1000)) dp_start(gen);
     dp_track_capture(fc, (int)got);
-    cap_submit(idx);
+    cap_submit(idx, gen);
 }
 
 /* Queue capture transfer idx for the next free USB frame. If the frame has already passed (after
    a completion stall), re-anchor ahead of the bus; the frames skipped are filled with silence
    when the next completion arrives. */
-static void cap_submit(int idx) {
+static void cap_submit(int idx, uint32_t gen) {
     for (int attempt = 0; attempt < DP_TRIES; attempt++) {
-        if (!atomic_load(&g_io_running) || !g_cpipe) return;
+        if (!stream_live(gen) || !g_cpipe) return;
 
         /* The next free USB frame, unless that has already passed. */
         if ((double)(mach_absolute_time() - g_dp_last_refresh) > 0.5 * ticks_per_ms()) dp_ref_refresh();
@@ -1010,8 +1018,8 @@ static void cap_submit(int idx) {
                                 transactionListCount:CAP_PKTS firstFrameNumber:f
                                              options:IOUSBHostIsochronousTransferOptionsNone error:&e
                                    completionHandler:^(IOReturn st, IOUSBHostIsochronousTransaction *done) {
-            if (!atomic_load(&g_io_running) || st == kIOReturnAborted || dp_gone(st)) return;
-            cap_complete(idx, f, done);
+            if (!stream_live(gen) || st == kIOReturnAborted || dp_gone(st)) return;
+            cap_complete(idx, f, done, gen);
         }];
         if (ok) return;
         /* Refused (the frame passed while this ran): take the next one. */
@@ -1019,7 +1027,7 @@ static void cap_submit(int idx) {
         g_cap_frame = now_f + DP_START_LEAD + attempt + 1;
     }
     /* Still refused: try again shortly rather than losing this transfer for the rest of the stream. */
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_MSEC), g_q, ^{ cap_submit(idx); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_MSEC), g_q, ^{ cap_submit(idx, gen); });
 }
 
 /* ============================================================================
@@ -1114,6 +1122,39 @@ static bool usb_ensure_hid(void) {
     return false;
 }
 
+/* Switch the deep schedule off and wait for any WriteMix still writing into it, after which its
+   buffers can be released. */
+static void dp_stop(void) {
+    atomic_store_explicit(&g_dp_active, false, memory_order_seq_cst);
+    while (atomic_load_explicit(&g_dp_writers, memory_order_seq_cst) > 0) usleep(50);
+}
+
+/* Release the deep schedule's transfer buffers. They hold the playback interface open, so they
+   must go before the next stream claims it. Call on g_q, after the pipes are aborted. */
+static void dp_release(void) {
+    for (int i = 0; i < DP_SLOTS; i++) { g_dp_data[i] = nil; g_dp_ptr[i] = NULL; }
+    for (int i = 0; i < DP_SCHED_N; i++) atomic_store(&g_dp_sched[i].frame, 0);
+    atomic_store(&g_dp_newest, 0);
+}
+
+/* Undo whatever usb_open_all set up for the audio interfaces: abort the pipes, then release the
+   buffers and pipes on g_q, so no completion handler is still using them (one that runs later
+   sees the stream generation has moved on and does nothing), then put the interfaces back to
+   alternate setting 0 and destroy them so the next stream can claim them. Not called on g_q. */
+static void usb_release_audio(void) {
+    if (g_cpipe) [g_cpipe abortWithError:nil];
+    if (g_ppipe) [g_ppipe abortWithError:nil];
+    if (g_q) dispatch_sync(g_q, ^{
+        dp_release();
+        g_cpipe = nil; g_ppipe = nil;
+    });
+    if (g_cap)  { [g_cap selectAlternateSetting:0 error:nil];  [g_cap destroy];  g_cap = nil; }
+    if (g_play) { [g_play selectAlternateSetting:0 error:nil]; [g_play destroy]; g_play = nil; }
+}
+
+/* Start streaming: claim the audio interfaces, open their isochronous pipes, switch the decks to
+   USB audio and queue the capture transfers (playback starts from the capture handler). On any
+   failure, everything opened so far is released again. */
 static bool usb_open_all(void) {
     if (!usb_ensure_hid()) return false;
     NSError *e = nil;
@@ -1122,6 +1163,7 @@ static bool usb_open_all(void) {
     atomic_store(&g_dp_active, false);
     DBG_DO(dbg_reset());
 
+    /* Claim the playback and capture interfaces. */
     io_iterator_t it = 0;
     IORegistryEntryGetChildIterator(g_dev.ioService, kIOServicePlane, &it);
     io_service_t ch;
@@ -1137,70 +1179,63 @@ static bool usb_open_all(void) {
         IOObjectRelease(ch);
     }
     IOObjectRelease(it);
-
     if (!g_play || !g_cap) {
         LOG("Failed to claim Play/Cap interfaces");
+        usb_release_audio();
         return false;
     }
 
+    /* Set the box's rate, select the streaming alternate settings and open the pipes. */
     send_hw_samplerate((int)g_sr);
-
     [g_play selectAlternateSetting:1 error:&e];
     g_ppipe = copy_isoch_pipe(g_play, kIOUSBEndpointDirectionOut, EP_PLAY, 0x02);
-
     [g_cap selectAlternateSetting:1 error:&e];
     g_cpipe = copy_isoch_pipe(g_cap, kIOUSBEndpointDirectionIn, EP_CAP, 0x86);
-
     if (!g_ppipe || !g_cpipe) {
         LOG("Failed to open Isoch pipes");
+        usb_release_audio();
         return false;
     }
-    dp_ref_refresh();   /* USB frame clock, used for bus times from the first capture on */
-    if (!dp_alloc()) return false;
 
+    /* Buffers: the playback schedule's (from the playback interface) and capture's. */
+    dp_ref_refresh();   /* USB frame clock, used for bus times from the first capture on */
+    if (!dp_alloc()) {
+        usb_release_audio();
+        return false;
+    }
     for (int i = 0; i < CAP_NXF; i++) {
         if (!g_cap_xf[i].buf) g_cap_xf[i].buf = [NSMutableData dataWithLength:CAP_PKTS * PKT_MAX];
         if (!g_cap_xf[i].tx)  g_cap_xf[i].tx  = calloc(CAP_PKTS, sizeof(IOUSBHostIsochronousTransaction));
     }
 
+    /* Decks to USB audio, and the heartbeat. */
     set_usb_switches(true);
     hb_start();
 
+    /* A new timeline and an empty capture ring. */
     memset(g_in_ring, 0, sizeof(g_in_ring));
     atomic_store(&g_cap_head, 0);
     g_cap_next_fc = 0;
     g_cap_last_n = (int)(g_sr / 8000.0 + 0.5);
-
     clk_reset();
     atomic_store(&g_total_cap_frames, 0);
     atomic_store(&g_total_play_frames, 0);
 
+    /* A new stream generation, then queue the capture transfers. */
+    uint32_t gen = atomic_fetch_add(&g_stream_gen, 1) + 1;
     atomic_store(&g_io_running, true);
     g_cap_frame = [g_dev frameNumberWithTime:NULL] + 32;
-    for (int i = 0; i < CAP_NXF; i++) cap_submit(i);
+    for (int i = 0; i < CAP_NXF; i++) cap_submit(i, gen);
 
     LOG("Streaming started on Rane SL 2 (%.0f Hz)", g_sr);
     return true;
 }
 
-/* Switch the deep schedule off and wait for any WriteMix still writing into it, after which its
-   buffers can be released. */
-static void dp_stop(void) {
-    atomic_store_explicit(&g_dp_active, false, memory_order_seq_cst);
-    while (atomic_load_explicit(&g_dp_writers, memory_order_seq_cst) > 0) usleep(50);
-}
-
-/* Release the deep schedule's transfer buffers. They hold the playback interface open, so they
-   must go before the next stream claims it. Call after the pipes are aborted. */
-static void dp_release(void) {
-    for (int i = 0; i < DP_SLOTS; i++) { g_dp_data[i] = nil; g_dp_ptr[i] = NULL; }
-    for (int i = 0; i < DP_SCHED_N; i++) atomic_store(&g_dp_sched[i].frame, 0);
-    atomic_store(&g_dp_newest, 0);
-}
-
-static void usb_stop_streaming(void) {
+/* Stop streaming. box_attached false means the box is gone, so nothing is sent to it. */
+static void usb_stop_streaming(bool box_attached) {
     dp_stop();   /* WriteMix stops touching the schedule */
     if (!atomic_exchange(&g_io_running, false)) return;
+    atomic_fetch_add(&g_stream_gen, 1);   /* completions and retries of this stream now do nothing */
     hb_stop();
 #if SL2_DEBUG   /* this stream's results */
     if (g_dp_started)
@@ -1218,22 +1253,26 @@ static void usb_stop_streaming(void) {
             hb, dbg_capdelay_min, dbg_capdelay_max, dbg_capstamp_min, dbg_capstamp_max);
     }
 #endif
-    if (g_cpipe) [g_cpipe abortWithError:nil];
-    if (g_ppipe) [g_ppipe abortWithError:nil];
-    dp_release();
-    if (g_cap)   [g_cap selectAlternateSetting:0 error:nil];
-    if (g_play)  [g_play selectAlternateSetting:0 error:nil];
-    set_usb_switches(false);
-    g_cpipe = nil; g_ppipe = nil;
-    g_cap = nil;   g_play = nil;
-    LOG("Streaming stopped; Analog Thru restored");
+    usb_release_audio();
+    if (box_attached) {
+        set_usb_switches(false);
+        LOG("Streaming stopped; Analog Thru restored");
+    } else {
+        LOG("Streaming stopped (box disconnected)");
+    }
 }
 
+/* The box is gone: stop streaming, then release the HID side (on g_q, like the audio side). */
 static void usb_close_all(void) {
-    usb_stop_streaming();
+    usb_stop_streaming(false);
+    hb_stop();
     if (g_hpipe_in)  [g_hpipe_in abortWithError:nil];
     if (g_hpipe_out) [g_hpipe_out abortWithError:nil];
-    g_hpipe_in = nil; g_hpipe_out = nil;
+    if (g_q) dispatch_sync(g_q, ^{
+        pthread_mutex_lock(&g_hout_mtx);
+        g_hpipe_in = nil; g_hpipe_out = nil;
+        pthread_mutex_unlock(&g_hout_mtx);
+    });
     if (g_hid)  { [g_hid destroy]; g_hid = nil; }
     if (g_dev)  { [g_dev destroy]; g_dev = nil; }
     atomic_store(&g_hw_connected, false);
@@ -1358,6 +1397,10 @@ static void on_usb_removed(void *refcon, io_iterator_t iter) {
         atomic_store(&g_box_present, false);
         pthread_mutex_lock(&g_mutex);
         usb_close_all();
+        /* The device leaves the HAL's list with the box, and a client using it again after a
+           replug sends a new StartIO: start counting clients from zero. */
+        if (g_io_clients) LOG("%u client(s) were streaming when the box was unplugged", g_io_clients);
+        g_io_clients = 0;
         pthread_mutex_unlock(&g_mutex);
     }
     atomic_store(&g_boot_mode, bootloader);
@@ -1434,11 +1477,11 @@ static OSStatus SL2_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef 
     pthread_mutex_lock(&g_mutex);
     if ((Float64)action != g_sr) {
         bool was_streaming = atomic_load(&g_io_running);
-        if (was_streaming) usb_stop_streaming();
+        if (was_streaming) usb_stop_streaming(true);
         g_sr = (Float64)action;
         clk_reset();
         atomic_fetch_add(&g_zts_seed, 1);   /* new timeline for the HAL */
-        if (was_streaming) usb_open_all();   /* sends 0x31 itself */
+        if (was_streaming && !usb_open_all()) LOG("Could not restart streaming at %.0f Hz", g_sr);   /* sends 0x31 itself */
         else if (usb_ensure_hid()) send_hw_samplerate((int)g_sr);
         LOG("Sample rate changed to %.0f Hz", g_sr);
     }
@@ -1919,13 +1962,13 @@ static OSStatus SL2_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
 }
 
 static OSStatus SL2_StartIO(AudioServerPlugInDriverRef d, AudioObjectID oid, UInt32 cid) {
+    /* The first client starts the stream; if the box can't be opened, the client gets an error
+       rather than silence on a timeline with no box behind it. */
     pthread_mutex_lock(&g_mutex);
-    if (g_io_clients == 0) {
-        if (!usb_open_all()) {
-            clk_reset();
-            atomic_store(&g_total_cap_frames, 0);
-            atomic_store(&g_total_play_frames, 0);
-        }
+    if (g_io_clients == 0 && !usb_open_all()) {
+        pthread_mutex_unlock(&g_mutex);
+        LOG("StartIO failed: the SL 2 could not be opened");
+        return kAudioHardwareNotRunningError;
     }
     g_io_clients++;
     pthread_mutex_unlock(&g_mutex);
@@ -1936,7 +1979,9 @@ static OSStatus SL2_StopIO(AudioServerPlugInDriverRef d, AudioObjectID oid, UInt
     pthread_mutex_lock(&g_mutex);
     if (g_io_clients > 0) {
         g_io_clients--;
-        if (g_io_clients == 0) usb_stop_streaming();
+        if (g_io_clients == 0) usb_stop_streaming(true);
+    } else {
+        LOG("StopIO with no client running (the box was unplugged while it streamed)");
     }
     pthread_mutex_unlock(&g_mutex);
     return 0;
