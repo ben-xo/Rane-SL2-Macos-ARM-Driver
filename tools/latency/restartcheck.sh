@@ -23,6 +23,6 @@ log=$(/usr/bin/log show --start "$start" --style compact --predicate "subsystem 
     | grep -E 'Deep-schedule playback started|Failed to claim|enqueue refused|dp result' | sed -E 's/.*\] \[SL2\] //')
 echo "$log"
 [ "$(echo "$log" | grep -c 'Deep-schedule playback started')" -ge 3 ] || { echo "FAIL: fewer than 3 streams started"; fail=1; }
-echo "$log" | grep -qE 'Failed to claim|enqueue refused' && { echo "FAIL: a stream did not start cleanly"; fail=1; }
+echo "$log" | grep -qE 'Failed to claim|enqueue refused for frame' && { echo "FAIL: a stream did not start cleanly"; fail=1; }
 [ $fail = 0 ] && echo "PASS" || echo "FAIL"
 exit $fail

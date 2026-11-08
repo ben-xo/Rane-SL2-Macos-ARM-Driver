@@ -955,7 +955,7 @@ static void dp_write(const float *buf, UInt32 frames, uint64_t pos) {
  * what the box clocked, and the audio that follows lands at its own timeline position.
  * ============================================================================ */
 static uint64_t g_cap_next_fc;          /* USB frame the next capture completion should cover (g_q) */
-static int      g_cap_last_n;           /* frames in the last good capture packet (g_q) */
+static double   g_cap_fill_frac;        /* fraction of a frame carried between silence fills (g_q) */
 static _Atomic uint64_t g_cap_head;     /* timeline position just past the last frame written to the ring */
 #define CAP_VALID_SPAN (RING_FRAMES / 2)   /* ReadInput trusts positions this far behind the head */
 
@@ -966,11 +966,16 @@ static void cap_fill_silence(uint64_t pos, uint64_t n) {
         memset(&g_in_ring[((pos + i) & RING_MASK) * NCH], 0, NCH * sizeof(float));
 }
 
-/* Audio frames the box clocks in `usb_frames` USB frames, at its measured rate. */
-static uint64_t cap_frames_in(uint64_t usb_frames) {
+/* Audio frames the box clocks in `uframes` microframes (125 us each), at its measured rate. The
+   fraction of a frame left over is carried to the next call, so successive fills add up to the
+   box's real count (e.g. 5.51 frames per packet at 44.1 kHz). */
+static uint64_t cap_frames_in(uint64_t uframes) {
     uint64_t h; double s, tpf;
     clk_get(&h, &s, &tpf);
-    return (uint64_t)((double)usb_frames * ticks_per_ms() / tpf + 0.5);
+    double f = (double)uframes * (ticks_per_ms() / 8.0) / tpf + g_cap_fill_frac;
+    uint64_t n = (uint64_t)f;
+    g_cap_fill_frac = f - (double)n;
+    return n;
 }
 
 static void cap_submit(int idx, uint32_t gen);
@@ -1021,7 +1026,7 @@ static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *
        refused after a stall): the box clocked them anyway, so fill them with silence. */
     if (before > 0 && fc > g_cap_next_fc) {
         uint64_t missed = fc - g_cap_next_fc;
-        uint64_t n = cap_frames_in(missed);
+        uint64_t n = cap_frames_in(8 * missed);
         ts = dp_time_of_uframe(8.0 * (double)g_cap_next_fc);
         cap_fill_silence(ring_pos, n);
         got += n;
@@ -1043,12 +1048,12 @@ static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *
         if (!ts) ts = dp_time_of_uframe(8.0 * (double)fc + k);
         if (bad) {
             DBG_DO(dbg_cap_pkt_err++);
-            cap_fill_silence(ring_pos + got, (uint64_t)g_cap_last_n);
-            got += (uint64_t)g_cap_last_n;
+            uint64_t n = cap_frames_in(1);
+            cap_fill_silence(ring_pos + got, n);
+            got += n;
             continue;
         }
         int n = done[k].completeCount / FRAME_BYTES;
-        if (n >= 4) g_cap_last_n = n;
         const uint8_t *p = b + k * PKT_MAX;
         for (int s = 0; s < n; s++) {
             const uint8_t *q = p + s * FRAME_BYTES;
@@ -1300,7 +1305,7 @@ static bool usb_open_all(void) {
     memset(g_in_ring, 0, sizeof(g_in_ring));
     atomic_store(&g_cap_head, 0);
     g_cap_next_fc = 0;
-    g_cap_last_n = (int)(g_sr / 8000.0 + 0.5);
+    g_cap_fill_frac = 0;
     clk_reset();
     atomic_store(&g_total_cap_frames, 0);
     atomic_store(&g_total_play_frames, 0);
