@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<!-- The installer's distribution file; Installer/build-pkg.sh replaces @VERSION@. -->
+<installer-gui-script minSpecVersion="2">
+    <title>Rane SL 2 — Driver for macOS (Apple Silicon &amp; Intel)</title>
+    <organization>io.github.pepeleedj</organization>
+    <domains enable_Anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+    <options customize="never" require-scripts="true" rootVolumeOnly="true" hostArchitectures="arm64,x86_64"/>
+    <background file="background.png" mime-type="image/png" alignment="bottomleft" scaling="tofit"/>
+    <background-darkAqua file="background.png" mime-type="image/png" alignment="bottomleft" scaling="tofit"/>
+    <welcome file="Welcome.html" mime-type="text/html"/>
+    <conclusion file="Conclusion.html" mime-type="text/html"/>
+    <choices-outline>
+        <line choice="default">
+            <line choice="com.pepelee.ranesl2.driver"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="com.pepelee.ranesl2.driver" visible="false">
+        <pkg-ref id="com.pepelee.ranesl2.driver"/>
+    </choice>
+    <pkg-ref id="com.pepelee.ranesl2.driver" version="@VERSION@" onConclusion="none">RaneSL2-Core.pkg</pkg-ref>
+</installer-gui-script>

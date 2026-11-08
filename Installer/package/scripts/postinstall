@@ -7,8 +7,8 @@ chmod -R 755 "/Library/Audio/Plug-Ins/HAL/SL2Device.driver"
 chown -R root:wheel "/Library/Frameworks/SL2Api.framework"
 chmod -R 755 "/Library/Frameworks/SL2Api.framework"
 
-chown -R root:wheel "/Library/PreferencePanes/SL 2 Audio Control Panel.prefPane"
-chmod -R 755 "/Library/PreferencePanes/SL 2 Audio Control Panel.prefPane"
+chown -R root:wheel "/Applications/SL 2 Control Panel.app"
+chmod -R 755 "/Applications/SL 2 Control Panel.app"
 
 chown -R root:wheel "/Library/Extensions/SL2.10.9.kext"
 chmod -R 755 "/Library/Extensions/SL2.10.9.kext"
@@ -21,7 +21,7 @@ fi
 # Remove quarantine attributes if present
 xattr -dr com.apple.quarantine "/Library/Audio/Plug-Ins/HAL/SL2Device.driver" 2>/dev/null || true
 xattr -dr com.apple.quarantine "/Library/Frameworks/SL2Api.framework" 2>/dev/null || true
-xattr -dr com.apple.quarantine "/Library/PreferencePanes/SL 2 Audio Control Panel.prefPane" 2>/dev/null || true
+xattr -dr com.apple.quarantine "/Applications/SL 2 Control Panel.app" 2>/dev/null || true
 
 # Restart CoreAudio daemon so the SL 2 HAL driver loads immediately without rebooting
 killall -9 coreaudiod 2>/dev/null || launchctl kickstart -kp system/com.apple.audio.coreaudiod 2>/dev/null || true

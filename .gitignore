@@ -9,3 +9,5 @@
 .DS_Store
 /tools/latency/bin/
 /sl2apitest
+/SL 2 Control Panel.app/
+/build/
