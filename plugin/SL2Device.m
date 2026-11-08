@@ -821,6 +821,7 @@ static NSMutableData *g_dp_data[DP_SLOTS];
 static uint8_t       *g_dp_ptr[DP_SLOTS];
 static IOUSBHostIsochronousTransaction g_dp_tx[DP_SLOTS][PLAY_PKTS];
 static _Atomic bool     g_dp_active;          /* WriteMix writes into the schedule */
+static _Atomic int      g_dp_writers;         /* WriteMix calls currently inside dp_write */
 static _Atomic uint64_t g_dp_x0, g_dp_F0;     /* first position / frame of the schedule (read by WriteMix) */
 static bool     g_dp_stream, g_dp_started;    /* g_q only from here down */
 static uint64_t g_dp_next_frame, g_dp_next_pos, g_dp_in_cum;
@@ -1395,8 +1396,23 @@ static bool usb_open_all(void) {
     return true;
 }
 
+/* Switch the deep schedule off and wait for any WriteMix still writing into it, after which its
+   buffers can be released. */
+static void dp_stop(void) {
+    atomic_store_explicit(&g_dp_active, false, memory_order_seq_cst);
+    while (atomic_load_explicit(&g_dp_writers, memory_order_seq_cst) > 0) usleep(50);
+}
+
+/* Release the deep schedule's transfer buffers. They hold the playback interface open, so they
+   must go before the next stream claims it. Call after the pipes are aborted. */
+static void dp_release(void) {
+    for (int i = 0; i < DP_SLOTS; i++) { g_dp_data[i] = nil; g_dp_ptr[i] = NULL; }
+    for (int i = 0; i < DP_SCHED_N; i++) atomic_store(&g_dp_sched[i].frame, 0);
+    for (int i = 0; i < XP_SLOTS; i++) g_xp_buf[i] = nil;   /* DEBUG experiment buffers, same reason */
+}
+
 static void usb_stop_streaming(void) {
-    atomic_store_explicit(&g_dp_active, false, memory_order_release);   /* WriteMix stops touching the schedule */
+    dp_stop();   /* WriteMix stops touching the schedule */
     if (!atomic_exchange(&g_io_running, false)) return;
     hb_stop();
     if (g_dp_started)   /* DEBUG */
@@ -1417,6 +1433,7 @@ static void usb_stop_streaming(void) {
     }
     if (g_cpipe) [g_cpipe abortWithError:nil];
     if (g_ppipe) [g_ppipe abortWithError:nil];
+    dp_release();
     if (g_cap)   [g_cap selectAlternateSetting:0 error:nil];
     if (g_play)  [g_play selectAlternateSetting:0 error:nil];
     set_usb_switches(false);
@@ -2098,10 +2115,15 @@ static OSStatus SL2_DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID oi
         }
     } else if (op == kAudioServerPlugInIOOperationWriteMix) {
         uint64_t pos = (uint64_t)ci->mOutputTime.mSampleTime;
-        if (atomic_load_explicit(&g_dp_active, memory_order_acquire)) {
+        /* Register as a writer before checking g_dp_active, so dp_stop either sees this call
+           or this call sees the schedule switched off. */
+        atomic_fetch_add_explicit(&g_dp_writers, 1, memory_order_seq_cst);
+        if (atomic_load_explicit(&g_dp_active, memory_order_seq_cst)) {
             dp_write(buf, frames, pos);
+            atomic_fetch_sub_explicit(&g_dp_writers, 1, memory_order_release);
             return 0;
         }
+        atomic_fetch_sub_explicit(&g_dp_writers, 1, memory_order_release);
         for (UInt32 f = 0; f < frames; f++) {
             uint32_t idx = ((uint32_t)((pos + f) & RING_MASK)) * NCH;
             for (int c = 0; c < NCH; c++) {
