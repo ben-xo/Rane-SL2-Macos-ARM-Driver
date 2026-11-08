@@ -5,8 +5,8 @@ S=$(dirname "$0")
 DEV="$1"; TO="$2"; BACK="$3"
 T="this is a rate change test, one two three four five six seven eight nine ten eleven twelve"
 t0=$(date +%s)
-( sleep 2; "$S/setrate" "$DEV" "$TO" ) &
+( sleep 2; "$S/bin/setrate" "$DEV" "$TO" ) &
 if [ -n "$SAY_DEFAULT" ]; then say "$T"; else say -a "$DEV" "$T"; fi
 echo "$DEV: say took $(( $(date +%s) - t0 ))s"
 wait
-"$S/setrate" "$DEV" "$BACK"
+"$S/bin/setrate" "$DEV" "$BACK"

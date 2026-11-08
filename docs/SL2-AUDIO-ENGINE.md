@@ -10,7 +10,7 @@ SL 3 and SL 4 drivers, which share this architecture.
 The measurements use a loopback cable from Left Deck Out L to Left Deck In L (line level), 44.1 kHz.
 
 - **Unreported latency** is the delay beyond what the HAL's timestamps account for, found by playing clicks
-  and locating them in the captured input (`debug-latency/rtlat.c`).
+  and locating them in the captured input (`tools/latency/rtlat.c`).
 - **Estimated DVS round trip** adds the HAL's own per-cycle gap (safety offsets and IO buffers). It
   approximates input jack → application → output jack, for an application that responds in the same IO cycle.
 
@@ -183,7 +183,7 @@ That matches the 3.7 ms of hidden latency measured on the loopback, before input
   - QuickLookUIService and AirPlayXPCHelper ignore SIGTERM and need `kill -9`.
   - Control Center drops the device from its menu until it is restarted.
 
-  `debug-latency/install-sl2.sh` handles this.
+  `tools/install-sl2.sh` handles this.
 
 ## Bug catalogue
 
@@ -290,7 +290,8 @@ that come from shared code or a shared design.
 
 ## Testing
 
-The tools are in `debug-latency/`. Build each with `clang -O2 -framework CoreAudio -framework CoreFoundation X.c -o X`.
+The tools are in `tools/latency/` (build them with `make latency`). Its README covers the loopback setup
+and what each tool does. The main ones:
 
 | Tool | What it does |
 |---|---|
@@ -298,8 +299,8 @@ The tools are in `debug-latency/`. Build each with `clang -O2 -framework CoreAud
 | `sinetest` | Plays a continuous 997 Hz sine through the loopback for N seconds. Flags any break in the sine recurrence (dropout, repeat, skip) and any drop in level |
 | `dptest.sh` | `sinetest` for N s idle, then with every core busy, with the driver's counters |
 | `restartcheck.sh` | Three streams in a row; each must start the deep schedule |
-| `chtone`, `chrec` | Tone on chosen channels, and cold-start capture to WAV |
-| `install-sl2.sh` | Installs a build and restarts coreaudiod and the processes that go stale |
+
+`tools/install-sl2.sh` installs a build and restarts coreaudiod and the processes that go stale.
 
 **Debug build.** `make plugin DEBUG=1` defines `SL2_DEBUG`, which compiles in the streaming diagnostics
 (counters, the capture timing histogram, the WriteMix calling-pattern check) and one debug command. A plain

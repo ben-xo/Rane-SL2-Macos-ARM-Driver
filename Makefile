@@ -21,7 +21,16 @@ dump:
 flash:
 	$(CC) $(ARCH) $(CFLAGS) -Itools -framework Foundation -framework CoreAudio -framework IOKit -framework IOUSBHost tools/firmware/sl2flash.m tools/SL2Passthrough.m -o sl2flash
 
+# latency and glitch test tools (tools/latency/README.md), built into tools/latency/bin
+LATENCY_TOOLS = rtlat sinetest chtone chrec devprobe setrate setinsafe
+latency: $(addprefix tools/latency/bin/,$(LATENCY_TOOLS))
+
+tools/latency/bin/%: tools/latency/%.c
+	@mkdir -p tools/latency/bin
+	$(CC) -O2 -framework CoreAudio -framework CoreFoundation $< -o $@
+
 clean:
 	rm -f SL2Device SL2Api sl2panel sl2dump sl2flash
+	rm -rf tools/latency/bin
 
-.PHONY: all plugin api panel dump flash clean
+.PHONY: all plugin api panel dump flash latency clean

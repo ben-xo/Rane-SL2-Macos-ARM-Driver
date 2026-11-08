@@ -1,7 +1,7 @@
 #!/bin/bash
 # Install the freshly built SL2Device into the HAL plug-in bundle and restart CoreAudio.
 set -euo pipefail
-# usage: install-sl2.sh [binary]   (default: the worktree build)
+# usage: sudo tools/install-sl2.sh [binary]   (default: SL2Device built by `make plugin` in this checkout)
 SRC=${1:-$(cd "$(dirname "$0")/.." && pwd)/SL2Device}
 echo "installing $SRC"
 DST=/Library/Audio/Plug-Ins/HAL/SL2Device.driver
