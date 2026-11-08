@@ -252,7 +252,13 @@ EXPORT int RH_get_firmware_version(void *h, uint32_t v[4]) {
     return 0;
 }
 
-EXPORT int RH_get_firmware_embedded_version(void *h, int *v) { if (v) *v = 0x0101; return 0; }
+/* As Rane's SL2Api: the firmware it embeds is v1.10, as two values {major, minor}. */
+EXPORT int RH_get_firmware_embedded_version(void *h, uint32_t v[2]) {
+    if (!h || !v) return 8;
+    v[0] = 1;
+    v[1] = 10;
+    return 0;
+}
 
 EXPORT int RH_send_hidimsg(void *h, const uint8_t *msg, int len);
 
@@ -353,7 +359,7 @@ EXPORT int   SL2_get_usb_port_status(void *h, int *st) { return RH_get_usb_port_
 EXPORT int   SL2_get_port_speed(void *h, int *sp) { return RH_get_port_speed(h, sp); }
 EXPORT int   SL2_driver_timer(void *h, int *t) { return RH_driver_timer(h, t); }
 EXPORT int   SL2_get_firmware_version(void *h, uint32_t v[4]) { return RH_get_firmware_version(h, v); }
-EXPORT int   SL2_get_firmware_embedded_version(void *h, int *v) { return RH_get_firmware_embedded_version(h, v); }
+EXPORT int   SL2_get_firmware_embedded_version(void *h, uint32_t v[2]) { return RH_get_firmware_embedded_version(h, v); }
 EXPORT int   SL2_get_all_controls(void *h) { return RH_get_all_controls(h); }
 EXPORT int   SL2_send_hidimsg(void *h, const uint8_t *msg, int len) { return RH_send_hidimsg(h, msg, len); }
 EXPORT int   SL2_send_note_on(void *h, uint8_t note, uint8_t vel) { return RH_send_note_on(h, note, vel); }
