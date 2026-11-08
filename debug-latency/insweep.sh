@@ -4,7 +4,6 @@
 S=$(dirname "$0")
 SECS=$1; NXF=$2; shift 2
 "$S/setnxf" "$NXF" >/dev/null
-"$S/setq" 1 0 >/dev/null
 for ms in "$@"; do
     "$S/setinsafe" "$ms" >/dev/null
     sleep 1
