@@ -818,6 +818,7 @@ static void xp_write_due(void) {
 #define DP_SLOTS       128         /* transfers kept queued: 128 ms (the HAL writes up to ~2 IO buffers ahead) */
 #define DP_SCHED_N     512         /* schedule ring entries: power of two, >= 2 x (DP_SLOTS + HAL lead) */
 #define DP_START_LEAD  8           /* (re)anchor this many frames ahead of the bus (+4 was refused) */
+#define DP_DRY_LEAD    4           /* the schedule counts as run dry when it reaches less than this far ahead */
 #define DP_CORR_S      1.0         /* sent-vs-captured frame difference is removed over this many seconds */
 #define DP_WRITE_GUARD 1.0         /* a frame is written only if it starts at least this many ms from now */
 #define DP_TRIES       4           /* enqueue attempts per call before retrying the slot later */
@@ -929,7 +930,7 @@ static void dp_submit(int slot) {
         if (!atomic_load(&g_io_running) || !g_ppipe || !g_dp_ptr[slot]) return;
         if ((double)(mach_absolute_time() - g_dp_last_refresh) > 0.5 * ticks_per_ms()) dp_ref_refresh();
         uint64_t now_f = (uint64_t)dp_frame_at(mach_absolute_time());
-        if (g_dp_next_frame < now_f + DP_START_LEAD) {
+        if (g_dp_next_frame < now_f + DP_DRY_LEAD) {
             /* The schedule ran dry: a stall longer than DP_SLOTS ms. Re-anchor ahead of the bus. */
             dp_anchor(now_f + DP_START_LEAD);
             dp_resync++;
