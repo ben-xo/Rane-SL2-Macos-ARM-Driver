@@ -840,7 +840,7 @@ static _Atomic uint64_t g_dp_x0, g_dp_F0;     /* current anchor: first position 
 static bool     g_dp_stream, g_dp_started;    /* g_q only from here down */
 static uint64_t g_dp_next_frame, g_dp_next_pos, g_dp_sent_cum, g_dp_in_cum, g_dp_last_refresh;
 static double   g_dp_acc, g_dp_err;
-/* USB frame clock: microframe g_dp_ref_uframe began at host time g_dp_ref_time (seqlock) */
+/* USB frame clock: microframe g_dp_ref_uframe is associated with host time g_dp_ref_time (seqlock) */
 static _Atomic uint32_t g_dp_ref_seq;
 static uint64_t g_dp_ref_uframe, g_dp_ref_time;
 /* DEBUG counters */
@@ -989,14 +989,16 @@ static bool dp_alloc(void) {
 
 static void dp_start(void) {
     dp_ref_refresh();
+    IOUSBHostTime t = 0;
+    uint64_t fn = [g_dev frameNumberWithTime:&t];   /* DEBUG: check the two frame counters agree */
+    double est = dp_frame_at(t);
     dp_anchor((uint64_t)dp_frame_at(mach_absolute_time()) + DP_START_LEAD);
-    uint64_t F0 = atomic_load(&g_dp_F0);
     atomic_store_explicit(&g_dp_active, true, memory_order_release);
     for (int i = 0; i < DP_SLOTS; i++) dp_submit(i);
     g_dp_started = true;
-    LOG("Deep-schedule playback started: frame %llu (frameNumber %llu), %d x 1 ms queued, "
-        "output latency %.1f + safety %.1f ms",
-        F0, [g_dev frameNumberWithTime:NULL], DP_SLOTS, DP_OUT_LATENCY_MS, DP_OUT_SAFETY_MS);
+    LOG("Deep-schedule playback started at frame %llu, %d x 1 ms queued, output latency %.1f + safety %.1f ms "
+        "(frameNumber %llu vs microframe estimate %.2f)",
+        atomic_load(&g_dp_F0), DP_SLOTS, DP_OUT_LATENCY_MS, DP_OUT_SAFETY_MS, fn, est);
 }
 
 /* A capture transfer for USB frame fc delivered `got` frames. Steer the predicted OUT sizes so
@@ -1119,10 +1121,14 @@ static void cap_submit(int idx) {
         usb_cycle_begin();
         dbg_enter();   /* DEBUG */
         dbg_log_thread_policy();
-        {   /* DEBUG: how long after its last packet this capture transfer was delivered */
-            uint64_t last = done[CAP_PKTS - 1].timeStamp, nowt = mach_absolute_time();
-            if (last && nowt > last) {
-                double ms = (double)(nowt - last) * g_tb.numer / g_tb.denom / 1e6;
+        /* Times below are bus times, from the USB frame clock (dp_ref_*): a completion's own
+           timeStamp is when the stack processed it, which can be many ms after the bus. */
+        if ((double)(mach_absolute_time() - g_dp_last_refresh) > 0.5 * ticks_per_ms()) dp_ref_refresh();
+        uint64_t fc = g_cap_xf_frame[idx];   /* USB frame this transfer covered */
+        {   /* DEBUG: delivery delay, from the end of the transfer on the bus */
+            uint64_t bus_end = dp_time_of_uframe(8.0 * (double)(fc + 1)), nowt = mach_absolute_time();
+            if (nowt > bus_end) {
+                double ms = (double)(nowt - bus_end) / ticks_per_ms();
                 dbg_capdelay_hist[ms < 1 ? 0 : ms < 2 ? 1 : ms < 3 ? 2 : ms < 5 ? 3 : ms < 10 ? 4 : ms < 20 ? 5 : 6]++;
             }
         }
@@ -1135,7 +1141,7 @@ static void cap_submit(int idx) {
             for (int k = 0; k < CAP_PKTS; k++) {
                 if (done[k].status == kIOReturnSuccess && done[k].completeCount >= FRAME_BYTES &&
                     done[k].completeCount <= PKT_MAX) {
-                    clk_first_capture(done[k].timeStamp);
+                    clk_first_capture(dp_time_of_uframe(8.0 * (double)fc + k));
                     break;
                 }
             }
@@ -1157,7 +1163,7 @@ static void cap_submit(int idx) {
                 }
             }
             if (n > 0) {
-                if (!ts) ts = done[k].timeStamp;
+                if (!ts) ts = dp_time_of_uframe(8.0 * (double)fc + k);
                 const uint8_t *p = b + k * PKT_MAX;
                 for (int s = 0; s < n; s++) {
                     const uint8_t *q = p + s * FRAME_BYTES;
@@ -1176,7 +1182,7 @@ static void cap_submit(int idx) {
 
         if (g_dp_stream) {   /* deep-schedule playback: start after a few ms of capture */
             if (!g_dp_started && wp >= (uint64_t)(8 * g_sr / 1000)) dp_start();
-            dp_track_capture(g_cap_xf_frame[idx], got);
+            dp_track_capture(fc, got);
         } else if (g_xp_mode) {   /* DEBUG experiment replaces normal playback; start once the rate is measured */
             if (!g_xp_started && !xp_alloc_fail && wp > (uint64_t)(g_sr / 2)) xp_start();
             else if (g_xp_started) xp_write_due();
@@ -1435,6 +1441,7 @@ static bool usb_open_all(void) {
         LOG("Failed to open Isoch pipes");
         return false;
     }
+    dp_ref_refresh();   /* USB frame clock, used for bus times from the first capture on */
     if (g_dp_stream && !dp_alloc()) g_dp_stream = false;
 
     for (int i = 0; i < CAP_NXF; i++) {
