@@ -800,27 +800,32 @@ static void xp_write_due(void) {
  * ioDataWithCapacity: buffer before then is what gets sent. Completions only recycle transfers
  * at the far end of the schedule, so a stall shorter than the schedule costs nothing.
  *
- * Each scheduled USB frame carries a contiguous run of HAL timeline positions, published in
- * g_dp_sched (indexed by frame number) for the IO thread to look up. The stream's first frame
- * carries the position DP_OUT_LATENCY_MS before its own start time, and because the packet
- * sizes follow the box's clock, every sample then plays DP_OUT_LATENCY_MS after its timeline
- * position. The HAL writes each sample DP_OUT_SAFETY_MS ahead of "now"; their sum covers the
- * up-to-1 ms between a sample's position and its frame's start, plus DP_WRITE_GUARD.
+ * Each queued USB frame carries a contiguous run of HAL timeline positions, published in
+ * g_dp_sched (indexed by frame number) for the IO thread to look up. When the schedule is
+ * anchored (dp_anchor), its first frame carries the position DP_OUT_LATENCY_MS before that
+ * frame's start time; because the packet sizes follow the box's clock, every sample then plays
+ * DP_OUT_LATENCY_MS after its timeline position. The HAL writes each sample DP_OUT_SAFETY_MS
+ * ahead of "now"; together they cover the up-to-1 ms between a sample's position and its frame's
+ * start plus DP_WRITE_GUARD, with the rest as margin for a late IO thread.
  *
  * Packet sizes are fixed when a transfer is queued, ~DP_SLOTS ms before it plays, so they cannot
  * be copied from the matching capture packets (implicit feedback). They are predicted from the
- * box's measured rate and steered (dp_track_capture) so that the frames sent per USB frame match
- * the frames the box captured in the same USB frames.
+ * box's measured rate and steered (dp_track_capture) so that the frames sent through each USB
+ * frame track the frames the box captured through it. A frame whose enqueue is refused is not
+ * sent: its positions move to the next frame (the audio stays continuous) and it does not count
+ * as sent, so the steering makes up the frames the box missed.
  * ============================================================================ */
 #define DP_SLOTS       64          /* transfers kept queued: 64 ms */
 #define DP_SCHED_N     256         /* schedule ring entries, power of two, > DP_SLOTS */
-#define DP_START_LEAD  8           /* the first transfer is scheduled this many frames ahead (+4 was refused) */
+#define DP_START_LEAD  8           /* (re)anchor this many frames ahead of the bus (+4 was refused) */
 #define DP_CORR_S      1.0         /* sent-vs-captured frame difference is removed over this many seconds */
 #define DP_WRITE_GUARD 0.25        /* a frame is written only if it starts at least this many ms from now */
+#define DP_TRIES       4           /* enqueue attempts per call before retrying the slot later */
 
 typedef struct {
-    _Atomic uint64_t frame;        /* USB frame this entry describes, 0 = none; published last */
+    _Atomic uint64_t frame;        /* USB frame this entry describes, 0 = none (seqlock tag) */
     uint64_t first;                /* timeline position of the frame's first sample */
+    uint64_t sent_cum;             /* frames queued from the anchor through this frame */
     uint16_t off[PLAY_PKTS + 1];   /* sample offset of each packet in the frame; [PLAY_PKTS] = total */
     uint8_t *buf;                  /* the frame's transfer buffer */
 } DPEntry;
@@ -831,16 +836,16 @@ static uint8_t       *g_dp_ptr[DP_SLOTS];
 static IOUSBHostIsochronousTransaction g_dp_tx[DP_SLOTS][PLAY_PKTS];
 static _Atomic bool     g_dp_active;          /* WriteMix writes into the schedule */
 static _Atomic int      g_dp_writers;         /* WriteMix calls currently inside dp_write */
-static _Atomic uint64_t g_dp_x0, g_dp_F0;     /* first position / frame of the schedule (read by WriteMix) */
+static _Atomic uint64_t g_dp_x0, g_dp_F0;     /* current anchor: first position / frame (read by WriteMix) */
 static bool     g_dp_stream, g_dp_started;    /* g_q only from here down */
-static uint64_t g_dp_next_frame, g_dp_next_pos, g_dp_in_cum;
+static uint64_t g_dp_next_frame, g_dp_next_pos, g_dp_sent_cum, g_dp_in_cum;
 static double   g_dp_acc, g_dp_err;
 /* USB frame clock: microframe g_dp_ref_uframe began at host time g_dp_ref_time (seqlock) */
 static _Atomic uint32_t g_dp_ref_seq;
 static uint64_t g_dp_ref_uframe, g_dp_ref_time;
 /* DEBUG counters */
 static _Atomic uint32_t dp_late, dp_unscheduled, dp_written;
-static uint32_t dp_enq_fail, dp_resync, dp_dbg_n;
+static uint32_t dp_enq_fail, dp_resync, dp_retry_later, dp_dbg_n;
 static double   dp_err_max;
 
 static double ticks_per_ms(void) {
@@ -880,6 +885,13 @@ static double dp_frame_at(uint64_t t) {
     return ((double)uf + ((double)t - (double)ut) / (ticks_per_ms() / 8.0)) / 8.0;
 }
 
+/* Host time at which (fractional) microframe uframe starts on the bus. */
+static uint64_t dp_time_of_uframe(double uframe) {
+    uint64_t uf, ut;
+    dp_ref_get(&uf, &ut);
+    return (uint64_t)((double)ut + (uframe - (double)uf) * (ticks_per_ms() / 8.0));
+}
+
 /* Frames in the next OUT packet: the box's measured rate, steered by dp_track_capture. */
 static int dp_packet_frames(void) {
     uint64_t h; double s, tpf;
@@ -894,19 +906,31 @@ static int dp_packet_frames(void) {
     return n;
 }
 
+/* (Re)start the schedule at frame F: it carries the timeline position DP_OUT_LATENCY_MS before
+   F's start time, and the sent-vs-captured count starts again from F. */
+static void dp_anchor(uint64_t F) {
+    double x0 = clk_sample_at(dp_time_of_uframe(8.0 * (double)F)) - DP_OUT_LATENCY_MS * g_sr / 1000.0;
+    g_dp_next_frame = F;
+    g_dp_next_pos = x0 > 0 ? (uint64_t)x0 : 0;
+    g_dp_sent_cum = 0; g_dp_in_cum = 0; g_dp_err = 0; g_dp_acc = 0;
+    atomic_store(&g_dp_x0, g_dp_next_pos);
+    atomic_store(&g_dp_F0, F);
+}
+
+static bool dp_gone(IOReturn st) {
+    return st == kIOReturnNoDevice || st == kIOReturnNotAttached || st == kIOReturnNotResponding ||
+           st == kIOReturnOffline;
+}
+
 /* Queue `slot` for the next frame of the schedule, zero-filled, and publish where its samples go. */
 static void dp_submit(int slot) {
-    for (int attempt = 0; attempt < 3; attempt++) {
-        if (!atomic_load(&g_io_running) || !g_ppipe) return;
+    for (int attempt = 0; attempt < DP_TRIES; attempt++) {
+        if (!atomic_load(&g_io_running) || !g_ppipe || !g_dp_ptr[slot]) return;
         dp_ref_refresh();
         uint64_t now_f = (uint64_t)dp_frame_at(mach_absolute_time());
-        if (g_dp_next_frame < now_f + 2) {
-            /* The schedule ran dry (a stall longer than DP_SLOTS ms). Restart it ahead of the bus,
-               moving the positions on by the frames that will not be sent, to stay on the timeline. */
-            uint64_t to = now_f + DP_START_LEAD;
-            for (uint64_t f = g_dp_next_frame; f < to; f++)
-                for (int k = 0; k < PLAY_PKTS; k++) g_dp_next_pos += dp_packet_frames();
-            g_dp_next_frame = to;
+        if (g_dp_next_frame < now_f + DP_START_LEAD) {
+            /* The schedule ran dry: a stall longer than DP_SLOTS ms. Re-anchor ahead of the bus. */
+            dp_anchor(now_f + DP_START_LEAD);
             dp_resync++;
         }
         uint64_t f = g_dp_next_frame++;
@@ -924,23 +948,30 @@ static void dp_submit(int slot) {
         }
         e->off[PLAY_PKTS] = off;
         e->first = g_dp_next_pos;
-        g_dp_next_pos += off;
         e->buf = g_dp_ptr[slot];
         memset(g_dp_ptr[slot], 0, PLAY_PKTS * PKT_MAX);
-        atomic_store_explicit(&e->frame, f, memory_order_release);
 
         NSError *err = nil;
         BOOL ok = [g_ppipe enqueueIORequestWithData:g_dp_data[slot] transactionList:g_dp_tx[slot]
                                transactionListCount:PLAY_PKTS firstFrameNumber:f
                                             options:IOUSBHostIsochronousTransferOptionsNone error:&err
                                   completionHandler:^(IOReturn st, IOUSBHostIsochronousTransaction *done) {
-            if (atomic_load(&g_io_running) && st != kIOReturnAborted) dp_submit(slot);
+            if (atomic_load(&g_io_running) && st != kIOReturnAborted && !dp_gone(st)) dp_submit(slot);
         }];
-        if (ok) return;
-        atomic_store_explicit(&e->frame, 0, memory_order_release);
+        if (ok) {
+            g_dp_next_pos += off;
+            g_dp_sent_cum += off;
+            e->sent_cum = g_dp_sent_cum;
+            atomic_store_explicit(&e->frame, f, memory_order_release);   /* publish */
+            return;
+        }
+        /* Refused: nothing is published, and the next frame carries these positions instead. */
         dp_enq_fail++;
         LOG("DBG dp enqueue refused for frame %llu (now ~%llu): %{public}@", f, now_f, err.localizedDescription);
     }
+    /* Still refused: try this slot again shortly rather than losing it from the schedule. */
+    dp_retry_later++;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_MSEC), g_q, ^{ dp_submit(slot); });
 }
 
 static bool dp_start(void) {
@@ -952,17 +983,8 @@ static bool dp_start(void) {
     }
     for (int i = 0; i < DP_SCHED_N; i++) atomic_store(&g_dp_sched[i].frame, 0);
     dp_ref_refresh();
-    double ticks_per_ms = 1e6 * (double)g_tb.denom / (double)g_tb.numer;
-    double now_f = dp_frame_at(mach_absolute_time());
-    uint64_t F0 = (uint64_t)now_f + DP_START_LEAD;
-    /* timeline position at the start of frame F0, less the output latency */
-    uint64_t t_F0 = mach_absolute_time() + (uint64_t)(((double)F0 - now_f) * ticks_per_ms);
-    double x0 = clk_sample_at(t_F0) - DP_OUT_LATENCY_MS * g_sr / 1000.0;
-    g_dp_next_frame = F0;
-    g_dp_next_pos = x0 > 0 ? (uint64_t)x0 : 0;
-    g_dp_acc = 0; g_dp_err = 0; g_dp_in_cum = 0;
-    atomic_store(&g_dp_F0, F0);
-    atomic_store(&g_dp_x0, g_dp_next_pos);
+    dp_anchor((uint64_t)dp_frame_at(mach_absolute_time()) + DP_START_LEAD);
+    uint64_t F0 = atomic_load(&g_dp_F0);
     atomic_store_explicit(&g_dp_active, true, memory_order_release);
     for (int i = 0; i < DP_SLOTS; i++) dp_submit(i);
     g_dp_started = true;
@@ -978,15 +1000,14 @@ static void dp_track_capture(uint64_t fc, int got) {
     if (!g_dp_started || fc < atomic_load(&g_dp_F0)) return;
     g_dp_in_cum += got;
     DPEntry *e = &g_dp_sched[fc & (DP_SCHED_N - 1)];
-    if (atomic_load_explicit(&e->frame, memory_order_acquire) != fc) return;
-    double sent = (double)(e->first + e->off[PLAY_PKTS] - atomic_load(&g_dp_x0));
-    g_dp_err = sent - (double)g_dp_in_cum;
+    if (atomic_load_explicit(&e->frame, memory_order_acquire) != fc) return;   /* not sent */
+    g_dp_err = (double)e->sent_cum - (double)g_dp_in_cum;
     if (fabs(g_dp_err) > dp_err_max) dp_err_max = fabs(g_dp_err);
     if (++dp_dbg_n % 2000 == 0)   /* DEBUG */
         LOG("DBG dp: sent-captured %.1f frames (max %.1f) | written %u, late %u, unscheduled %u | "
-            "enqueue refused %u, resyncs %u",
+            "enqueue refused %u, retried later %u, resyncs %u",
             g_dp_err, dp_err_max, atomic_load(&dp_written), atomic_load(&dp_late),
-            atomic_load(&dp_unscheduled), dp_enq_fail, dp_resync);
+            atomic_load(&dp_unscheduled), dp_enq_fail, dp_retry_later, dp_resync);
 }
 
 /* Read schedule entry for frame f consistently (seqlock reader). False if f is not published. */
