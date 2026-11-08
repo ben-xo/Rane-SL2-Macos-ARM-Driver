@@ -29,6 +29,7 @@
 #include <pthread.h>
 #include <os/log.h>
 #include <stdatomic.h>
+#include <math.h>
 
 #define VID          0x1cc5
 #define PID          0x0013
@@ -104,19 +105,65 @@ static uint32_t g_ref_count = 0;
 static float g_in_ring[RING_FRAMES * NCH];
 static float g_out_ring[RING_FRAMES * NCH];
 
-/* Clock state. The HAL's timeline (GetZeroTimeStamp) puts sample 0 at g_anchor_host, fixed when
-   streaming starts: moving it while IO runs makes the HAL see its timestamps jump and reset its
-   clock, an audible gap. Capture only begins some milliseconds later, so the first captured frame
-   is stored at the timeline position matching its arrival (g_cap_base), and the device's real
-   rate is measured from that first frame's time (g_rate_anchor). Both are touched only on g_q. */
+/* The HAL's timeline (GetZeroTimeStamp), as a line: sample g_clk_sample at host time g_clk_host,
+   advancing one sample every g_clk_tpf host ticks. It starts at sample 0 when streaming starts and
+   must never jump (the HAL resets its clock if its timestamps fall off the line), but it must
+   follow the box's own clock, or playback, which runs at the box's rate, drifts against it.
+   So every CLK_FIX_FRAMES captured frames, clk_track re-anchors the line where it is (keeping it
+   continuous) and sets its rate to the box's measured rate plus a correction that pulls the line
+   onto the box's actual frame count over CLK_CORR_S seconds. g_q writes it; GetZeroTimeStamp
+   (the HAL's IO thread) reads it, so it is published under a sequence lock.
+
+   Capture begins some milliseconds after the timeline starts: the first captured frame sits at
+   the timeline position matching its arrival (g_cap_base), and the box's rate is measured from
+   that frame's time (g_rate_anchor). These and g_clk_last_fix are touched only on g_q. */
+#define CLK_FIX_FRAMES 2048
+#define CLK_CORR_S     2.0
 static mach_timebase_info_data_t g_tb;
-static _Atomic uint64_t g_anchor_host = 0;
+static _Atomic uint32_t g_clk_seq = 0;
+static uint64_t g_clk_host = 0;
+static double   g_clk_sample = 0;
+static double   g_clk_tpf = 0;
 static uint64_t g_rate_anchor = 0;
 static uint64_t g_cap_base = 0;
+static uint64_t g_clk_last_fix = 0;  /* captured-frame count at the last clk_track correction */
+
 static _Atomic uint64_t g_total_cap_frames = 0;
 static _Atomic uint64_t g_total_play_frames = 0;
-static _Atomic double   g_ticks_per_frame = 0;
 static _Atomic uint64_t g_zts_seed = 1;     /* GetZeroTimeStamp seed: bumped when the timeline changes */
+
+static double nominal_tpf(void) {
+    return ((1e9 / g_sr) * (double)g_tb.denom) / (double)g_tb.numer;
+}
+
+static void clk_get(uint64_t *host, double *sample, double *tpf) {
+    uint32_t s1, s2;
+    do {
+        s1 = atomic_load_explicit(&g_clk_seq, memory_order_acquire);
+        *host = g_clk_host; *sample = g_clk_sample; *tpf = g_clk_tpf;
+        atomic_thread_fence(memory_order_acquire);
+        s2 = atomic_load_explicit(&g_clk_seq, memory_order_relaxed);
+    } while ((s1 & 1) || s1 != s2);
+}
+
+static void clk_set(uint64_t host, double sample, double tpf) {
+    atomic_fetch_add_explicit(&g_clk_seq, 1, memory_order_acq_rel);   /* odd: update in progress */
+    atomic_thread_fence(memory_order_release);
+    g_clk_host = host; g_clk_sample = sample; g_clk_tpf = tpf;
+    atomic_fetch_add_explicit(&g_clk_seq, 1, memory_order_release);   /* even: consistent again */
+}
+
+/* Start a new timeline: sample 0 is now, at the nominal rate. */
+static void clk_reset(void) {
+    clk_set(mach_absolute_time(), 0, nominal_tpf());
+}
+
+/* Timeline position (in samples) at host time t. */
+static double clk_sample_at(uint64_t t) {
+    uint64_t h; double s, tpf;
+    clk_get(&h, &s, &tpf);
+    return s + ((double)t - (double)h) / tpf;
+}
 
 /* Implicit feedback packet-size FIFO */
 static int g_fifo[FIFO_N];
@@ -373,25 +420,33 @@ static IOUSBHostPipe *copy_isoch_pipe(IOUSBHostInterface *intf, uint8_t dir, uin
 /* First capture of a stream: note when it arrived, and where on the HAL's timeline it belongs. */
 static void clk_first_capture(uint64_t hw_time) {
     uint64_t now = (hw_time > 0) ? hw_time : mach_absolute_time();
-    uint64_t a = atomic_load_explicit(&g_anchor_host, memory_order_acquire);
-    double tpf = atomic_load_explicit(&g_ticks_per_frame, memory_order_relaxed);
+    double pos = clk_sample_at(now);
     g_rate_anchor = now;
-    g_cap_base = (now > a && tpf > 0) ? (uint64_t)((double)(now - a) / tpf) : 0;
+    g_cap_base = pos > 0 ? (uint64_t)pos : 0;
+    g_clk_last_fix = 0;
 }
 
-static void clk_update(int frames, uint64_t hw_time) {
-    if (!frames) return;
-    uint64_t now = (hw_time > 0) ? hw_time : mach_absolute_time();
-    uint64_t prev = atomic_fetch_add_explicit(&g_total_cap_frames, frames, memory_order_relaxed);
-    if (prev != 0 && (prev / 2048) != ((prev + frames) / 2048)) {
-        double elapsed = (double)(now - g_rate_anchor);
-        double measured = elapsed / (double)(prev + frames);
-        double nom = ((1e9 / g_sr) * (double)g_tb.denom) / (double)g_tb.numer;
-        if (measured > nom * 0.90 && measured < nom * 1.10) {
-            double cur = atomic_load_explicit(&g_ticks_per_frame, memory_order_relaxed);
-            atomic_store_explicit(&g_ticks_per_frame, 0.995 * cur + 0.005 * measured, memory_order_relaxed);
-        }
-    }
+/* A capture transfer delivered `frames` frames, the first of which (captured-frame number
+   count_before) arrived at host time ts. Keep the timeline on the box's clock (see g_clk_*). */
+static void clk_track(uint64_t count_before, int frames, uint64_t ts) {
+    atomic_fetch_add_explicit(&g_total_cap_frames, frames, memory_order_relaxed);
+    if (!frames || !ts || count_before - g_clk_last_fix < CLK_FIX_FRAMES) return;
+    g_clk_last_fix = count_before;
+
+    uint64_t h; double s, tpf;
+    clk_get(&h, &s, &tpf);
+    if (ts <= h) return;
+    double here = s + (double)(ts - h) / tpf;                     /* timeline position at ts */
+    double err  = (double)(g_cap_base + count_before) - here;     /* > 0: timeline behind the box */
+
+    double nom_rate = 1.0 / nominal_tpf();                         /* frames per host tick */
+    double elapsed  = (double)(ts - g_rate_anchor);
+    double rate = (count_before >= 8 * CLK_FIX_FRAMES && elapsed > 0) ? (double)count_before / elapsed : nom_rate;
+    double ticks_per_s = 1e9 * (double)g_tb.denom / (double)g_tb.numer;
+    rate += err / (CLK_CORR_S * ticks_per_s);
+    if (rate > nom_rate * 1.005) rate = nom_rate * 1.005;
+    if (rate < nom_rate * 0.995) rate = nom_rate * 0.995;
+    clk_set(ts, here, 1.0 / rate);
 }
 
 static void play_submit(int idx) {
@@ -501,7 +556,7 @@ static void cap_submit(int idx) {
                 }
             }
         }
-        wp += g_cap_base;
+        uint64_t ring_pos = g_cap_base + wp;   /* timeline position of this transfer's first frame */
 
         for (int k = 0; k < CAP_PKTS; k++) {
             /* Drop errored packets and impossible lengths. The first completion after a
@@ -522,7 +577,7 @@ static void cap_submit(int idx) {
                 const uint8_t *p = b + k * PKT_MAX;
                 for (int s = 0; s < n; s++) {
                     const uint8_t *q = p + s * FRAME_BYTES;
-                    float *fr = &g_in_ring[(( wp + got ) & RING_MASK) * NCH];
+                    float *fr = &g_in_ring[((ring_pos + got) & RING_MASK) * NCH];
                     for (int c = 0; c < NCH; c++) {
                         int32_t raw32 = 0;
                         memcpy(&raw32, q + c * 4, 4);
@@ -533,7 +588,7 @@ static void cap_submit(int idx) {
                 }
             }
         }
-        if (got > 0) clk_update(got, ts);
+        clk_track(wp, got, ts);
 
         if (atomic_load(&g_play_inflight) == 0 &&
             (atomic_load(&g_fifo_w) - atomic_load(&g_fifo_r)) >= PLAY_NXF * PLAY_PKTS) {
@@ -685,9 +740,7 @@ static bool usb_open_all(void) {
     atomic_store(&g_play_inflight, 0);
     g_faccum = 0;
 
-    double nom = ((1e9 / g_sr) * (double)g_tb.denom) / (double)g_tb.numer;
-    atomic_store(&g_ticks_per_frame, nom);
-    atomic_store(&g_anchor_host, mach_absolute_time());
+    clk_reset();
     atomic_store(&g_total_cap_frames, 0);
     atomic_store(&g_total_play_frames, 0);
 
@@ -829,8 +882,7 @@ static OSStatus SL2_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerP
     g_log = os_log_create("com.rane.sl2", "HAL");
     g_host = inHost;
     mach_timebase_info(&g_tb);
-    double nom = ((1e9 / g_sr) * (double)g_tb.denom) / (double)g_tb.numer;
-    atomic_store(&g_ticks_per_frame, nom);
+    clk_reset();
     start_hotplug_monitor();
     LOG("SL2Device AudioServerPlugIn Initialized");
     return kAudioHardwareNoError;
@@ -852,8 +904,7 @@ static OSStatus SL2_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef 
         bool was_streaming = atomic_load(&g_io_running);
         if (was_streaming) usb_stop_streaming();
         g_sr = (Float64)action;
-        double nom = ((1e9 / g_sr) * (double)g_tb.denom) / (double)g_tb.numer;
-        atomic_store(&g_ticks_per_frame, nom);
+        clk_reset();
         atomic_fetch_add(&g_zts_seed, 1);   /* new timeline for the HAL */
         if (was_streaming) usb_open_all();   /* sends 0x31 itself */
         else if (usb_ensure_hid()) send_hw_samplerate((int)g_sr);
@@ -1288,9 +1339,7 @@ static OSStatus SL2_StartIO(AudioServerPlugInDriverRef d, AudioObjectID oid, UIn
     pthread_mutex_lock(&g_mutex);
     if (g_io_clients == 0) {
         if (!usb_open_all()) {
-            double nom = ((1e9 / g_sr) * (double)g_tb.denom) / (double)g_tb.numer;
-            atomic_store(&g_ticks_per_frame, nom);
-            atomic_store(&g_anchor_host, mach_absolute_time());
+            clk_reset();
             atomic_store(&g_total_cap_frames, 0);
             atomic_store(&g_total_play_frames, 0);
         }
@@ -1311,18 +1360,13 @@ static OSStatus SL2_StopIO(AudioServerPlugInDriverRef d, AudioObjectID oid, UInt
 }
 
 static OSStatus SL2_GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID oid, UInt32 cid, Float64 *outSampleTime, UInt64 *outHostTime, UInt64 *outSeed) {
-    uint64_t anchor = atomic_load_explicit(&g_anchor_host, memory_order_acquire);
-    double tpf = atomic_load_explicit(&g_ticks_per_frame, memory_order_relaxed);
-    if (anchor == 0 || tpf <= 0) {
-        anchor = mach_absolute_time();
-        tpf = ((1e9 / g_sr) * (double)g_tb.denom) / (double)g_tb.numer;
-    }
-    uint64_t now = mach_absolute_time();
-    double period_ticks = 2048.0 * tpf;
-    uint64_t periods = (now > anchor) ? (uint64_t)((double)(now - anchor) / period_ticks) : 0;
+    uint64_t h; double s, tpf;
+    clk_get(&h, &s, &tpf);
+    double pos = s + ((double)mach_absolute_time() - (double)h) / tpf;
+    double period = pos > 0 ? floor(pos / 2048.0) * 2048.0 : 0;   /* latest period boundary */
 
-    *outSampleTime = (Float64)(periods * 2048ULL);
-    *outHostTime   = anchor + (uint64_t)((double)periods * period_ticks);
+    *outSampleTime = period;
+    *outHostTime   = (uint64_t)((double)h + (period - s) * tpf);
     *outSeed       = atomic_load(&g_zts_seed);
     return 0;
 }
