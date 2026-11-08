@@ -24,7 +24,7 @@ When Apple transitioned to **Apple Silicon (M1 / M2 / M3 / M4)** and modern macO
 
 * ✅ **Designed for Serato DJ Pro 2.5.5** (the last Serato version that supports Rane SL 2 hardware—unlocks DVS `ABS` / `REL` / `INT` modes and `THRU` control via `SL2Api.framework`).
 * ✅ **NO SIP Disable Required & NO Reboot Required:** Runs 100% in user space via Apple's modern `AudioServerPlugIn` (CoreAudio HAL) and `IOUSBHost` frameworks, plus a custom Universal `SL2Api.framework` user-space bridge.
-* ✅ **Works with the macOS System Settings "SL 2" Control Panel** and includes a terminal control utility (`sl2panel`) to switch between **Phono / Line**, toggle **Thru**, and change sample rates (**44.1 kHz / 48 kHz**).
+* ✅ **Works with the macOS System Settings "SL 2" Control Panel** and includes a terminal control utility (`sl2panel`) to show the status (including the box's **Phono / Line** switch), toggle **Thru**, and change sample rates (**44.1 kHz / 48 kHz**).
 * ✅ **Works as a 4-In / 4-Out (24-bit) CoreAudio Soundcard** in **Mixxx, Traktor, Ableton Live, Rekordbox, Logic Pro**, and system-wide macOS audio.
 
 ---
@@ -52,7 +52,7 @@ Con la llegada de los procesadores **Apple Silicon (M1 / M2 / M3 / M4)** y los n
 
 * ✅ **Compatible con Serato DJ Pro 2.5.5** (la última versión de Serato compatible con Rane SL 2; activa los modos DVS `ABS` / `REL` / `INT` y `THRU`).
 * ✅ **SIN desactivar la seguridad del Mac (SIP) y SIN reiniciar:** Todo funciona en espacio de usuario mediante un plugin HAL de CoreAudio (`SL2Device.driver` sobre `IOUSBHost`) junto con un puente nativo Universal (`SL2Api.framework`).
-* ✅ **Funciona con el panel "SL 2" en Ajustes del Sistema de macOS** e incluye utilidad de control (`Panel-Control-SL2.command` / `sl2panel`) para cambiar entre **Phono / Line**, activar/desactivar **Thru** y elegir entre **44.1 kHz y 48 kHz**.
+* ✅ **Funciona con el panel "SL 2" en Ajustes del Sistema de macOS** e incluye utilidad de control (`Panel-Control-SL2.command` / `sl2panel`) para ver el estado (incluido el selector **Phono / Line** del aparato), activar/desactivar **Thru** y elegir entre **44.1 kHz y 48 kHz**.
 * ✅ **Funciona como tarjeta de sonido de 4 Entradas y 4 Salidas (24-bit)** en **Ableton Live, Traktor, Mixxx, Rekordbox, Logic Pro** y el audio general de macOS.
 
 ---

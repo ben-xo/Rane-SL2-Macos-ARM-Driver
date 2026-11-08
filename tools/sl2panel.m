@@ -115,14 +115,6 @@ int main(int argc, const char *argv[]) {
             send_hidi(dev, 0x80, 0x5C, 0x00);
             send_hidi(dev, 0x80, 0x5D, 0x00);
             printf("Enabled USB Audio (Feed-Thru Off) on Decks 1 & 2.\n");
-        } else if (strcmp(argv[1], "phono") == 0) {
-            send_hidi(dev, 0x90, 0x61, 0x00);
-            send_hidi(dev, 0x90, 0x61, 0x01);
-            printf("Set Decks 1 & 2 to PHONO level.\n");
-        } else if (strcmp(argv[1], "line") == 0) {
-            send_hidi(dev, 0x80, 0x61, 0x00);
-            send_hidi(dev, 0x80, 0x61, 0x01);
-            printf("Set Decks 1 & 2 to LINE level.\n");
         } else if (strcmp(argv[1], "sr") == 0 && argc >= 3) {
             Float64 sr = atof(argv[2]);
             AudioObjectPropertyAddress a = {
@@ -133,7 +125,8 @@ int main(int argc, const char *argv[]) {
             AudioObjectSetPropertyData(dev, &a, 0, NULL, sizeof(Float64), &sr);
             printf("Set Sample Rate to %.0f Hz.\n", sr);
         } else {
-            printf("Usage: sl2panel [status | usb | thru | phono | line | sr 44100|48000]\n");
+            /* LINE/PHONO is a physical switch on the box: reported in the status, not settable */
+            printf("Usage: sl2panel [status | usb | thru | sr 44100|48000]\n");
         }
     }
     return 0;
