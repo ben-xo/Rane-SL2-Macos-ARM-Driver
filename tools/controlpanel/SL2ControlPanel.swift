@@ -133,7 +133,9 @@ enum SL2Driver {
               let cf = data?.takeRetainedValue() else { return nil }
         let bytes = cf as Data
         guard bytes.count == 8 * MemoryLayout<Float32>.size else { return nil }
-        return bytes.withUnsafeBytes { Array($0.bindMemory(to: Float32.self)) }
+        var peaks = [Float32](repeating: 0, count: 8)
+        _ = peaks.withUnsafeMutableBytes { bytes.copyBytes(to: $0) }
+        return peaks
     }
 
     /// The output's main volume as a slider position (0...1) and in dB, or nil if there is none.
@@ -208,8 +210,11 @@ struct BoxState: Equatable {
     var thru: [Bool]
     var outputLatencyMs: Double
     var inputLatencyMs: Double
-    var volume: Float?       // the main output volume as a slider position (0...1); nil if none
-    var volumeDb: Float
+    var volume: Volume?      // the main output volume; nil if none
+    struct Volume: Equatable {
+        let scalar: Float    // as a slider position, 0...1
+        let db: Float
+    }
     var muted: Bool?         // the output mute; nil if none
 }
 
@@ -233,8 +238,10 @@ func repeatingTimer(every interval: TimeInterval, _ body: @escaping @MainActor (
 final class PanelModel: ObservableObject {
     @Published var state: PanelState = .noBox
     @Published var driverVersion: String?
+    /// The level meters, which read the device this model finds (not published: they redraw alone).
+    let meters = MeterModel()
     private var timer: Timer?
-    private var device: AudioObjectID?
+    private(set) var device: AudioObjectID?
     /// The device whose volume and mute changes we are told of, and the listener that hears them.
     private var watched: AudioObjectID?
     private lazy var volumeListener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
@@ -245,6 +252,7 @@ final class PanelModel: ObservableObject {
     }
 
     init() {
+        meters.device = { [weak self] in self?.device }
         refresh()
         // The status changes from outside the app (the box's switch, other apps, plugging in):
         // read it twice a second. The volume and mute are followed as they change (watch).
@@ -296,24 +304,22 @@ final class PanelModel: ObservableObject {
             thru: [s.thru.0 != 0, s.thru.1 != 0],
             outputLatencyMs: Double(SL2Driver.latencyFrames(dev, kAudioObjectPropertyScopeOutput)) * 1000 / rate,
             inputLatencyMs: Double(SL2Driver.latencyFrames(dev, kAudioObjectPropertyScopeInput)) * 1000 / rate,
-            volume: volume?.scalar,
-            volumeDb: volume?.db ?? 0,
+            volume: volume.map { BoxState.Volume(scalar: $0.scalar, db: $0.db) },
             muted: SL2Driver.muted(dev)))
     }
 
     /// Set the main output volume (a slider position, 0...1); the menu bar and Audio MIDI Setup follow.
-    /// Any level above the minimum unmutes, as the macOS volume slider does.
-    func setVolume(_ scalar: Float) {
+    /// Any level above the minimum unmutes, as the macOS volume slider does. The window updates from
+    /// the volume and mute listener (watch), so a slider drag costs one set per step, not a refresh.
+    func setVolume(_ scalar: Float, unmuting muted: Bool) {
         guard let dev = device else { return }
         SL2Driver.setVolume(dev, scalar)
-        if scalar > 0, SL2Driver.muted(dev) == true { SL2Driver.setMuted(dev, false) }
-        refresh()
+        if scalar > 0, muted { SL2Driver.setMuted(dev, false) }
     }
 
     func setMuted(_ muted: Bool) {
         guard let dev = device else { return }
         SL2Driver.setMuted(dev, muted)
-        refresh()
     }
 
     /// Switch a deck's analogue thru (deck 0 or 1), then show what the box reports.
@@ -345,33 +351,33 @@ final class MeterModel: ObservableObject {
     private static let ticksPerSecond = 60.0
     private static let fallDbPerTick: Float = 3     // 180 dB a second
     private var timer: Timer?
-    private var device: AudioObjectID?
-    private var ticks = 0
+    /// The device to read, from PanelModel.
+    var device: () -> AudioObjectID? = { nil }
 
     init() {
         timer = repeatingTimer(every: 1.0 / Self.ticksPerSecond) { [weak self] in self?.tick() }
     }
 
     private func tick() {
-        // Look the device up again every second (it comes and goes with the box).
-        if ticks % Int(Self.ticksPerSecond) == 0 { device = SL2Driver.device() }
-        ticks += 1
-        guard let dev = device, let peaks = SL2Driver.meters(dev) else {
-            levels = levels.map { _ in Self.meterFloorDb }
-            return
-        }
+        // Read the driver only while the window can be seen: once nothing reads them, the driver stops
+        // measuring (after a second), so a hidden or minimised panel costs nothing.
+        guard NSApp.windows.contains(where: { $0.isVisible && $0.occlusionState.contains(.visible) }) else { return }
+        let peaks = device().flatMap { SL2Driver.meters($0) } ?? Array(repeating: 0, count: 8)
         // A meter jumps up to a new peak and falls back fast, but not so fast that a short peak is gone
         // before it is drawn.
-        levels = zip(levels, peaks).map { shown, peak in
+        let next = zip(levels, peaks).map { shown, peak in
             let db = peak > 0 ? max(20 * log10(peak), Self.meterFloorDb) : Self.meterFloorDb
             return max(db, shown - Self.fallDbPerTick)
         }
+        // Publish only a change, so still meters don't redraw.
+        if next != levels { levels = next }
     }
 }
 
 /// A horizontal level meter, from meterFloorDb to 0 dB: green, then yellow from -12 dB, red from -3 dB.
 struct LevelMeter: View {
     let db: Float
+    var label = "Level"
     var body: some View {
         GeometryReader { geo in
             let floor = MeterModel.meterFloorDb
@@ -391,7 +397,7 @@ struct LevelMeter: View {
         }
         .frame(height: 6)
         .accessibilityElement()
-        .accessibilityLabel("Level")
+        .accessibilityLabel(label)
         .accessibilityValue(db <= MeterModel.meterFloorDb ? "silent" : String(format: "%.0f dB", db))
     }
 }
@@ -404,10 +410,20 @@ struct StereoMeter: View {
             ForEach([("L", left), ("R", right)], id: \.0) { side, db in
                 HStack(spacing: 6) {
                     Text(side).font(.caption2).foregroundStyle(.secondary).frame(width: 8)
-                    LevelMeter(db: db).accessibilityLabel(side == "L" ? "Left" : "Right")
+                    LevelMeter(db: db, label: side == "L" ? "Left" : "Right")
                 }
             }
         }
+    }
+}
+
+/// A labelled stereo meter row, observing the meters itself so that only it redraws as they move.
+struct DeckMeterRow: View {
+    @ObservedObject var meters: MeterModel
+    let name: String
+    let left: Int, right: Int   // indexes into meters.levels
+    var body: some View {
+        LabeledContent(name) { StereoMeter(left: meters.levels[left], right: meters.levels[right]) }
     }
 }
 
@@ -415,7 +431,6 @@ struct StereoMeter: View {
 
 struct PanelView: View {
     @ObservedObject var model: PanelModel
-    @ObservedObject var meters: MeterModel
 
     var body: some View {
         Group {
@@ -508,8 +523,8 @@ struct PanelView: View {
     @ViewBuilder
     private func levelSections(_ box: BoxState) -> some View {
         Section {
-            LabeledContent(Self.deckNames[0]) { StereoMeter(left: meters.levels[0], right: meters.levels[1]) }
-            LabeledContent(Self.deckNames[1]) { StereoMeter(left: meters.levels[2], right: meters.levels[3]) }
+            DeckMeterRow(meters: model.meters, name: Self.deckNames[0], left: 0, right: 1)
+            DeckMeterRow(meters: model.meters, name: Self.deckNames[1], left: 2, right: 3)
         } header: {
             Text("Inputs")
         } footer: {
@@ -520,8 +535,9 @@ struct PanelView: View {
             if let volume = box.volume {
                 LabeledContent("Volume") {
                     HStack {
-                        Slider(value: Binding(get: { volume }, set: { model.setVolume($0) }), in: 0...1)
-                        Text(box.muted == true ? "Muted" : volume <= 0 ? "Off" : String(format: "%.0f dB", box.volumeDb))
+                        Slider(value: Binding(get: { volume.scalar },
+                                              set: { model.setVolume($0, unmuting: box.muted == true) }), in: 0...1)
+                        Text(box.muted == true ? "Muted" : volume.scalar <= 0 ? "Off" : String(format: "%.0f dB", volume.db))
                             .monospacedDigit()
                             .frame(width: 52, alignment: .trailing)
                     }
@@ -530,8 +546,8 @@ struct PanelView: View {
             if let muted = box.muted {
                 Toggle("Mute", isOn: Binding(get: { muted }, set: { model.setMuted($0) }))
             }
-            LabeledContent(Self.deckNames[0]) { StereoMeter(left: meters.levels[4], right: meters.levels[5]) }
-            LabeledContent(Self.deckNames[1]) { StereoMeter(left: meters.levels[6], right: meters.levels[7]) }
+            DeckMeterRow(meters: model.meters, name: Self.deckNames[0], left: 4, right: 5)
+            DeckMeterRow(meters: model.meters, name: Self.deckNames[1], left: 6, right: 7)
         } header: {
             Text("Outputs")
         } footer: {
@@ -570,11 +586,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct SL2ControlPanelApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var model = PanelModel()
-    @StateObject private var meters = MeterModel()
 
     var body: some Scene {
         Window("SL 2 Control Panel", id: "main") {
-            PanelView(model: model, meters: meters)
+            PanelView(model: model)
         }
         .windowResizability(.contentSize)
     }
