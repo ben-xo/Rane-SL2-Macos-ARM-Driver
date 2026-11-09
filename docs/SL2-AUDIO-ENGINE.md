@@ -514,6 +514,11 @@ build; *(hook)* uses `tools/latency/bin/sl2dbg`.
 
 ## Testing
 
+`make hwtest` runs the hardware tests in one go, in the order that needs the fewest physical steps, and
+ends with a PASS / FAIL / SKIP summary (`ARGS="--loopback"` with the loopback cable in). It covers the
+status, SL2Api as Serato calls it, rate switching, restarts, glitches (idle and loaded), 48 kHz, the
+fault hooks, the LINE/PHONO report, and unplug and replug while idle and mid-stream.
+
 The tools are in `tools/latency/` (build them with `make latency`). Its README covers the loopback setup,
 what each tool does and the expected results. The main ones:
 

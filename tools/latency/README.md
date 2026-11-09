@@ -28,6 +28,24 @@ The log lines the scripts look for are the SL 2 driver's, so they need adapting 
    release package (`Installer/RaneSL2-macOS-Universal.pkg`) must be installed first. `--api` also installs
    a built SL2Api (`make api`), saving the previous one; `--restore-api` puts that back.
 
+## Running everything
+
+`make hwtest` runs the SL 2's hardware tests in one go (`tools/hwtest.sh`) and ends with a PASS / FAIL /
+SKIP summary; the full output goes to a log file it names. It runs them in the order that needs the
+fewest physical steps:
+
+1. with only the box attached: the driver's status, SL2Api as Serato DJ Pro 2.5.5 calls it (`sl2apitest`,
+   both slices), and sample-rate switching;
+2. with `ARGS="--loopback"`, which says the loopback cable is in (the tests play clicks and a loud tone
+   into Left Deck Out): `restartcheck.sh`, a 30 s glitch test, 48 kHz, and with a debug build `dptest.sh`
+   and the `sl2dbg` fault hooks (a USB stall, errored capture packets);
+3. steps for someone at the box: flipping the LINE/PHONO switch, and unplugging and replugging while idle
+   and while a (silent) stream runs. The script prints each step and waits until it sees the change, so
+   nothing needs typing. `ARGS="--no-physical"` skips them.
+
+Run it in a Terminal window, so the steps show as they come up. A release build skips the tests that
+need the debug build's counters and hooks; run it again with a debug build to cover those.
+
 ## Tools
 
 | Tool | What it does | Pass |
@@ -54,5 +72,6 @@ go stale when it restarts; `restart-audio.sh` does the restart alone.
 - `dptest.sh 60` (debug build): "0 glitches" idle and loaded, then PASS.
 - The debug build's `DBG dp` counters (`logq.sh`): late 0, unscheduled flat after start-up, enqueue refused
   0, resyncs 0, sent − captured within ±2, rewritten samples 0.
-- `sl2dbg stall 100` during a `sinetest`: one gap of about 100 ms, the driver logs "Capture: N ms not
-  captured", and the stream carries on. `sl2dbg errpkts 20`: a gap of about 3 ms, sent − captured within ±2.
+- `sl2dbg stall 100` during a `sinetest`: one gap, shorter than the stall (the 64 one-millisecond capture
+  transfers already queued keep receiving audio, so only the rest is lost: about 40 ms for a 100 ms stall),
+  the driver logs "Capture: N ms not captured", and the stream carries on. `sl2dbg errpkts 20`: a gap of about 3 ms, sent − captured within ±2.

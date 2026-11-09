@@ -34,8 +34,14 @@ tools/latency/bin/%: tools/latency/%.c tools/latency/common.h
 	@mkdir -p tools/latency/bin
 	$(CC) -O2 -framework CoreAudio -framework CoreFoundation $< -o $@
 
+# the hardware tests in one run (tools/hwtest.sh), on the installed driver with a box attached:
+#   make hwtest ARGS="--loopback"   with the loopback cable in; add --no-physical to skip the steps
+#                                   that need someone at the box (switch, unplug and replug)
+hwtest: panel apitest latency
+	tools/hwtest.sh $(ARGS)
+
 clean:
 	rm -f SL2Device SL2Api sl2panel sl2dump sl2flash sl2apitest
 	rm -rf tools/latency/bin
 
-.PHONY: all plugin api panel dump flash apitest latency clean
+.PHONY: all plugin api panel dump flash apitest latency hwtest clean

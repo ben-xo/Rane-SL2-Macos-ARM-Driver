@@ -1,0 +1,269 @@
+#!/bin/bash
+# hwtest.sh [--loopback] [--no-physical] — the SL 2 hardware tests in one run, with a PASS / FAIL /
+# SKIP summary. Run by `make hwtest` (ARGS="--loopback ..."), which builds what it needs first.
+#
+# The tests run in the order that needs the fewest physical steps:
+#   1. with the box attached, nothing else: driver status, SL2Api as Serato calls it (both slices),
+#      sample-rate switching;
+#   2. with --loopback (a cable from Left Deck Out L to Left Deck In L; the tests play clicks and a
+#      loud tone into that output, so pass it only when the cable is in): restarts, a glitch test,
+#      48 kHz, and in a debug build (make plugin DEBUG=1) the glitch test under load and the fault
+#      hooks;
+#   3. unless --no-physical: steps for a person at the box (flip the LINE/PHONO switch, unplug and
+#      replug while idle and while a stream runs). The script prints what to do and waits until it
+#      sees the change, so nothing needs typing.
+#
+# Exit status 0 = nothing failed. The full output goes to a log file, named at the end.
+set -u
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+B="$ROOT/tools/latency/bin"
+PANEL="$ROOT/sl2panel"
+APITEST="$ROOT/sl2apitest"
+DEV="SL 2"
+SUBSYS=com.rane.sl2
+WAIT_S=${HWTEST_WAIT:-120}          # how long to wait for a physical step
+
+LOOPBACK=0; PHYSICAL=1
+for a in "$@"; do
+    case "$a" in
+        --loopback) LOOPBACK=1 ;;
+        --no-physical) PHYSICAL=0 ;;
+        *) echo "usage: hwtest.sh [--loopback] [--no-physical]"; exit 2 ;;
+    esac
+done
+
+LOG="${TMPDIR:-/tmp}"; LOG="${LOG%/}/sl2-hwtest-$(date +%Y%m%d-%H%M%S).log"
+exec > >(tee "$LOG") 2>&1
+
+# ---------------------------------------------------------------------------- helpers
+
+RESULTS=()
+record() {   # <PASS|FAIL|SKIP> <test> [detail]
+    RESULTS+=("$1|$2|${3:-}")
+    printf '%-4s  %s%s\n' "$1" "$2" "${3:+  ($3)}"
+}
+
+status() { "$PANEL" status 2>&1; }
+connected() { status | grep -q 'USB Connected : YES'; }
+field() {    # the value of an sl2panel status line, e.g. field 'Sample Rate'
+    status | sed -nE "s/^  $1 *: *//p" | head -1
+}
+
+wait_until() {   # <description> <command...>: poll every half second, up to WAIT_S
+    local what=$1; shift
+    local t=0
+    while ! "$@" >/dev/null 2>&1; do
+        sleep 0.5; t=$((t + 1))
+        if [ $t -ge $((WAIT_S * 2)) ]; then echo "      timed out after ${WAIT_S} s waiting for: $what"; return 1; fi
+    done
+}
+not() { ! "$@"; }
+
+driver_log_since() {   # <start time> <grep pattern>: the driver's log lines since then
+    sleep 1
+    /usr/bin/log show --start "$1" --style compact --predicate "subsystem == \"$SUBSYS\"" 2>/dev/null \
+        | grep -E "$2" | sed -E 's/.*\] \[SL2\] //'
+}
+now() { date '+%Y-%m-%d %H:%M:%S'; }
+
+both_thru() { [ "$(status | grep -c 'Mode: ANALOG THRU')" = 2 ]; }
+input_is() { field 'Deck 1 Input' | grep -q "^$1"; }
+
+# ---------------------------------------------------------------------------- 0. preconditions
+
+echo "SL 2 hardware tests, $(date)"
+for tool in "$PANEL" "$APITEST" "$B/rtlat" "$B/sinetest" "$B/setrate" "$B/sl2dbg" "$B/chrec"; do
+    [ -x "$tool" ] || { echo "missing $tool: run make hwtest (it builds the tools)"; exit 2; }
+done
+if ! connected; then
+    echo "No SL 2 connected (or the driver isn't loaded): connect the box and run again."
+    "$PANEL" status
+    exit 2
+fi
+# A debug build accepts the driver's debug commands; errpkts 0 changes nothing.
+if "$B/sl2dbg" errpkts 0 >/dev/null 2>&1; then BUILD=debug; else BUILD=release; fi
+echo "driver: $BUILD build; firmware $(field 'Firmware Ver'); serial $(field 'Serial Number')"
+echo
+
+# ---------------------------------------------------------------------------- 1. the box only
+
+echo "== 1. box attached, nothing else"
+
+# The status: connected, a firmware version and serial number, not in bootloader mode.
+fw=$(field 'Firmware Ver'); serial=$(field 'Serial Number')
+if [ -n "$fw" ] && [ "$fw" != "0.00" ] && [ -n "$serial" ] && [ "$serial" != "N/A" ]; then
+    record PASS "status" "firmware $fw, serial $serial"
+else
+    record FAIL "status" "firmware '$fw', serial '$serial'"
+fi
+
+# SL2Api the way Serato DJ Pro 2.5.5 calls it: natively, and the x86_64 slice Serato loads.
+if "$APITEST" > /dev/null 2>&1; then record PASS "SL2Api, arm64"; else record FAIL "SL2Api, arm64" "run ./sl2apitest"; fi
+if arch -x86_64 /usr/bin/true 2>/dev/null; then
+    if arch -x86_64 "$APITEST" > /dev/null 2>&1; then record PASS "SL2Api, x86_64 (Rosetta)"
+    else record FAIL "SL2Api, x86_64 (Rosetta)" "run arch -x86_64 ./sl2apitest"; fi
+else
+    record SKIP "SL2Api, x86_64 (Rosetta)" "Rosetta not installed"
+fi
+
+# Sample-rate switching: to 48 kHz and back, the driver's status following each time.
+orig=$("$B/setrate" "$DEV" | grep -oE '[0-9]{5}' | head -1); orig=${orig:-44100}
+ok=1
+for r in 48000 44100; do
+    "$B/setrate" "$DEV" "$r" >/dev/null
+    wait_until "the driver to report $r Hz" sh -c "'$PANEL' status | grep -q 'Sample Rate   : $r Hz'" || ok=0
+done
+"$B/setrate" "$DEV" "$orig" >/dev/null
+[ $ok = 1 ] && record PASS "sample rate 44.1 -> 48 -> 44.1 kHz" || record FAIL "sample rate 44.1 -> 48 -> 44.1 kHz"
+echo
+
+# ---------------------------------------------------------------------------- 2. loopback
+
+echo "== 2. loopback cable"
+if [ $LOOPBACK = 0 ]; then
+    for t in "restarts" "glitch test, 30 s" "glitch test idle + loaded (dptest)" "48 kHz" "fault hook: USB stall" "fault hook: errored capture packets"; do
+        record SKIP "$t" "no --loopback"
+    done
+else
+    # The line-level loopback signal clips the phono preamp: wait for the switch to be on LINE.
+    if ! input_is LINE; then
+        echo "   >>> Set the LINE/PHONO switch on the box to LINE."
+        wait_until "the switch on LINE" input_is LINE
+    fi
+
+    # Three streams in a row, each starting cleanly and finding all its clicks.
+    if "$ROOT/tools/latency/restartcheck.sh" > /dev/null 2>&1; then record PASS "restarts"
+    else record FAIL "restarts" "run tools/latency/restartcheck.sh"; fi
+
+    # A 30 s glitch test with the Mac idle.
+    out=$("$B/sinetest" "$DEV" 1 1 30 128 | grep RESULT)
+    echo "$out" | grep -q 'RESULT: 0 glitches, 0 level drops' && record PASS "glitch test, 30 s" || record FAIL "glitch test, 30 s" "$out"
+
+    # Idle and with every core loaded, with the driver's counters: a debug build only.
+    if [ $BUILD = debug ]; then
+        if "$ROOT/tools/latency/dptest.sh" 30 > /dev/null 2>&1; then record PASS "glitch test idle + loaded (dptest)"
+        else record FAIL "glitch test idle + loaded (dptest)" "run tools/latency/dptest.sh 30"; fi
+    else
+        record SKIP "glitch test idle + loaded (dptest)" "release build"
+    fi
+
+    # 48 kHz: every click found, and a clean 10 s glitch test.
+    "$B/setrate" "$DEV" 48000 >/dev/null; sleep 1
+    lat=$("$B/rtlat" "$DEV" 1 1 4 128 | grep -E 'mean|not found' | head -1)
+    sine=$("$B/sinetest" "$DEV" 1 1 10 128 | grep RESULT)
+    "$B/setrate" "$DEV" "$orig" >/dev/null
+    if echo "$lat" | grep -q '(4/4 clicks)' && echo "$sine" | grep -q 'RESULT: 0 glitches, 0 level drops'; then
+        record PASS "48 kHz" "$(echo "$lat" | grep -oE 'DVS round trip est\. [0-9.]+ ms')"
+    else
+        record FAIL "48 kHz" "$lat / $sine"
+    fi
+
+    # The fault hooks (debug build), each injected 3 s into a 10 s glitch test: a 100 ms stall in USB
+    # completion delivery (the driver must fill the gap with silence and log it) and 20 errored
+    # capture packets (the driver must take them, and playback must stay matched to capture: sent -
+    # captured within +-2 frames at the end). Either way the stream runs to the end, never restarted.
+    if [ $BUILD = debug ]; then
+        for hook in "stall 100" "errpkts 20"; do
+            start=$(now)
+            ( sleep 3; "$B/sl2dbg" $hook >/dev/null ) &
+            sine=$("$B/sinetest" "$DEV" 1 1 10 128 | grep RESULT); wait
+            starts=$(driver_log_since "$start" 'Streaming started' | wc -l | tr -d ' ')
+            if [ "$hook" = "stall 100" ]; then
+                name="fault hook: USB stall"
+                seen=$(driver_log_since "$start" 'Capture: [0-9]+ ms not captured' | head -1)
+                balanced=1
+            else
+                name="fault hook: errored capture packets"
+                seen=$(driver_log_since "$start" 'capture packets treated as errored' | head -1)
+                sc=$(driver_log_since "$start" 'dp result' | grep -oE 'sent-captured now -?[0-9.]+' | head -1 | grep -oE '[-0-9.]+$')
+                balanced=$(awk -v v="${sc:-99}" 'BEGIN { print (v >= -2 && v <= 2) ? 1 : 0 }')
+                seen="$seen; sent-captured ${sc:-?}"
+            fi
+            if [ -n "$sine" ] && [ -n "${seen%%;*}" ] && [ "$balanced" = 1 ] && [ "$starts" -le 1 ]; then
+                record PASS "$name" "$seen"
+            else
+                record FAIL "$name" "result '$sine', log '$seen', $starts stream starts"
+            fi
+        done
+    else
+        record SKIP "fault hook: USB stall" "release build"
+        record SKIP "fault hook: errored capture packets" "release build"
+    fi
+fi
+echo
+
+# ---------------------------------------------------------------------------- 3. physical steps
+
+echo "== 3. steps at the box"
+if [ $PHYSICAL = 0 ]; then
+    for t in "LINE/PHONO switch reported" "unplug and replug, idle" "unplug and replug, mid-stream"; do
+        record SKIP "$t" "--no-physical"
+    done
+else
+    # The LINE/PHONO switch: the status must follow it both ways. It ends where it started.
+    first=$(input_is PHONO && echo LINE || echo PHONO)
+    second=$([ $first = PHONO ] && echo LINE || echo PHONO)
+    echo "   >>> Flip the LINE/PHONO switch to $first."
+    if wait_until "the switch on $first" input_is $first; then
+        echo "   >>> Flip it back to $second."
+        wait_until "the switch on $second" input_is $second && record PASS "LINE/PHONO switch reported" \
+            || record FAIL "LINE/PHONO switch reported" "not seen back on $second"
+    else
+        record FAIL "LINE/PHONO switch reported" "not seen on $first"
+    fi
+
+    # Unplug and replug with nothing playing: the device goes, comes back, and puts both decks on
+    # analogue thru.
+    echo "   >>> Unplug the SL 2's USB cable."
+    if wait_until "the box to go" not connected; then
+        echo "   >>> Plug it back in."
+        if wait_until "the box to return" connected && wait_until "both decks on thru" both_thru; then
+            record PASS "unplug and replug, idle"
+        else
+            record FAIL "unplug and replug, idle"
+        fi
+    else
+        record FAIL "unplug and replug, idle" "unplug not seen"
+    fi
+
+    # Unplug while a stream runs (a silent, input-only one) and replug: coreaudiod survives, the
+    # driver ends the stream cleanly, and a new stream starts after the replug.
+    caud=$(pgrep -x coreaudiod)
+    start=$(now)
+    "$B/chrec" "$DEV" 60 "${TMPDIR:-/tmp}/sl2-hwtest-chrec.wav" >/dev/null 2>&1 &
+    rec=$!
+    sleep 2
+    echo "   >>> A stream is running: unplug the SL 2's USB cable."
+    if wait_until "the box to go" not connected; then
+        kill $rec 2>/dev/null; wait $rec 2>/dev/null
+        echo "   >>> Plug it back in."
+        wait_until "the box to return" connected && wait_until "both decks on thru" both_thru
+        back=$?
+        # A new stream after the replug.
+        "$B/chrec" "$DEV" 2 "${TMPDIR:-/tmp}/sl2-hwtest-chrec.wav" >/dev/null 2>&1
+        ended=$(driver_log_since "$start" 'Streaming stopped \(box disconnected\)' | head -1)
+        started=$(driver_log_since "$start" 'Streaming started' | wc -l | tr -d ' ')
+        if [ $back = 0 ] && [ "$(pgrep -x coreaudiod)" = "$caud" ] && [ -n "$ended" ] && [ "$started" -ge 2 ]; then
+            record PASS "unplug and replug, mid-stream"
+        else
+            record FAIL "unplug and replug, mid-stream" "returned $([ $back = 0 ] && echo yes || echo no), coreaudiod pid $caud -> $(pgrep -x coreaudiod), stream end logged: ${ended:-no}, streams started $started"
+        fi
+    else
+        kill $rec 2>/dev/null; wait $rec 2>/dev/null
+        record FAIL "unplug and replug, mid-stream" "unplug not seen"
+    fi
+fi
+echo
+
+# ---------------------------------------------------------------------------- summary
+
+pass=0; fail=0; skip=0
+echo "== summary ($BUILD build)"
+for r in "${RESULTS[@]}"; do
+    IFS='|' read -r s name detail <<< "$r"
+    printf '%-4s  %s\n' "$s" "$name"
+    case $s in PASS) pass=$((pass + 1)) ;; FAIL) fail=$((fail + 1)) ;; SKIP) skip=$((skip + 1)) ;; esac
+done
+echo "$pass passed, $fail failed, $skip skipped. Log: $LOG"
+[ $fail = 0 ] && echo "PASS" || echo "FAIL"
+exit $([ $fail = 0 ] && echo 0 || echo 1)
