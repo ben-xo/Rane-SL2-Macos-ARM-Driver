@@ -103,6 +103,12 @@ enum {
     kObjDevice    = 2,
     kObjStreamIn  = 3,
     kObjStreamOut = 4,
+    kObjVolume    = 5,   /* output master volume */
+    kObjMute      = 6,   /* output master mute */
+    kObjVolCh1    = 7,   /* output volume, channels 1-4 */
+    kObjVolCh2    = 8,
+    kObjVolCh3    = 9,
+    kObjVolCh4    = 10,
 };
 
 static os_log_t g_log;
@@ -1660,6 +1666,211 @@ static OSStatus request_sample_rate(Float64 rate) {
 }
 static OSStatus SL2_AbortDeviceConfigurationChange(AudioServerPlugInDriverRef d, AudioObjectID id, UInt64 action, void *info) { return kAudioHardwareNoError; }
 
+/* ----------------------------------------------------------------------------
+ * Output volume and mute. The SL 2 has no volume control of its own: no HID command sets a level,
+ * and the box's FPGA, which carries the audio, takes no level from the host. So the driver scales
+ * the samples itself: a master volume and mute (element 0, what the menu bar and the volume keys
+ * use) and a volume for each output channel (elements 1-4, shown per channel in Audio MIDI Setup).
+ * A channel's gain is the master's times its own. Without the master, the HAL's virtual main volume
+ * (the volume keys) would move only the preferred stereo pair, channels 1-2: the channels are
+ * discrete, not a speaker layout it could follow.
+ *
+ * The gain is applied in ProcessMix: the HAL calls it in place on the mix of all its clients, in the
+ * same IO cycle, just before WriteMix. Applying it there adds no buffering and moves no timing.
+ * Every client follows the volume, Serato included. The driver keeps the levels and mute only in
+ * memory, starting at 0 dB, unmuted; the HAL saves them per device and sets them again whenever the
+ * device is published (after a replug or a restart of coreaudiod), as it does for any device.
+ * ---------------------------------------------------------------------------- */
+#define VOL_MIN_DB      (-64.0f)   /* scalar 0 is silence; above that, dB is linear in the scalar */
+#define VOL_MAX_DB      0.0f
+#define VOL_RAMP_MS     5.0f       /* a full-scale change of gain (0 to 1) takes this long */
+
+/* The volume controls' levels: [0] the master, [1..NCH] each channel. */
+static _Atomic float g_vol_db[1 + NCH] = { VOL_MAX_DB, VOL_MAX_DB, VOL_MAX_DB, VOL_MAX_DB, VOL_MAX_DB };
+static _Atomic bool  g_vol_mute = false;
+/* Each channel's linear gain from the levels and mute, and the gain the last ProcessMix ended at.
+   The HAL can call ProcessMix from more than one IO thread, but never two at once, so relaxed loads
+   and stores are enough. */
+static _Atomic float g_vol_gain[NCH]    = { 1.0f, 1.0f, 1.0f, 1.0f };
+static _Atomic float g_vol_applied[NCH] = { 1.0f, 1.0f, 1.0f, 1.0f };
+
+static const AudioObjectID kVolObjs[1 + NCH] = { kObjVolume, kObjVolCh1, kObjVolCh2, kObjVolCh3, kObjVolCh4 };
+/* Every control the device owns, in its ControlList order: the volumes, then the mute. */
+#define VOL_NCONTROLS   (2 + NCH)
+static const AudioObjectID kControlObjs[VOL_NCONTROLS] = { kObjVolume, kObjVolCh1, kObjVolCh2, kObjVolCh3, kObjVolCh4, kObjMute };
+/* Serialises volume and mute changes (on the HAL's property threads; never taken on the IO path), so
+   two changes at once can't leave the gains computed from a half-updated state. */
+static pthread_mutex_t g_vol_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+/* Which level a volume control sets (0 = master, 1..NCH = channel), or -1 if oid is not one. */
+static int vol_index(AudioObjectID oid) {
+    for (int i = 0; i <= NCH; i++) if (kVolObjs[i] == oid) return i;
+    return -1;
+}
+static bool vol_is_control(AudioObjectID oid) { return oid == kObjMute || vol_index(oid) >= 0; }
+
+static float vol_scalar_to_db(float s) {
+    if (s < 0) s = 0; else if (s > 1) s = 1;
+    return VOL_MIN_DB + s * (VOL_MAX_DB - VOL_MIN_DB);
+}
+static float vol_db_to_scalar(float db) {
+    if (db <= VOL_MIN_DB) return 0;
+    if (db >= VOL_MAX_DB) return 1;
+    return (db - VOL_MIN_DB) / (VOL_MAX_DB - VOL_MIN_DB);
+}
+/* A level's linear gain; the bottom of the range is silence. */
+static float vol_db_to_gain(float db) { return db <= VOL_MIN_DB ? 0.0f : powf(10.0f, db / 20.0f); }
+
+/* Recompute each channel's gain after a change of level or mute. */
+static void vol_update_gain(void) {
+    float master = atomic_load(&g_vol_mute) ? 0.0f : vol_db_to_gain(atomic_load(&g_vol_db[0]));
+    for (int ch = 0; ch < NCH; ch++)
+        atomic_store(&g_vol_gain[ch], master * vol_db_to_gain(atomic_load(&g_vol_db[1 + ch])));
+}
+
+/* Tell the HAL's clients that a volume control's value (both its scalar and dB forms) or the mute
+   control's value changed. */
+static void vol_notify(AudioObjectID oid) {
+    if (!g_host) return;
+    if (oid == kObjMute) {
+        AudioObjectPropertyAddress mute = { kAudioBooleanControlPropertyValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+        g_host->PropertiesChanged(g_host, kObjMute, 1, &mute);
+    } else {
+        AudioObjectPropertyAddress vol[2] = {
+            { kAudioLevelControlPropertyScalarValue,  kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+            { kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+        };
+        g_host->PropertiesChanged(g_host, oid, 2, vol);
+    }
+}
+
+/* ProcessMix, on the IO thread: scale each channel of the mix by its gain. A channel at unity gain
+   is not touched. A change of gain ramps at a fixed rate (VOL_RAMP_MS for the full range), carrying
+   on into the next cycles if need be, so a step doesn't click whatever the IO buffer size. */
+static void vol_process_mix(float *buf, UInt32 frames) {
+    /* Each channel's target and current gain; nothing to do if every channel is steady at unity. */
+    float target[NCH], g[NCH];
+    bool unity = true, ramping = false;
+    for (int ch = 0; ch < NCH; ch++) {
+        target[ch] = atomic_load_explicit(&g_vol_gain[ch], memory_order_relaxed);
+        g[ch] = atomic_load_explicit(&g_vol_applied[ch], memory_order_relaxed);
+        if (g[ch] != target[ch]) ramping = true;
+        if (g[ch] != 1.0f || target[ch] != 1.0f) unity = false;
+    }
+    if (unity) return;
+
+    /* Steady: one gain per channel, in a single pass. */
+    if (!ramping) {
+        for (UInt32 f = 0; f < frames; f++)
+            for (int ch = 0; ch < NCH; ch++) buf[f * NCH + ch] *= target[ch];
+        return;
+    }
+    /* Ramping: each channel moves towards its target by at most one step per frame. */
+    float step = 1000.0f / (VOL_RAMP_MS * (float)g_sr);
+    for (UInt32 f = 0; f < frames; f++)
+        for (int ch = 0; ch < NCH; ch++) {
+            g[ch] = g[ch] < target[ch] ? fminf(g[ch] + step, target[ch]) : fmaxf(g[ch] - step, target[ch]);
+            buf[f * NCH + ch] *= g[ch];
+        }
+    for (int ch = 0; ch < NCH; ch++) atomic_store_explicit(&g_vol_applied[ch], g[ch], memory_order_relaxed);
+}
+
+/* A new stream starts at the current gains rather than ramping from where the last one ended. */
+static void vol_snap(void) {
+    for (int ch = 0; ch < NCH; ch++) atomic_store(&g_vol_applied[ch], atomic_load(&g_vol_gain[ch]));
+}
+
+/* The volume and mute controls' properties. */
+static UInt32 vol_property_size(AudioObjectID oid, AudioObjectPropertySelector s) {
+    switch (s) {
+        case kAudioObjectPropertyBaseClass:
+        case kAudioObjectPropertyClass:              return sizeof(AudioClassID);
+        case kAudioObjectPropertyOwner:              return sizeof(AudioObjectID);
+        case kAudioObjectPropertyOwnedObjects:       return 0;
+        case kAudioObjectPropertyName:               return sizeof(CFStringRef);
+        case kAudioControlPropertyScope:             return sizeof(AudioObjectPropertyScope);
+        case kAudioControlPropertyElement:           return sizeof(AudioObjectPropertyElement);
+    }
+    if (vol_index(oid) >= 0) switch (s) {
+        case kAudioLevelControlPropertyScalarValue:
+        case kAudioLevelControlPropertyDecibelValue:
+        case kAudioLevelControlPropertyConvertScalarToDecibels:
+        case kAudioLevelControlPropertyConvertDecibelsToScalar: return sizeof(Float32);
+        case kAudioLevelControlPropertyDecibelRange:            return sizeof(AudioValueRange);
+    }
+    if (oid == kObjMute && s == kAudioBooleanControlPropertyValue) return sizeof(UInt32);
+    return UINT32_MAX;   /* not a property of this control */
+}
+
+static bool vol_has_property(AudioObjectID oid, AudioObjectPropertySelector s) {
+    return vol_property_size(oid, s) != UINT32_MAX;
+}
+
+static bool vol_property_settable(AudioObjectID oid, AudioObjectPropertySelector s) {
+    return (vol_index(oid) >= 0 && (s == kAudioLevelControlPropertyScalarValue || s == kAudioLevelControlPropertyDecibelValue)) ||
+           (oid == kObjMute && s == kAudioBooleanControlPropertyValue);
+}
+
+static OSStatus vol_get_property(AudioObjectID oid, AudioObjectPropertySelector s, UInt32 inSize, UInt32 *outSize, void *outData) {
+    static CFStringRef const names[1 + NCH] = {
+        CFSTR("Output Volume"), CFSTR("Left Deck Out L"), CFSTR("Left Deck Out R"),
+        CFSTR("Right Deck Out L"), CFSTR("Right Deck Out R")
+    };
+    UInt32 need = vol_property_size(oid, s);
+    if (need == UINT32_MAX) return kAudioHardwareUnknownPropertyError;
+    if (inSize < need) return kAudioHardwareBadPropertySizeError;
+    *outSize = need;
+    int v = vol_index(oid);   /* -1 for the mute control */
+    switch (s) {
+        case kAudioObjectPropertyBaseClass:
+            *(AudioClassID*)outData = v >= 0 ? kAudioLevelControlClassID : kAudioBooleanControlClassID; return 0;
+        case kAudioObjectPropertyClass:
+            *(AudioClassID*)outData = v >= 0 ? kAudioVolumeControlClassID : kAudioMuteControlClassID; return 0;
+        case kAudioObjectPropertyOwner: *(AudioObjectID*)outData = kObjDevice; return 0;
+        case kAudioObjectPropertyOwnedObjects: return 0;
+        case kAudioObjectPropertyName: *(CFStringRef*)outData = v >= 0 ? names[v] : CFSTR("Output Mute"); return 0;
+        case kAudioControlPropertyScope: *(AudioObjectPropertyScope*)outData = kAudioObjectPropertyScopeOutput; return 0;
+        case kAudioControlPropertyElement: *(AudioObjectPropertyElement*)outData = v > 0 ? (UInt32)v : kAudioObjectPropertyElementMain; return 0;
+        case kAudioLevelControlPropertyScalarValue: *(Float32*)outData = vol_db_to_scalar(atomic_load(&g_vol_db[v])); return 0;
+        case kAudioLevelControlPropertyDecibelValue: *(Float32*)outData = atomic_load(&g_vol_db[v]); return 0;
+        case kAudioLevelControlPropertyDecibelRange: {
+            AudioValueRange *r = (AudioValueRange*)outData;
+            r->mMinimum = VOL_MIN_DB; r->mMaximum = VOL_MAX_DB;
+            return 0;
+        }
+        /* The conversions take their input in the output buffer. */
+        case kAudioLevelControlPropertyConvertScalarToDecibels: *(Float32*)outData = vol_scalar_to_db(*(Float32*)outData); return 0;
+        case kAudioLevelControlPropertyConvertDecibelsToScalar: *(Float32*)outData = vol_db_to_scalar(*(Float32*)outData); return 0;
+        case kAudioBooleanControlPropertyValue: *(UInt32*)outData = atomic_load(&g_vol_mute) ? 1 : 0; return 0;
+    }
+    return kAudioHardwareUnknownPropertyError;
+}
+
+static OSStatus vol_set_property(AudioObjectID oid, AudioObjectPropertySelector s, UInt32 inSize, const void *inData) {
+    if (!vol_property_settable(oid, s)) return kAudioHardwareUnsupportedOperationError;
+    if (!inData || inSize < vol_property_size(oid, s)) return kAudioHardwareBadPropertySizeError;
+    int v = vol_index(oid);
+    if (v >= 0 && !isfinite(*(const Float32*)inData)) return kAudioHardwareIllegalOperationError;
+    /* Store the new level or mute and recompute the gains as one step. */
+    bool changed;
+    pthread_mutex_lock(&g_vol_mtx);
+    if (v >= 0) {
+        Float32 x = *(const Float32*)inData;
+        float db = s == kAudioLevelControlPropertyScalarValue ? vol_scalar_to_db(x)
+                 : (x < VOL_MIN_DB ? VOL_MIN_DB : x > VOL_MAX_DB ? VOL_MAX_DB : x);
+        changed = db != atomic_load(&g_vol_db[v]);
+        atomic_store(&g_vol_db[v], db);
+    } else {
+        bool mute = *(const UInt32*)inData != 0;
+        changed = mute != atomic_load(&g_vol_mute);
+        atomic_store(&g_vol_mute, mute);
+    }
+    if (changed) vol_update_gain();
+    pthread_mutex_unlock(&g_vol_mtx);
+    if (changed) vol_notify(oid);
+    return 0;
+}
+
 static Boolean SL2_HasProperty(AudioServerPlugInDriverRef d, AudioObjectID oid, pid_t pid, const AudioObjectPropertyAddress *addr) {
     if (!addr) return false;
     AudioObjectPropertySelector s = addr->mSelector;
@@ -1739,6 +1950,8 @@ static Boolean SL2_HasProperty(AudioServerPlugInDriverRef d, AudioObjectID oid, 
         }
         return false;
     }
+    /* The output volume and mute controls */
+    if (vol_is_control(oid)) return vol_has_property(oid, s);
     (void)sc;
     return false;
 }
@@ -1750,6 +1963,9 @@ static OSStatus SL2_IsPropertySettable(AudioServerPlugInDriverRef d, AudioObject
     } else if ((oid == kObjStreamIn || oid == kObjStreamOut) &&
                (addr->mSelector == kAudioStreamPropertyVirtualFormat || addr->mSelector == kAudioStreamPropertyPhysicalFormat)) {
         *outSettable = true;
+    } else if (vol_is_control(oid)) {
+        if (!vol_has_property(oid, addr->mSelector)) return kAudioHardwareUnknownPropertyError;
+        *outSettable = vol_property_settable(oid, addr->mSelector);
     }
     return kAudioHardwareNoError;
 }
@@ -1763,6 +1979,28 @@ static bool owned_class_wanted(UInt32 qsz, const void *qd, AudioClassID cls) {
     for (UInt32 i = 0; i < n; i++)
         if (c[i] == cls || c[i] == kAudioObjectClassID) return true;
     return false;
+}
+
+/* Whether the class qualifier wants a control of class cls, which derives from base and that from
+   kAudioControlClassID. */
+static bool control_wanted(UInt32 qsz, const void *qd, AudioClassID cls, AudioClassID base) {
+    return owned_class_wanted(qsz, qd, cls) || owned_class_wanted(qsz, qd, base) ||
+           owned_class_wanted(qsz, qd, kAudioControlClassID);
+}
+
+/* The device's owned objects in a scope, filtered by the class qualifier: the streams, and the
+   output volume and mute controls. */
+#define DEVICE_NOWNED   (2 + VOL_NCONTROLS)   /* the two streams and the controls */
+static UInt32 device_owned_objects(AudioObjectPropertyScope sc, UInt32 qsz, const void *qd, AudioObjectID ids[DEVICE_NOWNED]) {
+    UInt32 n = 0;
+    bool in = sc != kAudioObjectPropertyScopeOutput, out = sc != kAudioObjectPropertyScopeInput;
+    if (in  && owned_class_wanted(qsz, qd, kAudioStreamClassID)) ids[n++] = kObjStreamIn;
+    if (out && owned_class_wanted(qsz, qd, kAudioStreamClassID)) ids[n++] = kObjStreamOut;
+    bool vol  = out && control_wanted(qsz, qd, kAudioVolumeControlClassID, kAudioLevelControlClassID);
+    bool mute = out && control_wanted(qsz, qd, kAudioMuteControlClassID, kAudioBooleanControlClassID);
+    for (int i = 0; i < VOL_NCONTROLS; i++)
+        if (kControlObjs[i] == kObjMute ? mute : vol) ids[n++] = kControlObjs[i];
+    return n;
 }
 
 static void fill_asbd(AudioStreamBasicDescription *a, Float64 sr) {
@@ -1819,16 +2057,16 @@ static OSStatus SL2_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjec
             case kAudioDevicePropertyIsHidden:
             case kAudioDevicePropertyZeroTimeStampPeriod: *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertyRelatedDevices: *outSize = sizeof(AudioObjectID); return 0;
-            case kAudioObjectPropertyOwnedObjects:
-                if (!owned_class_wanted(qsz, qd, kAudioStreamClassID)) *outSize = 0;
-                else *outSize = (sc == kAudioObjectPropertyScopeInput || sc == kAudioObjectPropertyScopeOutput)
-                              ? sizeof(AudioObjectID) : 2 * sizeof(AudioObjectID);
+            case kAudioObjectPropertyOwnedObjects: {
+                AudioObjectID ids[DEVICE_NOWNED];
+                *outSize = device_owned_objects(sc, qsz, qd, ids) * sizeof(AudioObjectID);
                 return 0;
+            }
             case kAudioDevicePropertyStreams:
                 if (sc == kAudioObjectPropertyScopeInput || sc == kAudioObjectPropertyScopeOutput) *outSize = sizeof(AudioObjectID);
                 else *outSize = 2 * sizeof(AudioObjectID);
                 return 0;
-            case kAudioObjectPropertyControlList: *outSize = 0; return 0;
+            case kAudioObjectPropertyControlList: *outSize = sizeof kControlObjs; return 0;
             case kAudioDevicePropertyNominalSampleRate: *outSize = sizeof(Float64); return 0;
             case kAudioDevicePropertyAvailableNominalSampleRates: *outSize = 2 * sizeof(AudioValueRange); return 0;
             case kAudioDevicePropertyPreferredChannelsForStereo: *outSize = 2 * sizeof(UInt32); return 0;
@@ -1859,6 +2097,13 @@ static OSStatus SL2_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjec
             case kAudioStreamPropertyAvailableVirtualFormats:
             case kAudioStreamPropertyAvailablePhysicalFormats: *outSize = 2 * sizeof(AudioStreamRangedDescription); return 0;
         }
+    }
+    /* The output volume and mute controls */
+    if (vol_is_control(oid)) {
+        UInt32 n = vol_property_size(oid, s);
+        if (n == UINT32_MAX) return kAudioHardwareUnknownPropertyError;
+        *outSize = n;
+        return 0;
     }
     return kAudioHardwareUnknownPropertyError;
 }
@@ -1921,19 +2166,24 @@ static OSStatus get_property_data(AudioServerPlugInDriverRef d, AudioObjectID oi
                 *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertyIsHidden: *(UInt32*)outData = 0; *outSize = sizeof(UInt32); return 0;
             case kAudioDevicePropertyZeroTimeStampPeriod: *(UInt32*)outData = ZTS_PERIOD_FRAMES; *outSize = sizeof(UInt32); return 0;
-            case kAudioObjectPropertyOwnedObjects:
+            case kAudioObjectPropertyOwnedObjects: {
+                AudioObjectID ids[DEVICE_NOWNED];
+                UInt32 n = device_owned_objects(sc, qsz, qd, ids);
+                memcpy(outData, ids, n * sizeof(AudioObjectID));
+                *outSize = n * sizeof(AudioObjectID);
+                return 0;
+            }
             case kAudioDevicePropertyStreams: {
                 AudioObjectID *ids = (AudioObjectID*)outData;
-                if (s == kAudioObjectPropertyOwnedObjects && !owned_class_wanted(qsz, qd, kAudioStreamClassID)) {
-                    *outSize = 0;
-                    return 0;
-                }
                 if (sc == kAudioObjectPropertyScopeInput) { ids[0] = kObjStreamIn; *outSize = sizeof(AudioObjectID); }
                 else if (sc == kAudioObjectPropertyScopeOutput) { ids[0] = kObjStreamOut; *outSize = sizeof(AudioObjectID); }
                 else { ids[0] = kObjStreamIn; ids[1] = kObjStreamOut; *outSize = 2 * sizeof(AudioObjectID); }
                 return 0;
             }
-            case kAudioObjectPropertyControlList: *outSize = 0; return 0;
+            case kAudioObjectPropertyControlList:
+                memcpy(outData, kControlObjs, sizeof kControlObjs);
+                *outSize = sizeof kControlObjs;
+                return 0;
             case kAudioDevicePropertyNominalSampleRate: *(Float64*)outData = g_sr; *outSize = sizeof(Float64); return 0;
             case kAudioDevicePropertyAvailableNominalSampleRates: {
                 AudioValueRange *r = (AudioValueRange*)outData;
@@ -2078,6 +2328,8 @@ static OSStatus get_property_data(AudioServerPlugInDriverRef d, AudioObjectID oi
             }
         }
     }
+    /* The output volume and mute controls */
+    if (vol_is_control(oid)) return vol_get_property(oid, s, inSize, outSize, outData);
     return kAudioHardwareUnknownPropertyError;
 }
 
@@ -2220,6 +2472,8 @@ static OSStatus SL2_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
         if (inSize < sizeof(AudioStreamBasicDescription) || !inData) return kAudioHardwareBadPropertySizeError;
         return request_sample_rate(((const AudioStreamBasicDescription*)inData)->mSampleRate);
     }
+    /* The output volume and mute controls */
+    if (vol_is_control(oid)) return vol_set_property(oid, addr->mSelector, inSize, inData);
     return kAudioHardwareUnsupportedOperationError;
 }
 
@@ -2227,6 +2481,9 @@ static OSStatus SL2_StartIO(AudioServerPlugInDriverRef d, AudioObjectID oid, UIn
     /* The first client starts the stream; if the box can't be opened, the client gets an error
        rather than silence on a timeline with no box behind it. */
     pthread_mutex_lock(&g_mutex);
+    /* No IO is running yet, so a new stream starts at the current gain rather than ramping from
+       the level the last one ended at. */
+    if (g_io_clients == 0) vol_snap();
     if (g_io_clients == 0 && !usb_open_all()) {
         pthread_mutex_unlock(&g_mutex);
         LOG("StartIO failed: the SL 2 could not be opened");
@@ -2270,7 +2527,10 @@ static OSStatus SL2_GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID
 
 static OSStatus SL2_WillDoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID oid, UInt32 cid, UInt32 op, Boolean *outWillDo, Boolean *outIsInPlace) {
     *outIsInPlace = true;
-    *outWillDo = (op == kAudioServerPlugInIOOperationReadInput || op == kAudioServerPlugInIOOperationWriteMix);
+    /* ProcessMix applies the output volume to the mix, in place, just before WriteMix (see
+       vol_process_mix). */
+    *outWillDo = (op == kAudioServerPlugInIOOperationReadInput || op == kAudioServerPlugInIOOperationProcessMix ||
+                  op == kAudioServerPlugInIOOperationWriteMix);
     return 0;
 }
 
@@ -2292,6 +2552,10 @@ static OSStatus SL2_DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID oi
             }
             memcpy(buf + f * NCH, &g_in_ring[(p & RING_MASK) * NCH], NCH * sizeof(float));
         }
+
+        /* ProcessMix: the mix of all clients, before WriteMix: apply the output volume. */
+    } else if (op == kAudioServerPlugInIOOperationProcessMix) {
+        if (sid == kObjStreamOut && buf) vol_process_mix(buf, frames);
 
         /* WriteMix: into the deep schedule's queued transfers, at the HAL's output sample time. */
     } else if (op == kAudioServerPlugInIOOperationWriteMix) {

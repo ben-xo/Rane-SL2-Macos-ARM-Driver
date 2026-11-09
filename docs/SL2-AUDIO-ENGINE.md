@@ -203,6 +203,37 @@ within 0.15 ms, on the safe side. Most of the 2.8 ms is fixed by design (the 1.5
 the box's converters and buffers, so it should not vary between Macs; a different USB controller might
 shift it slightly. Only 44.1 kHz has been measured.
 
+### 4a. Output volume (`vol_*`)
+
+The SL 2 has no volume control of its own. No HID command sets a level, and the FPGA that carries the
+audio gets no level from the host: after configuring it, the firmware only ever sends it one constant
+word, when the LINE/PHONO switch moves. Rane's own driver had none either; its volume hooks were empty.
+So the driver scales the samples itself: a master **Output Volume** and **Output Mute**, which the
+menu-bar slider and the volume keys use, and a **volume for each output channel**, shown per channel
+in Audio MIDI Setup. All run from −64 to 0 dB, linear in dB along the slider, with the bottom silent.
+A channel's gain is the master's times its own. The master is needed: without one, the HAL's virtual
+main volume (the volume keys) moves only the preferred stereo pair, channels 1–2, because the four
+channels are discrete rather than a speaker layout it could follow, so the keys would turn down one
+deck and not the other.
+
+- **Where:** in `ProcessMix`, which the HAL calls in place on the mix of all its clients, in the same IO
+  cycle, just before WriteMix. It adds no buffering and moves no timing; the deep schedule, the reported
+  latencies and the safety offsets are unchanged. At 0 dB, unmuted, no sample is touched. A change of
+  level ramps at a fixed rate (5 ms for the full range, across IO cycles if need be), so a step doesn't
+  click at any buffer size; a stream starts at the current level.
+- **Every client follows it, Serato included**, so turning the volume down while Serato plays turns down
+  the decks' output to the mixer. Like any device's, the volume and mute are remembered: the HAL saves
+  them and sets them again when the device reappears (after a replug or a restart of coreaudiod). The
+  driver keeps them only in memory.
+
+Measured through the loopback cable (44.1 kHz, 128-frame buffer): clicks drop by exactly the volume
+(−20.0 dB at −20 dB), whether set on the channel or with the volume keys (which set the master and
+leave the channels' own levels), a level set on another channel leaves them alone, and they are gone
+when muted. The DVS round trip at 0 dB is 18.6 ms, the
+same as without the volume control. `rtlat` reads quieter clicks one to three frames later, but a click at half
+amplitude reads the same with no volume applied: its fixed detection threshold is crossed by the
+converters' pre-ringing, which is smaller on a quieter click. It is not latency.
+
 ### 5. Sample-rate changes
 
 - Rates change through `RequestDeviceConfigurationChange` / `PerformDeviceConfigurationChange`.
@@ -517,7 +548,7 @@ build; *(hook)* uses `tools/latency/bin/sl2dbg`.
 `make hwtest` runs the hardware tests in one go, in the order that needs the fewest physical steps, and
 ends with a PASS / FAIL / SKIP summary (`ARGS="--loopback"` with the loopback cable in). It covers the
 status, SL2Api as Serato calls it, rate switching, restarts, glitches (idle and loaded), 48 kHz, the
-fault hooks, the LINE/PHONO report, and unplug and replug while idle and mid-stream.
+output volume and mute (and that they survive a replug), the fault hooks, the LINE/PHONO report, and unplug and replug while idle and mid-stream.
 
 The tools are in `tools/latency/` (build them with `make latency`). Its README covers the loopback setup,
 what each tool does and the expected results. The main ones:

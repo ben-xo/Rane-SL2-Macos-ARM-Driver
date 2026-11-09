@@ -26,6 +26,7 @@ When Apple transitioned to **Apple Silicon (M1 / M2 / M3 / M4)** and modern macO
 * ✅ **NO SIP Disable Required & NO Reboot Required:** Runs 100% in user space via Apple's modern `AudioServerPlugIn` (CoreAudio HAL) and `IOUSBHost` frameworks, plus a custom Universal `SL2Api.framework` user-space bridge.
 * ✅ **Works with the macOS System Settings "SL 2" Control Panel** and includes a terminal control utility (`sl2panel`) to show the status (including the box's **Phono / Line** switch), toggle **Thru**, and change sample rates (**44.1 kHz / 48 kHz**).
 * ✅ **Works as a 4-In / 4-Out (24-bit) CoreAudio Soundcard** in **Mixxx, Traktor, Ableton Live, Rekordbox, Logic Pro**, and system-wide macOS audio.
+* ✅ **Output volume and mute** from the menu bar and the volume keys, and per channel in Audio MIDI Setup (the SL 2 has no volume control of its own, so the driver provides one). It applies to everything the SL 2 plays, **Serato's decks included**, and macOS remembers it: if your decks sound quiet in Serato, check the SL 2's volume.
 
 ---
 
@@ -54,6 +55,7 @@ Con la llegada de los procesadores **Apple Silicon (M1 / M2 / M3 / M4)** y los n
 * ✅ **SIN desactivar la seguridad del Mac (SIP) y SIN reiniciar:** Todo funciona en espacio de usuario mediante un plugin HAL de CoreAudio (`SL2Device.driver` sobre `IOUSBHost`) junto con un puente nativo Universal (`SL2Api.framework`).
 * ✅ **Funciona con el panel "SL 2" en Ajustes del Sistema de macOS** e incluye utilidad de control (`Panel-Control-SL2.command` / `sl2panel`) para ver el estado (incluido el selector **Phono / Line** del aparato), activar/desactivar **Thru** y elegir entre **44.1 kHz y 48 kHz**.
 * ✅ **Funciona como tarjeta de sonido de 4 Entradas y 4 Salidas (24-bit)** en **Ableton Live, Traktor, Mixxx, Rekordbox, Logic Pro** y el audio general de macOS.
+* ✅ **Volumen y silencio de salida** desde la barra de menús y las teclas de volumen, y por canal en Configuración de Audio MIDI (la SL 2 no tiene control de volumen propio, así que lo aporta el driver). Afecta a todo lo que suena por la SL 2, **incluidos los platos de Serato**, y macOS lo recuerda: si los platos suenan bajos en Serato, revisa el volumen de la SL 2.
 
 ---
 
