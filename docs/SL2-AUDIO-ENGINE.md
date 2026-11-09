@@ -266,7 +266,7 @@ converters' pre-ringing, which is smaller on a quieter click. It is not latency.
 - **StartIO fails** (`kAudioHardwareNotRunningError`) when the box can't be opened, rather than running a
   timeline with no box behind it.
 
-### 7. The HID path for clients (`sl2h`, `sl2s`, `sl2q`)
+### 7. The HID path for clients (`sl2h`, `sl2s`, `sl2q`, `sl2m`)
 
 - **`sl2h`:** writing a 64-byte command sends it to the box and keeps the reply for the calling process; the
   next read returns it once, and a read never sends anything. The driver tags each request with its own
@@ -278,6 +278,11 @@ converters' pre-ringing, which is smaller on a quieter click. It is not latency.
   in a ring of 256 with a read position per client process, so every client gets every report.
 - **`sl2s`:** the status (connected, streaming, rate, version, serial, thru and LINE/PHONO, frame counts,
   boot mode). Reading it has no side effects.
+- **`sl2m`:** level meters for the control panel: the peak level (0–1) of each input channel as captured and
+  each output channel as sent (after the volume) since the last read, which resets them. The driver
+  measures only while some client has read them in the last second, so they cost nothing otherwise. There
+  is one set, so two clients reading at once share the peaks between them. They move only while a stream
+  runs: with no app using the SL 2 the decks are on thru and the box sends no audio.
 - **No heartbeat.** The driver doesn't send `0x37`: the firmware doesn't check for it, and a 45 s loopback
   test with no `0x37` at all passed with full level and no glitches. It is sent only when a client asks
   (Serato's hardware check, below).
@@ -553,7 +558,7 @@ build; *(hook)* uses `tools/latency/bin/sl2dbg`.
 `make hwtest` runs the hardware tests in one go, in the order that needs the fewest physical steps, and
 ends with a PASS / FAIL / SKIP summary (`ARGS="--loopback"` with the loopback cable in). It covers the
 status, SL2Api as Serato calls it, rate switching, restarts, glitches (idle and loaded), 48 kHz, the
-output volume and mute (and that they survive a replug), the fault hooks, the LINE/PHONO report, and unplug and replug while idle and mid-stream.
+output volume and mute (and that they survive a replug), the level meters, the fault hooks, the LINE/PHONO report, and unplug and replug while idle and mid-stream.
 
 The tools are in `tools/latency/` (build them with `make latency`). Its README covers the loopback setup,
 what each tool does and the expected results. The main ones:

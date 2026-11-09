@@ -57,6 +57,7 @@
 #define kSL2PropHIDCommand  'sl2h'   /* CFDataRef (64B cmd in -> 64B reply out) */
 #define kSL2PropStatus      'sl2s'   /* CFDataRef (SL2StatusPacket out) */
 #define kSL2PropUnsolQueue  'sl2q'   /* CFDataRef (this client's queued 64B reports, oldest first) */
+#define kSL2PropMeters      'sl2m'   /* CFDataRef (8 Float32: peak level of inputs 1-4, then outputs 1-4) */
 
 /* The box's HID protocol (docs/SL2-COMMANDS.md). Every command and reply is one 64-byte report:
    [0] = command, [1..4] = tag (echoed in the reply), [5..] = arguments / results. */
@@ -970,6 +971,39 @@ static void dp_write(const float *buf, UInt32 frames, uint64_t pos) {
 }
 
 /* ============================================================================
+ * Level meters ('sl2m', for the control panel)
+ *
+ * The peak absolute sample level (0..1) on each input and output channel since the meters were last
+ * read: inputs as captured, outputs as sent to the box (after the volume). Reading the property
+ * returns them and starts the next peak. They are measured only while some client has read them in
+ * the last METER_IDLE_MS, so they cost nothing when no meter is shown. One set is kept, so two
+ * clients reading at once would split the peaks between them.
+ * ============================================================================ */
+#define METER_IDLE_MS 1000
+static _Atomic float    g_meter_peak[2 * NCH];   /* [0..NCH) inputs, [NCH..2*NCH) outputs */
+static _Atomic uint64_t g_meter_last_read;       /* host time of the last read; 0 = never */
+
+static bool meter_active(void) {
+    uint64_t t = atomic_load_explicit(&g_meter_last_read, memory_order_relaxed);
+    return t && (double)(mach_absolute_time() - t) < METER_IDLE_MS * ticks_per_ms();
+}
+
+/* Raise channel i's peak to at least v (lock-free: the reader resets it concurrently). */
+static void meter_raise(int i, float v) {
+    float cur = atomic_load_explicit(&g_meter_peak[i], memory_order_relaxed);
+    while (v > cur && !atomic_compare_exchange_weak_explicit(&g_meter_peak[i], &cur, v,
+                                                             memory_order_relaxed, memory_order_relaxed)) {}
+}
+
+/* The peaks of `frames` interleaved frames, into meters base..base+NCH-1. */
+static void meter_frames(int base, const float *buf, UInt32 frames) {
+    float pk[NCH] = { 0 };
+    for (UInt32 f = 0; f < frames; f++)
+        for (int c = 0; c < NCH; c++) pk[c] = fmaxf(pk[c], fabsf(buf[f * NCH + c]));
+    for (int c = 0; c < NCH; c++) meter_raise(base + c, pk[c]);
+}
+
+/* ============================================================================
  * Capture
  *
  * CAP_NXF 1 ms isochronous IN transfers are kept queued, each re-queued from its own completion
@@ -1095,6 +1129,15 @@ static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *
                 fr[c] = (float)s24 * (1.0f / 8388608.0f);
             }
             got++;
+        }
+    }
+
+    /* The input meters, if shown: the frames just placed (the ring may wrap within them). */
+    if (meter_active()) {
+        for (uint64_t left = got, at = ring_pos & RING_MASK; left > 0; ) {
+            uint64_t run = RING_FRAMES - at < left ? RING_FRAMES - at : left;
+            meter_frames(0, &g_in_ring[at * NCH], (UInt32)run);
+            left -= run; at = 0;
         }
     }
 
@@ -1930,6 +1973,7 @@ static Boolean SL2_HasProperty(AudioServerPlugInDriverRef d, AudioObjectID oid, 
             case kSL2PropHIDCommand:
             case kSL2PropStatus:
             case kSL2PropUnsolQueue:
+            case kSL2PropMeters:
             case kAudioObjectPropertyCustomPropertyInfoList:
                 return true;
         }
@@ -2081,8 +2125,9 @@ static OSStatus SL2_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjec
                 return 0;
             case kSL2PropHIDCommand:
             case kSL2PropStatus:
-            case kSL2PropUnsolQueue: *outSize = sizeof(CFDataRef); return 0;
-            case kAudioObjectPropertyCustomPropertyInfoList: *outSize = 3 * sizeof(AudioServerPlugInCustomPropertyInfo); return 0;
+            case kSL2PropUnsolQueue:
+            case kSL2PropMeters: *outSize = sizeof(CFDataRef); return 0;
+            case kAudioObjectPropertyCustomPropertyInfoList: *outSize = 4 * sizeof(AudioServerPlugInCustomPropertyInfo); return 0;
         }
     }
     /* The input and output streams */
@@ -2236,13 +2281,14 @@ static OSStatus get_property_data(AudioServerPlugInDriverRef d, AudioObjectID oi
             case kAudioObjectPropertyCustomPropertyInfoList: {
                 /* Declares the custom properties so the HAL marshals them to clients
                    (SL2Api.framework, sl2panel). Without this, clients get 'who?'. */
-                static const AudioServerPlugInCustomPropertyInfo all[3] = {
+                static const AudioServerPlugInCustomPropertyInfo all[4] = {
                     { kSL2PropHIDCommand, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
                     { kSL2PropStatus,     kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
                     { kSL2PropUnsolQueue, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
+                    { kSL2PropMeters,     kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
                 };
                 UInt32 n = inSize / sizeof(AudioServerPlugInCustomPropertyInfo);
-                if (n > 3) n = 3;
+                if (n > 4) n = 4;
                 memcpy(outData, all, n * sizeof(AudioServerPlugInCustomPropertyInfo));
                 *outSize = n * sizeof(AudioServerPlugInCustomPropertyInfo);
                 return 0;
@@ -2275,6 +2321,16 @@ static OSStatus get_property_data(AudioServerPlugInDriverRef d, AudioObjectID oi
                 g_st.boot_mode = atomic_load(&g_boot_mode) ? 1 : 0;
                 pthread_mutex_unlock(&g_mutex);
                 *(CFDataRef*)outData = CFDataCreate(kCFAllocatorDefault, (const UInt8*)&g_st, sizeof(g_st));
+                *outSize = sizeof(CFDataRef);
+                return 0;
+            }
+            case kSL2PropMeters: {
+                /* The peaks since the last read, each reset as it is taken; reading also keeps the
+                   meters running for another METER_IDLE_MS. */
+                Float32 v[2 * NCH];
+                for (int i = 0; i < 2 * NCH; i++) v[i] = atomic_exchange_explicit(&g_meter_peak[i], 0.0f, memory_order_relaxed);
+                atomic_store_explicit(&g_meter_last_read, mach_absolute_time(), memory_order_relaxed);
+                *(CFDataRef*)outData = CFDataCreate(kCFAllocatorDefault, (const UInt8*)v, sizeof v);
                 *outSize = sizeof(CFDataRef);
                 return 0;
             }
@@ -2561,7 +2617,10 @@ static OSStatus SL2_DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID oi
 
         /* ProcessMix: the mix of all clients, before WriteMix: apply the output volume. */
     } else if (op == kAudioServerPlugInIOOperationProcessMix) {
-        if (sid == kObjStreamOut && buf) vol_process_mix(buf, frames);
+        if (sid == kObjStreamOut && buf) {
+            vol_process_mix(buf, frames);
+            if (meter_active()) meter_frames(NCH, buf, frames);
+        }
 
         /* WriteMix: into the deep schedule's queued transfers, at the HAL's output sample time. */
     } else if (op == kAudioServerPlugInIOOperationWriteMix) {

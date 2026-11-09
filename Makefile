@@ -35,7 +35,7 @@ flash:
 	$(CC) $(ARCH) $(CFLAGS) -Itools -framework Foundation -framework CoreAudio -framework IOKit -framework IOUSBHost tools/firmware/sl2flash.m tools/SL2Passthrough.m -o sl2flash
 
 # latency and glitch test tools (tools/latency/README.md), built into tools/latency/bin
-LATENCY_TOOLS = rtlat sinetest chtone chrec devprobe setrate sl2dbg volctl
+LATENCY_TOOLS = rtlat sinetest chtone chrec devprobe setrate sl2dbg volctl meters
 latency: $(addprefix tools/latency/bin/,$(LATENCY_TOOLS))
 
 tools/latency/bin/%: tools/latency/%.c tools/latency/common.h
