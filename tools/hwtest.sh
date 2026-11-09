@@ -7,7 +7,7 @@
 #      sample-rate switching;
 #   2. with --loopback (a cable from Left Deck Out L to Left Deck In L; the tests play clicks and a
 #      loud tone into that output, so pass it only when the cable is in): restarts, a glitch test,
-#      48 kHz, the output volume and mute, and in a debug build (make plugin DEBUG=1) the glitch test under load and the fault
+#      48 kHz, the output volume and mute, the level meters, and in a debug build (make plugin DEBUG=1) the glitch test under load and the fault
 #      hooks;
 #   3. unless --no-physical: steps for a person at the box (flip the LINE/PHONO switch, unplug and
 #      replug while idle and while a stream runs). The script prints what to do and waits until it
@@ -106,7 +106,7 @@ input_is() { field 'Deck 1 Input' | grep -q "^$1"; }
 # ---------------------------------------------------------------------------- 0. preconditions
 
 echo "SL 2 hardware tests, $(date)"
-for tool in "$PANEL" "$APITEST" "$B/rtlat" "$B/sinetest" "$B/setrate" "$B/sl2dbg" "$B/chrec" "$B/volctl"; do
+for tool in "$PANEL" "$APITEST" "$B/rtlat" "$B/sinetest" "$B/setrate" "$B/sl2dbg" "$B/chrec" "$B/volctl" "$B/meters"; do
     [ -x "$tool" ] || { echo "missing $tool: run make hwtest (it builds the tools)"; exit 2; }
 done
 if ! connected; then
@@ -155,7 +155,7 @@ echo
 
 echo "== 2. loopback cable"
 if [ $LOOPBACK = 0 ]; then
-    for t in "restarts" "glitch test, 30 s" "glitch test idle + loaded (dptest)" "48 kHz" "output volume and mute" "fault hook: USB stall" "fault hook: errored capture packets"; do
+    for t in "restarts" "glitch test, 30 s" "glitch test idle + loaded (dptest)" "48 kHz" "output volume and mute" "level meters" "fault hook: USB stall" "fault hook: errored capture packets"; do
         record SKIP "$t" "no --loopback"
     done
 else
@@ -227,6 +227,24 @@ else
         fi
     else
         record FAIL "output volume and mute" "the driver has no output volume controls (volctl)"
+    fi
+
+    # The level meters ('sl2m', which the control panel shows): while sinetest plays its 0.4 tone
+    # (-8 dB) on output 1, output 1 must read -8 dB +-1, input 1 must clearly get it (the loopback),
+    # and outputs 2-4, which nothing plays to, must be silent.
+    "$B/sinetest" "$DEV" 1 1 4 128 >/dev/null 2>&1 &
+    sine=$!
+    sleep 1.5
+    m=$("$B/meters" "$DEV" 1.5)
+    wait $sine
+    if awk -v m="$m" 'BEGIN {
+            gsub(/in |, out | dB/, " ", m); n = split(m, v, " ")
+            if (n != 8) exit 1
+            for (i = 6; i <= 8; i++) if (v[i] != "-inf" && v[i] + 0 > -60) exit 1
+            exit !(v[5] + 0 > -9 && v[5] + 0 < -7 && v[1] != "-inf" && v[1] + 0 > -20) }'; then
+        record PASS "level meters" "$m"
+    else
+        record FAIL "level meters" "${m:-no reading}"
     fi
 
     # The fault hooks (debug build), each injected 3 s into a 10 s glitch test: a 100 ms stall in USB
