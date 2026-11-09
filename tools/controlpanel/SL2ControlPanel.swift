@@ -1,8 +1,11 @@
 // SL2ControlPanel.swift — "SL 2 Control Panel", a small app to see and set the Rane SL 2's state:
 // connection, firmware and driver versions, sample rate, latency, each deck's analogue thru and the
-// LINE/PHONO switch. It talks to the SL2Device HAL plug-in through CoreAudio, as sl2panel does:
+// LINE/PHONO switch, the decks' input and output levels, and the output volume. It talks to the
+// SL2Device HAL plug-in through CoreAudio, as sl2panel does:
 //   'sl2s'  the driver's status (SL2StatusPacket, SL2Status.h)
 //   'sl2h'  a 64-byte HID command to the box; reading it back returns the box's reply
+//   'sl2m'  the peak level of each input and output channel since the last read
+// and the device's standard output volume.
 // Built by tools/controlpanel/build-app.sh (make controlpanel).
 
 import AppKit
@@ -118,6 +121,38 @@ enum SL2Driver {
         return out.first == cmdHidi
     }
 
+    static let propMeters = fourCC("sl2m")
+
+    /// The peak level (0...1) of inputs 1-4 then outputs 1-4 since the last read. Reading keeps the
+    /// driver measuring for another second; nil if the driver has no meters.
+    static func meters(_ dev: AudioObjectID) -> [Float]? {
+        var addr = address(propMeters)
+        var data: Unmanaged<CFData>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFData>?>.size)
+        guard AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &data) == noErr,
+              let cf = data?.takeRetainedValue() else { return nil }
+        let bytes = cf as Data
+        guard bytes.count == 8 * MemoryLayout<Float32>.size else { return nil }
+        return bytes.withUnsafeBytes { Array($0.bindMemory(to: Float32.self)) }
+    }
+
+    /// The output's main volume as a slider position (0...1) and in dB, or nil if there is none.
+    static func volume(_ dev: AudioObjectID) -> (scalar: Float, db: Float)? {
+        var scalarAddr = address(kAudioDevicePropertyVolumeScalar, kAudioObjectPropertyScopeOutput)
+        var dbAddr = address(kAudioDevicePropertyVolumeDecibels, kAudioObjectPropertyScopeOutput)
+        var scalar: Float32 = 0, db: Float32 = 0
+        var size = UInt32(MemoryLayout<Float32>.size)
+        guard AudioObjectGetPropertyData(dev, &scalarAddr, 0, nil, &size, &scalar) == noErr,
+              AudioObjectGetPropertyData(dev, &dbAddr, 0, nil, &size, &db) == noErr else { return nil }
+        return (scalar, db)
+    }
+
+    static func setVolume(_ dev: AudioObjectID, _ scalar: Float) {
+        var addr = address(kAudioDevicePropertyVolumeScalar, kAudioObjectPropertyScopeOutput)
+        var value = Float32(scalar)
+        AudioObjectSetPropertyData(dev, &addr, 0, nil, UInt32(MemoryLayout<Float32>.size), &value)
+    }
+
     static func setSampleRate(_ dev: AudioObjectID, _ rate: Double) {
         var addr = address(kAudioDevicePropertyNominalSampleRate)
         var value = rate
@@ -156,6 +191,8 @@ struct BoxState: Equatable {
     var thru: [Bool]
     var outputLatencyMs: Double
     var inputLatencyMs: Double
+    var volume: Float?       // the main output volume as a slider position (0...1); nil if none
+    var volumeDb: Float
 }
 
 enum PanelState: Equatable {
@@ -194,6 +231,7 @@ final class PanelModel: ObservableObject {
         if s.connected == 0 { state = .noBox; return }
         // Connected: collect what the panel shows.
         let rate = Double(s.sample_rate > 0 ? s.sample_rate : 44100)
+        let volume = SL2Driver.volume(dev)
         let serial = withUnsafeBytes(of: s.serial) { raw in
             String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
         }
@@ -205,7 +243,16 @@ final class PanelModel: ObservableObject {
             phono: s.phono.0 != 0,
             thru: [s.thru.0 != 0, s.thru.1 != 0],
             outputLatencyMs: Double(SL2Driver.latencyFrames(dev, kAudioObjectPropertyScopeOutput)) * 1000 / rate,
-            inputLatencyMs: Double(SL2Driver.latencyFrames(dev, kAudioObjectPropertyScopeInput)) * 1000 / rate))
+            inputLatencyMs: Double(SL2Driver.latencyFrames(dev, kAudioObjectPropertyScopeInput)) * 1000 / rate,
+            volume: volume?.scalar,
+            volumeDb: volume?.db ?? 0))
+    }
+
+    /// Set the main output volume (a slider position, 0...1); the menu bar and Audio MIDI Setup follow.
+    func setVolume(_ scalar: Float) {
+        guard let dev = device else { return }
+        SL2Driver.setVolume(dev, scalar)
+        refresh()
     }
 
     /// Switch a deck's analogue thru (deck 0 or 1), then show what the box reports.
@@ -224,10 +271,92 @@ final class PanelModel: ObservableObject {
     }
 }
 
+/// The level meters: each deck's input and output, read from the driver 60 times a second. Kept
+/// apart from PanelModel so the meters redraw on their own, not the whole window. They respond fast
+/// (a new peak at once, falling the full range in a third of a second), so they show how promptly
+/// audio, a DVS record's timecode for one, starts and stops.
+@MainActor
+final class MeterModel: ObservableObject {
+    /// Peak level in dB (meterFloorDb...0) of each channel: inputs 1-4 (left deck L, R, right deck L, R),
+    /// then outputs 1-4.
+    @Published var levels: [Float] = Array(repeating: MeterModel.meterFloorDb, count: 8)
+    static let meterFloorDb: Float = -60
+    private static let ticksPerSecond = 60.0
+    private static let fallDbPerTick: Float = 3     // 180 dB a second
+    private var timer: Timer?
+    private var device: AudioObjectID?
+    private var ticks = 0
+
+    init() {
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / Self.ticksPerSecond, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.tick() }
+        }
+    }
+
+    private func tick() {
+        // Look the device up again every second (it comes and goes with the box).
+        if ticks % Int(Self.ticksPerSecond) == 0 { device = SL2Driver.device() }
+        ticks += 1
+        guard let dev = device, let peaks = SL2Driver.meters(dev) else {
+            levels = levels.map { _ in Self.meterFloorDb }
+            return
+        }
+        // A meter jumps up to a new peak and falls back fast, but not so fast that a short peak is gone
+        // before it is drawn.
+        levels = zip(levels, peaks).map { shown, peak in
+            let db = peak > 0 ? max(20 * log10(peak), Self.meterFloorDb) : Self.meterFloorDb
+            return max(db, shown - Self.fallDbPerTick)
+        }
+    }
+}
+
+/// A horizontal level meter, from meterFloorDb to 0 dB: green, then yellow from -12 dB, red from -3 dB.
+struct LevelMeter: View {
+    let db: Float
+    var body: some View {
+        GeometryReader { geo in
+            let floor = MeterModel.meterFloorDb
+            let fraction = CGFloat((db - floor) / -floor)
+            ZStack(alignment: .leading) {
+                Capsule().fill(.quaternary)
+                Capsule()
+                    .fill(LinearGradient(stops: [.init(color: .green, location: 0),
+                                                 .init(color: .green, location: 0.78),
+                                                 .init(color: .yellow, location: 0.8),
+                                                 .init(color: .yellow, location: 0.93),
+                                                 .init(color: .red, location: 0.95)],
+                                         startPoint: .leading, endPoint: .trailing))
+                    .frame(width: geo.size.width)
+                    .mask(alignment: .leading) { Capsule().frame(width: geo.size.width * max(0, min(1, fraction))) }
+            }
+        }
+        .frame(height: 6)
+        .accessibilityElement()
+        .accessibilityLabel("Level")
+        .accessibilityValue(db <= MeterModel.meterFloorDb ? "silent" : String(format: "%.0f dB", db))
+    }
+}
+
+/// A deck's stereo meter: one bar for its left channel, one for its right.
+struct StereoMeter: View {
+    let left: Float, right: Float
+    var body: some View {
+        VStack(spacing: 3) {
+            ForEach([("L", left), ("R", right)], id: \.0) { side, db in
+                HStack(spacing: 6) {
+                    Text(side).font(.caption2).foregroundStyle(.secondary).frame(width: 8)
+                    LevelMeter(db: db).accessibilityLabel(side == "L" ? "Left" : "Right")
+                }
+            }
+        }
+    }
+}
+
 // MARK: - The window
 
 struct PanelView: View {
     @ObservedObject var model: PanelModel
+    @ObservedObject var meters: MeterModel
 
     var body: some View {
         Group {
@@ -283,6 +412,34 @@ struct PanelView: View {
                 Text("Thru sends a deck's input straight to its outputs. An app playing through the SL 2 switches both decks to USB when it starts, and back to thru when it stops. Phono / Line is the switch on the box.")
                     .foregroundStyle(.secondary)
             }
+            Section {
+                LabeledContent("Left deck") { StereoMeter(left: meters.levels[0], right: meters.levels[1]) }
+                LabeledContent("Right deck") { StereoMeter(left: meters.levels[2], right: meters.levels[3]) }
+            } header: {
+                Text("Inputs")
+            } footer: {
+                Text("The level of each deck's input, left and right, while an app is using the SL 2. With nothing using it the decks are on thru, and the box sends the computer no audio.")
+                    .foregroundStyle(.secondary)
+            }
+            Section {
+                if let volume = box.volume {
+                    LabeledContent("Volume") {
+                        HStack {
+                            Slider(value: Binding(get: { volume }, set: { model.setVolume($0) }), in: 0...1)
+                            Text(volume <= 0 ? "Off" : String(format: "%.0f dB", box.volumeDb))
+                                .monospacedDigit()
+                                .frame(width: 52, alignment: .trailing)
+                        }
+                    }
+                }
+                LabeledContent("Left deck") { StereoMeter(left: meters.levels[4], right: meters.levels[5]) }
+                LabeledContent("Right deck") { StereoMeter(left: meters.levels[6], right: meters.levels[7]) }
+            } header: {
+                Text("Outputs")
+            } footer: {
+                Text("The volume applies to everything the SL 2 plays, Serato's decks included, like the volume keys. Set each output channel's own volume in Audio MIDI Setup.")
+                    .foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
         // The window is sized to the whole form, so it never needs to scroll.
@@ -314,10 +471,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct SL2ControlPanelApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var model = PanelModel()
+    @StateObject private var meters = MeterModel()
 
     var body: some Scene {
         Window("SL 2 Control Panel", id: "main") {
-            PanelView(model: model)
+            PanelView(model: model, meters: meters)
         }
         .windowResizability(.contentSize)
     }
