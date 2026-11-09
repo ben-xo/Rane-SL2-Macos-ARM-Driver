@@ -1,6 +1,6 @@
 // SL2ControlPanel.swift — "SL 2 Control Panel", a small app to see and set the Rane SL 2's state:
 // connection, firmware and driver versions, sample rate, latency, each deck's analogue thru and the
-// LINE/PHONO switch, the decks' input and output levels, and the output volume. It talks to the
+// CD/PHONO (line/phono) switch, the decks' input and output levels, and the output volume. It talks to the
 // SL2Device HAL plug-in through CoreAudio, as sl2panel does:
 //   'sl2s'  the driver's status (SL2StatusPacket, SL2Status.h)
 //   'sl2h'  a 64-byte HID command to the box; reading it back returns the box's reply
@@ -453,11 +453,11 @@ struct PanelView: View {
                 Toggle("\(Self.deckNames[deck]) analogue thru", isOn: Binding(get: { box.thru[deck] },
                                                                       set: { model.setThru(deck: deck, on: $0) }))
             }
-            LabeledContent("Input", value: box.phono ? "Phono" : "Line")
+            LabeledContent("Input", value: box.phono ? "Phono" : "CD (line)")
         } header: {
             Text("Decks")
         } footer: {
-            Text("Thru sends a deck's input straight to its outputs. An app playing through the SL 2 switches both decks to USB when it starts, and back to thru when it stops. Phono / Line is the switch on the box.")
+            Text("Thru sends a deck's input straight to its outputs. An app playing through the SL 2 switches both decks to USB when it starts, and back to thru when it stops. CD / Phono is the switch on the box, for both decks.")
                 .foregroundStyle(.secondary)
         }
     }
