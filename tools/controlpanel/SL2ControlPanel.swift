@@ -505,6 +505,12 @@ struct PanelView: View {
         } footer: {
             Text(outputsFooter)
                 .foregroundStyle(.secondary)
+                // The link is the app's bundle: launch it (the default handler does nothing with an .app).
+                .environment(\.openURL, OpenURLAction { url in
+                    guard url.pathExtension == "app" else { return .systemAction }
+                    NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+                    return .handled
+                })
         }
     }
 }
