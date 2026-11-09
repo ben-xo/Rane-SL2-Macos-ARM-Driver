@@ -974,33 +974,67 @@ static void dp_write(const float *buf, UInt32 frames, uint64_t pos) {
  * Level meters ('sl2m', for the control panel)
  *
  * The peak absolute sample level (0..1) on each input and output channel since the meters were last
- * read: inputs as captured, outputs as sent to the box (after the volume). Reading the property
- * returns them and starts the next peak. They are measured only while some client has read them in
- * the last METER_IDLE_MS, so they cost nothing when no meter is shown. One set is kept, so two
- * clients reading at once would split the peaks between them.
+ * read: inputs as captured, outputs as sent to the box (after the volume). Each client process has
+ * its own set (up to METER_READERS), so two readers (the control panel and the meters tool, say) each
+ * see every peak. Reading the property returns the caller's peaks and starts its next ones. They are
+ * measured only while some client has read them in the last METER_IDLE_MS, so they cost nothing when
+ * no meter is shown.
  * ============================================================================ */
 #define METER_IDLE_MS 1000
-static _Atomic float    g_meter_peak[2 * NCH];   /* [0..NCH) inputs, [NCH..2*NCH) outputs */
-static _Atomic uint64_t g_meter_last_read;       /* host time of the last read; 0 = never */
+#define METER_READERS 4
+typedef struct {
+    pid_t            pid;               /* the reader; set under g_meter_mtx */
+    _Atomic uint64_t last_read;         /* host time of its last read; 0 = slot free */
+    _Atomic float    peak[2 * NCH];     /* [0..NCH) inputs, [NCH..2*NCH) outputs */
+} MeterReader;
+static MeterReader g_meters[METER_READERS];
+static pthread_mutex_t g_meter_mtx = PTHREAD_MUTEX_INITIALIZER;   /* reads (property threads only) */
+
+static bool meter_slot_live(MeterReader *m, uint64_t now) {
+    uint64_t t = atomic_load_explicit(&m->last_read, memory_order_relaxed);
+    return t && (double)(now - t) < METER_IDLE_MS * ticks_per_ms();
+}
 
 static bool meter_active(void) {
-    uint64_t t = atomic_load_explicit(&g_meter_last_read, memory_order_relaxed);
-    return t && (double)(mach_absolute_time() - t) < METER_IDLE_MS * ticks_per_ms();
+    uint64_t now = mach_absolute_time();
+    for (int r = 0; r < METER_READERS; r++) if (meter_slot_live(&g_meters[r], now)) return true;
+    return false;
 }
 
-/* Raise channel i's peak to at least v (lock-free: the reader resets it concurrently). */
-static void meter_raise(int i, float v) {
-    float cur = atomic_load_explicit(&g_meter_peak[i], memory_order_relaxed);
-    while (v > cur && !atomic_compare_exchange_weak_explicit(&g_meter_peak[i], &cur, v,
-                                                             memory_order_relaxed, memory_order_relaxed)) {}
+/* Raise a peak to at least v (lock-free: its reader resets it concurrently). */
+static void meter_raise(_Atomic float *peak, float v) {
+    float cur = atomic_load_explicit(peak, memory_order_relaxed);
+    while (v > cur && !atomic_compare_exchange_weak_explicit(peak, &cur, v, memory_order_relaxed, memory_order_relaxed)) {}
 }
 
-/* The peaks of `frames` interleaved frames, into meters base..base+NCH-1. */
+/* The peaks of `frames` interleaved frames, into every live reader's meters base..base+NCH-1. */
 static void meter_frames(int base, const float *buf, UInt32 frames) {
     float pk[NCH] = { 0 };
     for (UInt32 f = 0; f < frames; f++)
         for (int c = 0; c < NCH; c++) pk[c] = fmaxf(pk[c], fabsf(buf[f * NCH + c]));
-    for (int c = 0; c < NCH; c++) meter_raise(base + c, pk[c]);
+    uint64_t now = mach_absolute_time();
+    for (int r = 0; r < METER_READERS; r++)
+        if (meter_slot_live(&g_meters[r], now))
+            for (int c = 0; c < NCH; c++) meter_raise(&g_meters[r].peak[base + c], pk[c]);
+}
+
+/* A reader's peaks since its last read, reset as they are taken. A new reader takes a free slot, or
+   the one read longest ago, and starts from silence. */
+static void meter_take(pid_t pid, Float32 out[2 * NCH]) {
+    pthread_mutex_lock(&g_meter_mtx);
+    MeterReader *m = NULL;
+    for (int r = 0; r < METER_READERS && !m; r++)
+        if (g_meters[r].pid == pid && atomic_load(&g_meters[r].last_read)) m = &g_meters[r];
+    if (!m) {
+        m = &g_meters[0];
+        for (int r = 1; r < METER_READERS; r++)
+            if (atomic_load(&g_meters[r].last_read) < atomic_load(&m->last_read)) m = &g_meters[r];
+        m->pid = pid;
+        for (int i = 0; i < 2 * NCH; i++) atomic_store(&m->peak[i], 0.0f);
+    }
+    for (int i = 0; i < 2 * NCH; i++) out[i] = atomic_exchange_explicit(&m->peak[i], 0.0f, memory_order_relaxed);
+    atomic_store_explicit(&m->last_read, mach_absolute_time(), memory_order_relaxed);
+    pthread_mutex_unlock(&g_meter_mtx);
 }
 
 /* ============================================================================
@@ -1132,9 +1166,11 @@ static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *
         }
     }
 
-    /* The input meters, if shown: the frames just placed (the ring may wrap within them). */
+    /* The input meters, if shown: the frames just placed (the ring may wrap within them). After a
+       long gap the silence fill can be many times the ring, so take at most the newest ring's worth. */
     if (meter_active()) {
-        for (uint64_t left = got, at = ring_pos & RING_MASK; left > 0; ) {
+        uint64_t span = got < RING_FRAMES ? got : RING_FRAMES;
+        for (uint64_t left = span, at = (ring_pos + got - span) & RING_MASK; left > 0; ) {
             uint64_t run = RING_FRAMES - at < left ? RING_FRAMES - at : left;
             meter_frames(0, &g_in_ring[at * NCH], (UInt32)run);
             left -= run; at = 0;
@@ -2328,8 +2364,7 @@ static OSStatus get_property_data(AudioServerPlugInDriverRef d, AudioObjectID oi
                 /* The peaks since the last read, each reset as it is taken; reading also keeps the
                    meters running for another METER_IDLE_MS. */
                 Float32 v[2 * NCH];
-                for (int i = 0; i < 2 * NCH; i++) v[i] = atomic_exchange_explicit(&g_meter_peak[i], 0.0f, memory_order_relaxed);
-                atomic_store_explicit(&g_meter_last_read, mach_absolute_time(), memory_order_relaxed);
+                meter_take(pid, v);
                 *(CFDataRef*)outData = CFDataCreate(kCFAllocatorDefault, (const UInt8*)v, sizeof v);
                 *outSize = sizeof(CFDataRef);
                 return 0;
