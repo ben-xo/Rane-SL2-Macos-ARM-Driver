@@ -374,78 +374,95 @@ struct PanelView: View {
                 connected(box)
             }
         }
-        .frame(width: 440)
     }
+
+    /// One column of the connected view: a grouped form sized to its sections, so it never scrolls.
+    private func column<Content: View>(@ViewBuilder _ sections: () -> Content) -> some View {
+        Form { sections() }
+            .formStyle(.grouped)
+            .scrollDisabled(true)
+            .scrollIndicators(.never)
+            .frame(width: Self.columnWidth)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+    static let columnWidth: CGFloat = 440
 
     @ViewBuilder
     private func connected(_ box: BoxState) -> some View {
-        Form {
-            Section("Rane SL 2") {
-                LabeledContent("Status", value: box.streaming ? "Connected, streaming audio" : "Connected")
-                LabeledContent("Firmware", value: box.firmware)
-                LabeledContent("Serial number", value: box.serial)
-                LabeledContent("Driver", value: model.driverVersion ?? "—")
+        HStack(alignment: .top, spacing: 0) {
+            column { boxSections(box) }
+            column { levelSections(box) }
+        }
+    }
+
+    /// The left column: the box, its audio settings and the decks.
+    @ViewBuilder
+    private func boxSections(_ box: BoxState) -> some View {
+        Section("Rane SL 2") {
+            LabeledContent("Status", value: box.streaming ? "Connected, streaming audio" : "Connected")
+            LabeledContent("Firmware", value: box.firmware)
+            LabeledContent("Serial number", value: box.serial)
+            LabeledContent("Driver", value: model.driverVersion ?? "—")
+        }
+        Section {
+            Picker("Sample rate", selection: Binding(get: { box.sampleRate },
+                                                     set: { model.setSampleRate($0) })) {
+                Text("44.1 kHz").tag(44100)
+                Text("48 kHz").tag(48000)
             }
-            Section {
-                Picker("Sample rate", selection: Binding(get: { box.sampleRate },
-                                                         set: { model.setSampleRate($0) })) {
-                    Text("44.1 kHz").tag(44100)
-                    Text("48 kHz").tag(48000)
-                }
-                LabeledContent("Output latency", value: String(format: "%.1f ms", box.outputLatencyMs))
-                LabeledContent("Input latency", value: String(format: "%.1f ms", box.inputLatencyMs))
-            } header: {
-                Text("Audio")
-            } footer: {
-                Text("Latency as the driver reports it, not counting each app's own buffer (in Serato DJ: USB Buffer Size).")
-                    .foregroundStyle(.secondary)
+            LabeledContent("Output latency", value: String(format: "%.1f ms", box.outputLatencyMs))
+            LabeledContent("Input latency", value: String(format: "%.1f ms", box.inputLatencyMs))
+        } header: {
+            Text("Audio")
+        } footer: {
+            Text("Latency as the driver reports it, not counting each app's own buffer (in Serato DJ: USB Buffer Size).")
+                .foregroundStyle(.secondary)
+        }
+        Section {
+            ForEach(0..<2, id: \.self) { deck in
+                Toggle("Deck \(deck + 1) analogue thru", isOn: Binding(get: { box.thru[deck] },
+                                                                      set: { model.setThru(deck: deck, on: $0) }))
             }
-            Section {
-                ForEach(0..<2, id: \.self) { deck in
-                    Toggle("Deck \(deck + 1) analogue thru", isOn: Binding(get: { box.thru[deck] },
-                                                                          set: { model.setThru(deck: deck, on: $0) }))
-                }
-                LabeledContent("Input", value: box.phono ? "Phono" : "Line")
-            } header: {
-                Text("Decks")
-            } footer: {
-                Text("Thru sends a deck's input straight to its outputs. An app playing through the SL 2 switches both decks to USB when it starts, and back to thru when it stops. Phono / Line is the switch on the box.")
-                    .foregroundStyle(.secondary)
-            }
-            Section {
-                LabeledContent("Left deck") { StereoMeter(left: meters.levels[0], right: meters.levels[1]) }
-                LabeledContent("Right deck") { StereoMeter(left: meters.levels[2], right: meters.levels[3]) }
-            } header: {
-                Text("Inputs")
-            } footer: {
-                Text("The level of each deck's input, left and right, while an app is using the SL 2. With nothing using it the decks are on thru, and the box sends the computer no audio.")
-                    .foregroundStyle(.secondary)
-            }
-            Section {
-                if let volume = box.volume {
-                    LabeledContent("Volume") {
-                        HStack {
-                            Slider(value: Binding(get: { volume }, set: { model.setVolume($0) }), in: 0...1)
-                            Text(volume <= 0 ? "Off" : String(format: "%.0f dB", box.volumeDb))
-                                .monospacedDigit()
-                                .frame(width: 52, alignment: .trailing)
-                        }
+            LabeledContent("Input", value: box.phono ? "Phono" : "Line")
+        } header: {
+            Text("Decks")
+        } footer: {
+            Text("Thru sends a deck's input straight to its outputs. An app playing through the SL 2 switches both decks to USB when it starts, and back to thru when it stops. Phono / Line is the switch on the box.")
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// The right column: the input and output levels, and the output volume.
+    @ViewBuilder
+    private func levelSections(_ box: BoxState) -> some View {
+        Section {
+            LabeledContent("Left deck") { StereoMeter(left: meters.levels[0], right: meters.levels[1]) }
+            LabeledContent("Right deck") { StereoMeter(left: meters.levels[2], right: meters.levels[3]) }
+        } header: {
+            Text("Inputs")
+        } footer: {
+            Text("The level of each deck's input, left and right, while an app is using the SL 2. With nothing using it the decks are on thru, and the box sends the computer no audio.")
+                .foregroundStyle(.secondary)
+        }
+        Section {
+            if let volume = box.volume {
+                LabeledContent("Volume") {
+                    HStack {
+                        Slider(value: Binding(get: { volume }, set: { model.setVolume($0) }), in: 0...1)
+                        Text(volume <= 0 ? "Off" : String(format: "%.0f dB", box.volumeDb))
+                            .monospacedDigit()
+                            .frame(width: 52, alignment: .trailing)
                     }
                 }
-                LabeledContent("Left deck") { StereoMeter(left: meters.levels[4], right: meters.levels[5]) }
-                LabeledContent("Right deck") { StereoMeter(left: meters.levels[6], right: meters.levels[7]) }
-            } header: {
-                Text("Outputs")
-            } footer: {
-                Text("The volume applies to everything the SL 2 plays, Serato's decks included, like the volume keys. Set each output channel's own volume in Audio MIDI Setup.")
-                    .foregroundStyle(.secondary)
             }
+            LabeledContent("Left deck") { StereoMeter(left: meters.levels[4], right: meters.levels[5]) }
+            LabeledContent("Right deck") { StereoMeter(left: meters.levels[6], right: meters.levels[7]) }
+        } header: {
+            Text("Outputs")
+        } footer: {
+            Text("The volume applies to everything the SL 2 plays, Serato's decks included, like the volume keys. Set each output channel's own volume in Audio MIDI Setup.")
+                .foregroundStyle(.secondary)
         }
-        .formStyle(.grouped)
-        // The window is sized to the whole form, so it never needs to scroll.
-        .scrollDisabled(true)
-        .scrollIndicators(.never)
-        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -458,6 +475,7 @@ struct Message: View {
             Text(text).multilineTextAlignment(.center).foregroundStyle(.secondary)
         }
         .padding(32)
+        .frame(width: PanelView.columnWidth)
     }
 }
 
