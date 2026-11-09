@@ -7,7 +7,7 @@
 #      sample-rate switching;
 #   2. with --loopback (a cable from Left Deck Out L to Left Deck In L; the tests play clicks and a
 #      loud tone into that output, so pass it only when the cable is in): restarts, a glitch test,
-#      48 kHz, and in a debug build (make plugin DEBUG=1) the glitch test under load and the fault
+#      48 kHz, the output volume and mute, and in a debug build (make plugin DEBUG=1) the glitch test under load and the fault
 #      hooks;
 #   3. unless --no-physical: steps for a person at the box (flip the LINE/PHONO switch, unplug and
 #      replug while idle and while a stream runs). The script prints what to do and waits until it
@@ -66,13 +66,47 @@ driver_log_since() {   # <start time> <grep pattern>: the driver's log lines sin
 }
 now() { date '+%Y-%m-%d %H:%M:%S'; }
 
+# The user's output volume (the main volume and each channel's) and mute, saved before a test
+# changes them and put back afterwards (by a trap if the script is interrupted). save_volume fails if
+# the driver has no volume controls.
+save_volume() {
+    local v
+    v=$("$B/volctl" "$DEV") || return 1
+    SAVED_DB=$(echo "$v" | sed -nE 's/^volume (-?[0-9.e+-]+) dB.*/\1/p')
+    SAVED_CH=$(echo "$v" | sed -nE 's/.*, channels (.*) dB, mute [01]$/\1/p')
+    SAVED_MUTE=$(echo "$v" | sed -nE 's/.*mute ([01])$/\1/p')
+    [ -n "$SAVED_DB" ] && [ -n "$SAVED_MUTE" ] || return 1
+    trap 'restore_volume' EXIT
+    trap 'exit 130' INT TERM
+}
+neutral_volume() {   # the main volume and every channel at 0 dB, unmuted
+    local ch
+    "$B/volctl" "$DEV" unmute >/dev/null; "$B/volctl" "$DEV" 0 >/dev/null
+    for ch in 1 2 3 4; do "$B/volctl" "$DEV" 0 $ch >/dev/null; done
+}
+restore_volume() {
+    trap - EXIT INT TERM
+    [ -n "${SAVED_DB:-}" ] || return 0   # nothing was saved
+    local m=unmute ch=0 db ok=1
+    [ "$SAVED_MUTE" = 1 ] && m=mute
+    "$B/volctl" "$DEV" "$SAVED_DB" >/dev/null || ok=0
+    for db in $SAVED_CH; do
+        ch=$((ch + 1))
+        "$B/volctl" "$DEV" "$db" $ch >/dev/null || ok=0
+    done
+    "$B/volctl" "$DEV" $m >/dev/null || ok=0
+    [ $ok = 1 ] || echo "      could not put the output volume back ($SAVED_DB dB, channels $SAVED_CH dB, mute $SAVED_MUTE): set it by hand"
+    SAVED_DB=
+    [ $ok = 1 ]
+}
+
 both_thru() { [ "$(status | grep -c 'Mode: ANALOG THRU')" = 2 ]; }
 input_is() { field 'Deck 1 Input' | grep -q "^$1"; }
 
 # ---------------------------------------------------------------------------- 0. preconditions
 
 echo "SL 2 hardware tests, $(date)"
-for tool in "$PANEL" "$APITEST" "$B/rtlat" "$B/sinetest" "$B/setrate" "$B/sl2dbg" "$B/chrec"; do
+for tool in "$PANEL" "$APITEST" "$B/rtlat" "$B/sinetest" "$B/setrate" "$B/sl2dbg" "$B/chrec" "$B/volctl"; do
     [ -x "$tool" ] || { echo "missing $tool: run make hwtest (it builds the tools)"; exit 2; }
 done
 if ! connected; then
@@ -121,7 +155,7 @@ echo
 
 echo "== 2. loopback cable"
 if [ $LOOPBACK = 0 ]; then
-    for t in "restarts" "glitch test, 30 s" "glitch test idle + loaded (dptest)" "48 kHz" "fault hook: USB stall" "fault hook: errored capture packets"; do
+    for t in "restarts" "glitch test, 30 s" "glitch test idle + loaded (dptest)" "48 kHz" "output volume and mute" "fault hook: USB stall" "fault hook: errored capture packets"; do
         record SKIP "$t" "no --loopback"
     done
 else
@@ -130,6 +164,10 @@ else
         echo "   >>> Set the LINE/PHONO switch on the box to LINE."
         wait_until "the switch on LINE" input_is LINE
     fi
+
+    # Every test here plays at full level: the user's output volume and mute are saved, set to 0 dB
+    # and unmuted for the section, and put back at its end (by a trap if the script is interrupted).
+    if save_volume; then have_volume=1; neutral_volume; else have_volume=0; fi
 
     # Three streams in a row, each starting cleanly and finding all its clicks.
     if "$ROOT/tools/latency/restartcheck.sh" > /dev/null 2>&1; then record PASS "restarts"
@@ -156,6 +194,39 @@ else
         record PASS "48 kHz" "$(echo "$lat" | grep -oE 'DVS round trip est\. [0-9.]+ ms')"
     else
         record FAIL "48 kHz" "$lat / $sine"
+    fi
+
+    # Output volume. With everything at 0 dB every click is found at full level; channel 1 at -20 dB
+    # brings them down 20 dB; channel 2 at -20 dB leaves channel 1 alone; the virtual main volume (the
+    # volume keys) at the scalar for -20 dB sets the main volume to -20 dB, leaving the channels'
+    # own levels, and brings the clicks down 20 dB; mute silences them. (rtlat reads quieter clicks a
+    # frame or two later: it finds a click at a fixed threshold, which the converters' pre-ringing
+    # crosses sooner on a loud click. So only levels are checked here; the restart test above covers
+    # the round trip.)
+    if [ $have_volume = 1 ]; then
+        peak() { grep -oE 'peak [0-9.]+' | tail -1 | grep -oE '[0-9.]+$'; }
+        db() { awk -v r="$1" -v a="$2" 'BEGIN { if (r > 0 && a > 0) printf "%.1f", 20 * log(a / r) / log(10); else print "none" }'; }
+        full=$("$B/rtlat" "$DEV" 1 1 3 128); ref=$(echo "$full" | peak)
+        "$B/volctl" "$DEV" -20 1 >/dev/null
+        ch1=$(db "$ref" "$("$B/rtlat" "$DEV" 1 1 3 128 | peak)")
+        "$B/volctl" "$DEV" 0 1 >/dev/null; "$B/volctl" "$DEV" -20 2 >/dev/null
+        ch2=$(db "$ref" "$("$B/rtlat" "$DEV" 1 1 3 128 | peak)")
+        "$B/volctl" "$DEV" 0 2 >/dev/null
+        keys=$("$B/volctl" "$DEV" main 0.6875)
+        main=$(db "$ref" "$("$B/rtlat" "$DEV" 1 1 3 128 | peak)")
+        "$B/volctl" "$DEV" 0 >/dev/null; "$B/volctl" "$DEV" mute >/dev/null
+        muted=$("$B/rtlat" "$DEV" 1 1 3 128 | grep -c 'not found')
+        neutral_volume
+        detail="channel 1 at -20 dB: $ch1 dB; channel 2 at -20 dB: channel 1 $ch2 dB; volume keys: $main dB ($keys); muted: $muted/3 clicks gone"
+        if echo "$full" | grep -q '(3/3 clicks)' && [ "$muted" = 3 ] &&
+           awk -v a="$ch1" -v b="$ch2" -v c="$main" 'BEGIN { exit !(a > -21 && a < -19 && b > -0.5 && b < 0.5 && c > -21 && c < -19) }' &&
+           echo "$keys" | grep -qE '^volume -20(\.[0-9]*)? dB, channels 0 0 0 0 dB'; then
+            record PASS "output volume and mute" "$detail"
+        else
+            record FAIL "output volume and mute" "$detail"
+        fi
+    else
+        record FAIL "output volume and mute" "the driver has no output volume controls (volctl)"
     fi
 
     # The fault hooks (debug build), each injected 3 s into a 10 s glitch test: a 100 ms stall in USB
@@ -189,6 +260,7 @@ else
         record SKIP "fault hook: USB stall" "release build"
         record SKIP "fault hook: errored capture packets" "release build"
     fi
+    [ $have_volume = 1 ] && restore_volume
 fi
 echo
 
@@ -196,7 +268,7 @@ echo
 
 echo "== 3. steps at the box"
 if [ $PHYSICAL = 0 ]; then
-    for t in "LINE/PHONO switch reported" "unplug and replug, idle" "unplug and replug, mid-stream"; do
+    for t in "LINE/PHONO switch reported" "unplug and replug, idle" "volume and mute survive a replug" "unplug and replug, mid-stream"; do
         record SKIP "$t" "--no-physical"
     done
 else
@@ -213,18 +285,37 @@ else
     fi
 
     # Unplug and replug with nothing playing: the device goes, comes back, and puts both decks on
-    # analogue thru.
+    # analogue thru. The output volume, set to -20 dB (channels at 0 dB) and muted first, comes back
+    # the same. (That shows the settings survive a replug; it can't show who kept them, since the
+    # driver's own copy outlives the unplug too. The HAL restores a device's controls whenever it is
+    # published.) The user's own setting is put back afterwards.
+    if save_volume; then
+        have_volume=1
+        neutral_volume; "$B/volctl" "$DEV" -20 >/dev/null; "$B/volctl" "$DEV" mute >/dev/null
+    else
+        have_volume=0
+    fi
     echo "   >>> Unplug the SL 2's USB cable."
     if wait_until "the box to go" not connected; then
         echo "   >>> Plug it back in."
         if wait_until "the box to return" connected && wait_until "both decks on thru" both_thru; then
             record PASS "unplug and replug, idle"
+            if [ $have_volume = 1 ]; then
+                vol=$("$B/volctl" "$DEV")
+                [ "$vol" = "volume -20 dB, channels 0 0 0 0 dB, mute 1" ] && record PASS "volume and mute survive a replug" \
+                    || record FAIL "volume and mute survive a replug" "$vol"
+            else
+                record SKIP "volume and mute survive a replug" "the driver has no output volume controls"
+            fi
         else
             record FAIL "unplug and replug, idle"
+            record SKIP "volume and mute survive a replug" "the box did not come back"
         fi
     else
         record FAIL "unplug and replug, idle" "unplug not seen"
+        record SKIP "volume and mute survive a replug" "unplug not seen"
     fi
+    [ $have_volume = 1 ] && restore_volume
 
     # Unplug while a stream runs (a silent, input-only one) and replug: coreaudiod survives, the
     # driver ends the stream cleanly, and a new stream starts after the replug.

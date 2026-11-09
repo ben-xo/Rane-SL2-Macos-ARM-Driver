@@ -37,7 +37,8 @@ fewest physical steps:
 1. with only the box attached: the driver's status, SL2Api as Serato DJ Pro 2.5.5 calls it (`sl2apitest`,
    both slices), and sample-rate switching;
 2. with `ARGS="--loopback"`, which says the loopback cable is in (the tests play clicks and a loud tone
-   into Left Deck Out): `restartcheck.sh`, a 30 s glitch test, 48 kHz, and with a debug build `dptest.sh`
+   into Left Deck Out): `restartcheck.sh`, a 30 s glitch test, 48 kHz, the output volume and mute
+   (it puts your volume and mute back afterwards), and with a debug build `dptest.sh`
    and the `sl2dbg` fault hooks (a USB stall, errored capture packets);
 3. steps for someone at the box: flipping the LINE/PHONO switch, and unplugging and replugging while idle
    and while a (silent) stream runs. The script prints each step and waits until it sees the change, so
@@ -60,6 +61,7 @@ need the debug build's counters and hooks; run it again with a debug build to co
 | `envelope.py <wav>` | Peak level of a `chrec` recording in 100 ms windows | — |
 | `bin/devprobe <device>` | Dumps the HAL properties that output-device pickers check | — |
 | `bin/setrate <device> [rate]` | Prints or sets a device's sample rate | — |
+| `bin/volctl <device> [get \| <dB> [channel] \| main <0..1> \| mute \| unmute]` | Prints or sets a device's output volume and mute through the properties Audio MIDI Setup uses: `<dB>` sets the main volume, or with a channel number that channel's; `main` sets the virtual main volume the way the volume keys do. Note that `rtlat` reads quieter clicks one to three frames later (its fixed threshold catches the converters' pre-ringing sooner on a loud click), so compare latency at the same click level | — |
 | `ratetest.sh <device> <rate> <back>` | Speaks a sentence on the device and switches its rate mid-sentence | speech continues at the right pitch |
 | `logq.sh [minutes] [lines]` | The driver's log, with coreaudiod's and Audio MIDI Setup's relevant lines | — |
 
