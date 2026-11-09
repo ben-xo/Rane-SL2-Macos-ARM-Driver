@@ -220,20 +220,52 @@ enum PanelState: Equatable {
     case connected(BoxState)
 }
 
+/// A repeating timer on the main run loop in its common modes, so it keeps firing while a control is
+/// being dragged (event tracking), which a timer in the default mode does not.
+@MainActor
+func repeatingTimer(every interval: TimeInterval, _ body: @escaping @MainActor () -> Void) -> Timer {
+    let timer = Timer(timeInterval: interval, repeats: true) { _ in Task { @MainActor in body() } }
+    RunLoop.main.add(timer, forMode: .common)
+    return timer
+}
+
 @MainActor
 final class PanelModel: ObservableObject {
     @Published var state: PanelState = .noBox
     @Published var driverVersion: String?
     private var timer: Timer?
     private var device: AudioObjectID?
+    /// The device whose volume and mute changes we are told of, and the listener that hears them.
+    private var watched: AudioObjectID?
+    private lazy var volumeListener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+        Task { @MainActor in self?.refresh() }
+    }
+    private static let watchedProperties = [kAudioDevicePropertyVolumeScalar, kAudioDevicePropertyMute].map {
+        SL2Driver.address($0, kAudioObjectPropertyScopeOutput)
+    }
 
     init() {
         refresh()
         // The status changes from outside the app (the box's switch, other apps, plugging in):
-        // read it twice a second.
-        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
+        // read it twice a second. The volume and mute are followed as they change (watch).
+        timer = repeatingTimer(every: 0.5) { [weak self] in self?.refresh() }
+    }
+
+    /// Be told when the device's main volume or mute changes (the menu bar, the volume keys, Audio
+    /// MIDI Setup), so the slider follows at once rather than at the next status read.
+    private func watch(_ dev: AudioObjectID?) {
+        guard dev != watched else { return }
+        if let old = watched {
+            for var addr in Self.watchedProperties {
+                AudioObjectRemovePropertyListenerBlock(old, &addr, DispatchQueue.main, volumeListener)
+            }
         }
+        if let new = dev {
+            for var addr in Self.watchedProperties {
+                AudioObjectAddPropertyListenerBlock(new, &addr, DispatchQueue.main, volumeListener)
+            }
+        }
+        watched = dev
     }
 
     func refresh() {
@@ -241,10 +273,12 @@ final class PanelModel: ObservableObject {
         // No driver device: either no box, or no driver to list one.
         guard let dev = SL2Driver.device(), let s = SL2Driver.status(dev) else {
             device = nil
+            watch(nil)
             state = SL2Driver.pluginLoaded() ? .noBox : .driverMissing
             return
         }
         device = dev
+        watch(dev)
         if s.boot_mode != 0 { state = .bootloader; return }
         if s.connected == 0 { state = .noBox; return }
         // Connected: collect what the panel shows.
@@ -315,9 +349,7 @@ final class MeterModel: ObservableObject {
     private var ticks = 0
 
     init() {
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / Self.ticksPerSecond, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.tick() }
-        }
+        timer = repeatingTimer(every: 1.0 / Self.ticksPerSecond) { [weak self] in self?.tick() }
     }
 
     private func tick() {
