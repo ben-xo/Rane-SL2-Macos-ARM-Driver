@@ -23,10 +23,11 @@ The log lines the scripts look for are the SL 2 driver's, so they need adapting 
    the tools send clicks and a loud tone into it.
 3. Set the box's LINE/PHONO switch to **LINE**. A line-level signal into the phono preamp clips, and the
    glitch test then reports a glitch at its first analysed sample.
-4. Install the driver build under test: `make plugin && sudo tools/install-sl2.sh` (add `DEBUG=1` for the
-   driver's counters and `sl2dbg`). The script replaces the binary inside the installed driver, so the
-   release package (`Installer/RaneSL2-macOS-Universal.pkg`) must be installed first. `--api` also installs
-   a built SL2Api (`make api`), saving the previous one; `--restore-api` puts that back.
+4. Install the driver build under test: `make install` (add `DEBUG=1` for the driver's counters and
+   `sl2dbg`), which builds it and runs `sudo tools/install-sl2.sh`. The script replaces the binary inside
+   the installed driver, so the release package (`Installer/RaneSL2-macOS-Universal.pkg`) must be
+   installed first. Run the script directly for its other options: `--api` also installs a built SL2Api
+   (`make api`), saving the previous one; `--restore-api` puts that back.
 
 ## Running everything
 

@@ -7,8 +7,8 @@
 #      sample-rate switching;
 #   2. with --loopback (a cable from Left Deck Out L to Left Deck In L; the tests play clicks and a
 #      loud tone into that output, so pass it only when the cable is in): restarts, a glitch test,
-#      48 kHz, and in a debug build (make plugin DEBUG=1) the glitch test under load and the fault
-#      hooks;
+#      48 kHz, and in a debug build (installed with make install DEBUG=1) the glitch test under load
+#      and the fault hooks;
 #   3. unless --no-physical: steps for a person at the box (flip the LINE/PHONO switch, unplug and
 #      replug while idle and while a stream runs). The script prints what to do and waits until it
 #      sees the change, so nothing needs typing.
@@ -83,6 +83,7 @@ fi
 # A debug build accepts the driver's debug commands; errpkts 0 changes nothing.
 if "$B/sl2dbg" errpkts 0 >/dev/null 2>&1; then BUILD=debug; else BUILD=release; fi
 echo "driver: $BUILD build; firmware $(field 'Firmware Ver'); serial $(field 'Serial Number')"
+[ $BUILD = release ] && echo "(the debug-only tests will be skipped: make install DEBUG=1 installs a debug build)"
 echo
 
 # ---------------------------------------------------------------------------- 1. the box only
@@ -144,7 +145,7 @@ else
         if "$ROOT/tools/latency/dptest.sh" 30 > /dev/null 2>&1; then record PASS "glitch test idle + loaded (dptest)"
         else record FAIL "glitch test idle + loaded (dptest)" "run tools/latency/dptest.sh 30"; fi
     else
-        record SKIP "glitch test idle + loaded (dptest)" "release build"
+        record SKIP "glitch test idle + loaded (dptest)" "release build (make install DEBUG=1)"
     fi
 
     # 48 kHz: every click found, and a clean 10 s glitch test.
@@ -186,8 +187,8 @@ else
             fi
         done
     else
-        record SKIP "fault hook: USB stall" "release build"
-        record SKIP "fault hook: errored capture packets" "release build"
+        record SKIP "fault hook: USB stall" "release build (make install DEBUG=1)"
+        record SKIP "fault hook: errored capture packets" "release build (make install DEBUG=1)"
     fi
 fi
 echo

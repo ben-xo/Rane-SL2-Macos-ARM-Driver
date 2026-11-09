@@ -2,13 +2,19 @@ CC = clang
 ARCH = -arch arm64 -arch x86_64
 CFLAGS = -fobjc-arc -O2
 # make plugin DEBUG=1 builds the driver with its streaming diagnostics and its debug commands
-# (tools/latency/bin/sl2dbg: input safety offset, test hooks)
+# (tools/latency/bin/sl2dbg: input safety offset, test hooks); make install DEBUG=1 also installs it
 PLUGIN_DEFS = $(if $(DEBUG),-DSL2_DEBUG=1)
 
 all: plugin api panel dump flash
 
 plugin:
 	$(CC) $(ARCH) -bundle $(CFLAGS) $(PLUGIN_DEFS) -framework Foundation -framework CoreAudio -framework IOKit -framework IOUSBHost plugin/SL2Device.m -o SL2Device
+
+# build the driver and install it into the installed driver bundle, then restart coreaudiod
+# (tools/install-sl2.sh; asks for your password). The release package must be installed first.
+# make install DEBUG=1 installs a debug build; make install puts a release build back.
+install: plugin
+	sudo tools/install-sl2.sh
 
 api:
 	$(CC) $(ARCH) -dynamiclib $(CFLAGS) -install_name /Library/Frameworks/SL2Api.framework/Versions/A/SL2Api -current_version 1.1.0 -compatibility_version 1.0.0 -framework Foundation -framework CoreAudio -framework IOKit tools/SL2Api.m -o SL2Api
@@ -34,7 +40,8 @@ tools/latency/bin/%: tools/latency/%.c tools/latency/common.h
 	@mkdir -p tools/latency/bin
 	$(CC) -O2 -framework CoreAudio -framework CoreFoundation $< -o $@
 
-# the hardware tests in one run (tools/hwtest.sh), on the installed driver with a box attached:
+# the hardware tests in one run (tools/hwtest.sh), on the installed driver with a box attached
+# (install a debug build first, make install DEBUG=1, to also run the debug-only tests):
 #   make hwtest ARGS="--loopback"   with the loopback cable in; add --no-physical to skip the steps
 #                                   that need someone at the box (switch, unplug and replug)
 hwtest: panel apitest latency
@@ -44,4 +51,4 @@ clean:
 	rm -f SL2Device SL2Api sl2panel sl2dump sl2flash sl2apitest
 	rm -rf tools/latency/bin
 
-.PHONY: all plugin api panel dump flash apitest latency hwtest clean
+.PHONY: all plugin install api panel dump flash apitest latency hwtest clean

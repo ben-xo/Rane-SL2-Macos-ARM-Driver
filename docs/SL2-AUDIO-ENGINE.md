@@ -7,7 +7,7 @@ cause, fix and a way to test for it again. The catalogue is written to guide the
 SL 4 drivers, which share much of this architecture.
 
 > **Fixing a playback or capture bug? Start here.**
-> 1. Build and install a debug driver: `make plugin DEBUG=1 && sudo tools/install-sl2.sh`, and the test tools:
+> 1. Build and install a debug driver: `make install DEBUG=1`, and the test tools:
 >    `make latency`.
 > 2. Connect a loopback cable from Left Deck Out L to Left Deck In L, with the LINE/PHONO switch on **LINE**
 >    (`tools/latency/README.md`).
@@ -530,9 +530,10 @@ what each tool does and the expected results. The main ones:
 | `restartcheck.sh` | Three streams in a row; each must start cleanly and find its clicks; PASS/FAIL |
 | `sl2dbg` | Debug build only: input safety offset, stall the USB queue, error capture packets |
 
-`tools/install-sl2.sh` installs a build into the installed driver bundle (the release package must be
-installed first) and restarts coreaudiod and the processes that go stale. `--api` also installs a built
-SL2Api into `SL2Api.framework`, saving the previous one, which `--restore-api` puts back.
+`tools/install-sl2.sh` (run by `make install`) installs a build into the installed driver bundle (the
+release package must be installed first) and restarts coreaudiod and the processes that go stale.
+`--api` also installs a built SL2Api into `SL2Api.framework`, saving the previous one, which
+`--restore-api` puts back.
 
 **Debug build.** `make plugin DEBUG=1` defines `SL2_DEBUG`, which compiles in the streaming diagnostics
 (counters, the capture timing histogram, the WriteMix calling-pattern check) and the debug commands
