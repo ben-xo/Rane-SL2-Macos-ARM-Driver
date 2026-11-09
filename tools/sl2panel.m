@@ -26,6 +26,7 @@ typedef struct {
     uint64_t cap_frames;
     uint64_t play_frames;
     uint32_t boot_mode;      /* 1 = box is in its USB bootloader with no firmware loaded */
+    uint32_t debug_build;    /* 1 = the driver is a debug build; 0 also from a driver too old to say */
 } SL2StatusPacket;
 
 static AudioObjectID find_hal_device(void) {
@@ -110,6 +111,7 @@ static void print_status(AudioObjectID dev) {
     printf("  Rane SL 2 — Hardware & CoreAudio Status\n");
     printf("==================================================\n");
     printf("  USB Connected : %s\n", s.connected ? "YES" : "NO");
+    printf("  Driver Build  : %s\n", s.debug_build ? "DEBUG" : "release");
     if (s.boot_mode) {
         printf("  Firmware      : NOT LOADED — box is in USB bootloader mode\n");
         printf("                  the box needs its firmware restored\n");

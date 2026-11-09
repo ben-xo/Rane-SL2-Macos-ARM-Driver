@@ -68,6 +68,7 @@ typedef struct {
     uint64_t cap_frames;
     uint64_t play_frames;
     uint32_t boot_mode;
+    uint32_t debug_build;
 } SL2StatusPacket;
 
 /* Rane's API types */

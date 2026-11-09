@@ -97,6 +97,7 @@ typedef struct {
     uint64_t cap_frames;
     uint64_t play_frames;
     uint32_t boot_mode;      /* 1 = the box is in its USB bootloader; no audio until firmware is loaded */
+    uint32_t debug_build;    /* 1 = this driver was built with SL2_DEBUG (make plugin DEBUG=1) */
 } SL2StatusPacket;
 
 enum {
@@ -2355,6 +2356,7 @@ static OSStatus get_property_data(AudioServerPlugInDriverRef d, AudioObjectID oi
                 g_st.cap_frames = atomic_load(&g_total_cap_frames);
                 g_st.play_frames = atomic_load(&g_total_play_frames);
                 g_st.boot_mode = atomic_load(&g_boot_mode) ? 1 : 0;
+                g_st.debug_build = SL2_DEBUG ? 1 : 0;
                 pthread_mutex_unlock(&g_mutex);
                 *(CFDataRef*)outData = CFDataCreate(kCFAllocatorDefault, (const UInt8*)&g_st, sizeof(g_st));
                 *outSize = sizeof(CFDataRef);

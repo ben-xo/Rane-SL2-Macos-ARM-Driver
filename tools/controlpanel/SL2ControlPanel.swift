@@ -287,6 +287,9 @@ final class PanelModel: ObservableObject {
         }
         device = dev
         watch(dev)
+        // The bundle's version can't tell a debug build (make install DEBUG=1 replaces only the
+        // binary in it); the running driver says so in its status.
+        if s.debug_build != 0, let version = driverVersion { driverVersion = version + " (debug build)" }
         if s.boot_mode != 0 { state = .bootloader; return }
         if s.connected == 0 { state = .noBox; return }
         // Connected: collect what the panel shows.

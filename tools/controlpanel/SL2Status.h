@@ -18,4 +18,5 @@ typedef struct {
     uint64_t cap_frames;
     uint64_t play_frames;
     uint32_t boot_mode;      /* 1 = the box is in its USB bootloader: no firmware loaded */
+    uint32_t debug_build;    /* 1 = the driver is a debug build (make install DEBUG=1) */
 } SL2StatusPacket;
