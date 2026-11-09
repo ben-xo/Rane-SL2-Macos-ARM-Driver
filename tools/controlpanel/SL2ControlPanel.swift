@@ -413,6 +413,9 @@ struct PanelView: View {
             .fixedSize(horizontal: false, vertical: true)
     }
     static let columnWidth: CGFloat = 440
+    /// The decks as the box marks them: the left deck is channels 1/2 (the firmware's deck 1, thru note
+    /// 0x5C), the right deck channels 3/4 (deck 2, 0x5D), for inputs and outputs alike.
+    static let deckNames = ["Left deck (1/2)", "Right deck (3/4)"]
 
     @ViewBuilder
     private func connected(_ box: BoxState) -> some View {
@@ -447,7 +450,7 @@ struct PanelView: View {
         }
         Section {
             ForEach(0..<2, id: \.self) { deck in
-                Toggle("Deck \(deck + 1) analogue thru", isOn: Binding(get: { box.thru[deck] },
+                Toggle("\(Self.deckNames[deck]) analogue thru", isOn: Binding(get: { box.thru[deck] },
                                                                       set: { model.setThru(deck: deck, on: $0) }))
             }
             LabeledContent("Input", value: box.phono ? "Phono" : "Line")
@@ -473,8 +476,8 @@ struct PanelView: View {
     @ViewBuilder
     private func levelSections(_ box: BoxState) -> some View {
         Section {
-            LabeledContent("Left deck") { StereoMeter(left: meters.levels[0], right: meters.levels[1]) }
-            LabeledContent("Right deck") { StereoMeter(left: meters.levels[2], right: meters.levels[3]) }
+            LabeledContent(Self.deckNames[0]) { StereoMeter(left: meters.levels[0], right: meters.levels[1]) }
+            LabeledContent(Self.deckNames[1]) { StereoMeter(left: meters.levels[2], right: meters.levels[3]) }
         } header: {
             Text("Inputs")
         } footer: {
@@ -495,8 +498,8 @@ struct PanelView: View {
             if let muted = box.muted {
                 Toggle("Mute", isOn: Binding(get: { muted }, set: { model.setMuted($0) }))
             }
-            LabeledContent("Left deck") { StereoMeter(left: meters.levels[4], right: meters.levels[5]) }
-            LabeledContent("Right deck") { StereoMeter(left: meters.levels[6], right: meters.levels[7]) }
+            LabeledContent(Self.deckNames[0]) { StereoMeter(left: meters.levels[4], right: meters.levels[5]) }
+            LabeledContent(Self.deckNames[1]) { StereoMeter(left: meters.levels[6], right: meters.levels[7]) }
         } header: {
             Text("Outputs")
         } footer: {
