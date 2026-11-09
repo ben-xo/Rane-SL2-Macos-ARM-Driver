@@ -153,6 +153,23 @@ enum SL2Driver {
         AudioObjectSetPropertyData(dev, &addr, 0, nil, UInt32(MemoryLayout<Float32>.size), &value)
     }
 
+    /// The output mute, or nil if there is none.
+    static func muted(_ dev: AudioObjectID) -> Bool? {
+        var addr = address(kAudioDevicePropertyMute, kAudioObjectPropertyScopeOutput)
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        return AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &value) == noErr ? value != 0 : nil
+    }
+
+    static func setMuted(_ dev: AudioObjectID, _ muted: Bool) {
+        var addr = address(kAudioDevicePropertyMute, kAudioObjectPropertyScopeOutput)
+        var value: UInt32 = muted ? 1 : 0
+        AudioObjectSetPropertyData(dev, &addr, 0, nil, UInt32(MemoryLayout<UInt32>.size), &value)
+    }
+
+    /// Audio MIDI Setup, where each output channel's volume is set.
+    static let audioMIDISetup = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.audio.AudioMIDISetup")
+
     static func setSampleRate(_ dev: AudioObjectID, _ rate: Double) {
         var addr = address(kAudioDevicePropertyNominalSampleRate)
         var value = rate
@@ -193,6 +210,7 @@ struct BoxState: Equatable {
     var inputLatencyMs: Double
     var volume: Float?       // the main output volume as a slider position (0...1); nil if none
     var volumeDb: Float
+    var muted: Bool?         // the output mute; nil if none
 }
 
 enum PanelState: Equatable {
@@ -245,13 +263,22 @@ final class PanelModel: ObservableObject {
             outputLatencyMs: Double(SL2Driver.latencyFrames(dev, kAudioObjectPropertyScopeOutput)) * 1000 / rate,
             inputLatencyMs: Double(SL2Driver.latencyFrames(dev, kAudioObjectPropertyScopeInput)) * 1000 / rate,
             volume: volume?.scalar,
-            volumeDb: volume?.db ?? 0))
+            volumeDb: volume?.db ?? 0,
+            muted: SL2Driver.muted(dev)))
     }
 
     /// Set the main output volume (a slider position, 0...1); the menu bar and Audio MIDI Setup follow.
+    /// Any level above the minimum unmutes, as the macOS volume slider does.
     func setVolume(_ scalar: Float) {
         guard let dev = device else { return }
         SL2Driver.setVolume(dev, scalar)
+        if scalar > 0, SL2Driver.muted(dev) == true { SL2Driver.setMuted(dev, false) }
+        refresh()
+    }
+
+    func setMuted(_ muted: Bool) {
+        guard let dev = device else { return }
+        SL2Driver.setMuted(dev, muted)
         refresh()
     }
 
@@ -432,6 +459,16 @@ struct PanelView: View {
         }
     }
 
+    /// The Outputs footer, with "Audio MIDI Setup" a link that opens it (plain text if it can't be found).
+    private var outputsFooter: AttributedString {
+        var text = AttributedString("The volume applies to everything the SL 2 plays, Serato's decks included, like the volume keys. Set each output channel's own volume in ")
+        var app = AttributedString("Audio MIDI Setup")
+        if let url = SL2Driver.audioMIDISetup { app.link = url }
+        text.append(app)
+        text.append(AttributedString("."))
+        return text
+    }
+
     /// The right column: the input and output levels, and the output volume.
     @ViewBuilder
     private func levelSections(_ box: BoxState) -> some View {
@@ -449,18 +486,21 @@ struct PanelView: View {
                 LabeledContent("Volume") {
                     HStack {
                         Slider(value: Binding(get: { volume }, set: { model.setVolume($0) }), in: 0...1)
-                        Text(volume <= 0 ? "Off" : String(format: "%.0f dB", box.volumeDb))
+                        Text(box.muted == true ? "Muted" : volume <= 0 ? "Off" : String(format: "%.0f dB", box.volumeDb))
                             .monospacedDigit()
                             .frame(width: 52, alignment: .trailing)
                     }
                 }
+            }
+            if let muted = box.muted {
+                Toggle("Mute", isOn: Binding(get: { muted }, set: { model.setMuted($0) }))
             }
             LabeledContent("Left deck") { StereoMeter(left: meters.levels[4], right: meters.levels[5]) }
             LabeledContent("Right deck") { StereoMeter(left: meters.levels[6], right: meters.levels[7]) }
         } header: {
             Text("Outputs")
         } footer: {
-            Text("The volume applies to everything the SL 2 plays, Serato's decks included, like the volume keys. Set each output channel's own volume in Audio MIDI Setup.")
+            Text(outputsFooter)
                 .foregroundStyle(.secondary)
         }
     }
