@@ -210,7 +210,10 @@ audio gets no level from the host: after configuring it, the firmware only ever 
 word, when the LINE/PHONO switch moves. Rane's own driver had none either; its volume hooks were empty.
 So the driver scales the samples itself: a master **Output Volume** and **Output Mute**, which the
 menu-bar slider and the volume keys use, and a **volume for each output channel**, shown per channel
-in Audio MIDI Setup. All run from −64 to 0 dB, linear in dB along the slider, with the bottom silent.
+in Audio MIDI Setup. All run from −64 to 0 dB, with the bottom silent. The slider follows CoreAudio's
+standard volume curve (its "2 over 1" transfer function: the slider position is the square of the
+level's position in the dB range), as the Mac's built-in output and Apple-driven USB interfaces do, so
+half-way is about −19 dB and each volume-key step is about 2 dB near the top and 3 dB around the middle.
 A channel's gain is the master's times its own. The master is needed: without one, the HAL's virtual
 main volume (the volume keys) moves only the preferred stereo pair, channels 1–2, because the four
 channels are discrete rather than a speaker layout it could follow, so the keys would turn down one

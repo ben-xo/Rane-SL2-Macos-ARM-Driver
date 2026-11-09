@@ -198,8 +198,9 @@ else
 
     # Output volume. With everything at 0 dB every click is found at full level; channel 1 at -20 dB
     # brings them down 20 dB; channel 2 at -20 dB leaves channel 1 alone; the virtual main volume (the
-    # volume keys) at the scalar for -20 dB sets the main volume to -20 dB, leaving the channels'
-    # own levels, and brings the clicks down 20 dB; mute silences them. (rtlat reads quieter clicks a
+    # volume keys) at the slider position for -20 dB (0.6875 squared, by CoreAudio's standard volume
+    # curve) sets the main volume to -20 dB, leaving the channels' own levels, and brings the clicks
+    # down 20 dB; mute silences them. (rtlat reads quieter clicks a
     # frame or two later: it finds a click at a fixed threshold, which the converters' pre-ringing
     # crosses sooner on a loud click. So only levels are checked here; the restart test above covers
     # the round trip.)
@@ -212,7 +213,7 @@ else
         "$B/volctl" "$DEV" 0 1 >/dev/null; "$B/volctl" "$DEV" -20 2 >/dev/null
         ch2=$(db "$ref" "$("$B/rtlat" "$DEV" 1 1 3 128 | peak)")
         "$B/volctl" "$DEV" 0 2 >/dev/null
-        keys=$("$B/volctl" "$DEV" main 0.6875)
+        keys=$("$B/volctl" "$DEV" main 0.47265625)
         main=$(db "$ref" "$("$B/rtlat" "$DEV" 1 1 3 128 | peak)")
         "$B/volctl" "$DEV" 0 >/dev/null; "$B/volctl" "$DEV" mute >/dev/null
         muted=$("$B/rtlat" "$DEV" 1 1 3 128 | grep -c 'not found')

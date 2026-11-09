@@ -1681,7 +1681,7 @@ static OSStatus SL2_AbortDeviceConfigurationChange(AudioServerPlugInDriverRef d,
  * memory, starting at 0 dB, unmuted; the HAL saves them per device and sets them again whenever the
  * device is published (after a replug or a restart of coreaudiod), as it does for any device.
  * ---------------------------------------------------------------------------- */
-#define VOL_MIN_DB      (-64.0f)   /* scalar 0 is silence; above that, dB is linear in the scalar */
+#define VOL_MIN_DB      (-64.0f)   /* scalar 0 is silence (see vol_scalar_to_db for the curve) */
 #define VOL_MAX_DB      0.0f
 #define VOL_RAMP_MS     5.0f       /* a full-scale change of gain (0 to 1) takes this long */
 
@@ -1709,14 +1709,19 @@ static int vol_index(AudioObjectID oid) {
 }
 static bool vol_is_control(AudioObjectID oid) { return oid == kObjMute || vol_index(oid) >= 0; }
 
+/* Slider position (the scalar, 0..1) and level, by CoreAudio's standard volume curve (its "2 over 1"
+   transfer function): the scalar is the square of the level's position in the dB range. The Mac's
+   built-in output and Apple-driven USB interfaces follow it, so the slider and the volume keys feel
+   the same here as there: half-way is about -19 dB, not half the dB range. */
 static float vol_scalar_to_db(float s) {
     if (s < 0) s = 0; else if (s > 1) s = 1;
-    return VOL_MIN_DB + s * (VOL_MAX_DB - VOL_MIN_DB);
+    return VOL_MIN_DB + sqrtf(s) * (VOL_MAX_DB - VOL_MIN_DB);
 }
 static float vol_db_to_scalar(float db) {
     if (db <= VOL_MIN_DB) return 0;
     if (db >= VOL_MAX_DB) return 1;
-    return (db - VOL_MIN_DB) / (VOL_MAX_DB - VOL_MIN_DB);
+    float x = (db - VOL_MIN_DB) / (VOL_MAX_DB - VOL_MIN_DB);
+    return x * x;
 }
 /* A level's linear gain; the bottom of the range is silence. */
 static float vol_db_to_gain(float db) { return db <= VOL_MIN_DB ? 0.0f : powf(10.0f, db / 20.0f); }
