@@ -75,10 +75,10 @@ enum {
     SL2_CMD_PORT_STATUS    = 0x45,   /* reply [5..6], always 00 00 on the SL 2 */
     SL2_REPORT_HIDI        = 0x40,   /* the box's only unsolicited report: [5] length, [6..] messages */
     SL2_REJECTED           = 0xFF,   /* reply to a command the box refuses */
-    SL2_NOTE_THRU_DECK1    = 0x5C,   /* Note On = analogue thru, Note Off = USB audio */
-    SL2_NOTE_THRU_DECK2    = 0x5D,
+    SL2_NOTE_THRU_DECK1    = 0x5C,   /* the left deck (1/2): Note On = analogue thru, Note Off = USB audio */
+    SL2_NOTE_THRU_DECK2    = 0x5D,   /* the right deck (3/4) */
     SL2_NOTE_PC7           = 0x60,   /* board input PC7 (not traced) */
-    SL2_NOTE_LINE_PHONO    = 0x61,   /* the one LINE/PHONO switch: On = phono (reported only) */
+    SL2_NOTE_CD_PHONO      = 0x61,   /* the one CD / Phono switch: On = phono (reported only) */
     /* Reports the driver makes itself (not from the box), queued for clients like the box's: */
     SL2_EVT_SAMPLE_RATE    = 0x4F,   /* [5..7] rate, big-endian */
 };
@@ -401,8 +401,8 @@ static void hid_read(void) {
                     int on = ((st & 0xF0) == 0x90) ? 1 : 0;
                     if (note == SL2_NOTE_THRU_DECK1 || note == SL2_NOTE_THRU_DECK2) {
                         g_st.thru[note - SL2_NOTE_THRU_DECK1] = on;
-                    } else if (note == SL2_NOTE_LINE_PHONO) {
-                        /* the box's one LINE/PHONO switch (firmware input PE0), shared by both decks */
+                    } else if (note == SL2_NOTE_CD_PHONO) {
+                        /* the box's one CD / Phono switch (firmware input PE0), shared by both decks */
                         g_st.phono[0] = g_st.phono[1] = on;
                     }
                 }
@@ -507,7 +507,7 @@ static void refresh_hw_status(void) {
     }
     /* Switch and thru state arrive as unsolicited 0x40 reports (parsed in hid_read), which the box
        sends only once 0x36 has enabled them. Then ask for a state dump (0x41 SysEx F0 17 04 F7),
-       so the LINE/PHONO switch is known before it is first moved. */
+       so the CD / Phono switch is known before it is first moved. */
     uint8_t enable[1] = { 1 };
     hid_cmd(SL2_CMD_REPORTS, enable, 1, NULL, NULL);
     uint8_t dump[5] = { 4, 0xF0, 0x17, 0x04, 0xF7 };

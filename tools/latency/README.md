@@ -21,7 +21,7 @@ The log lines the scripts look for are the SL 2 driver's, so they need adapting 
 1. Build the tools: `make latency` (into `tools/latency/bin/`).
 2. Connect a **loopback cable** from Left Deck Out L to Left Deck In L. Use nothing else on that output:
    the tools send clicks and a loud tone into it.
-3. Set the box's LINE/PHONO switch to **LINE**. A line-level signal into the phono preamp clips, and the
+3. Set the box's CD / Phono switch to **CD** (line level). A line-level signal into the phono preamp clips, and the
    glitch test then reports a glitch at its first analysed sample.
 4. Install the driver build under test: `make plugin && sudo tools/install-sl2.sh` (add `DEBUG=1` for the
    driver's counters and `sl2dbg`). The script replaces the binary inside the installed driver, so the
@@ -40,7 +40,7 @@ fewest physical steps:
    into Left Deck Out): `restartcheck.sh`, a 30 s glitch test, 48 kHz, the output volume and mute
    (it puts your volume and mute back afterwards), the level meters, and with a debug build `dptest.sh`
    and the `sl2dbg` fault hooks (a USB stall, errored capture packets);
-3. steps for someone at the box: flipping the LINE/PHONO switch, and unplugging and replugging while idle
+3. steps for someone at the box: flipping the CD / Phono switch, and unplugging and replugging while idle
    and while a (silent) stream runs. The script prints each step and waits until it sees the change, so
    nothing needs typing. `ARGS="--no-physical"` skips them.
 

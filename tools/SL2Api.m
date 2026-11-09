@@ -280,7 +280,7 @@ static int send_hid_cmd(uint8_t cmd, const uint8_t *args, size_t nargs, uint8_t 
  * ============================================================================ */
 
 static void dispatch_report(const uint8_t pkt[HID_REPORT_LEN]) {
-    /* The box's Hidi report: thru (notes 0x5C/0x5D), the LINE/PHONO switch (0x61) and 0x60. */
+    /* The box's Hidi report: thru (notes 0x5C/0x5D), the CD / Phono switch (0x61) and 0x60. */
     void (*hidi)(RH_hidimsg_data_t *) = atomic_load(&g_hidi_cb);
     if (pkt[0] == SL2_REPORT_HIDI && hidi) {
         /* [5] = length of the messages (capped at what a report carries), [6..] = the messages. */
@@ -514,7 +514,7 @@ static int send_three(void *h, uint8_t a, uint8_t b, uint8_t c) {
 }
 
 /* Ask the box for a state dump (SysEx F0 17 04 F7), as Rane's does. The box answers with 0x40
-   reports of notes 0x5C/0x5D (deck thru), 0x61 (the LINE/PHONO switch) and 0x60, which reach the
+   reports of notes 0x5C/0x5D (deck thru), 0x61 (the CD / Phono switch) and 0x60, which reach the
    hidimsg callback like any other report. */
 EXPORT int RH_get_all_controls(void *h) {
     TRACE(": state dump requested");
@@ -522,8 +522,8 @@ EXPORT int RH_get_all_controls(void *h) {
     return RH_send_hidimsg(h, &m);
 }
 
-/* Rane's API: the SL 2 Audio Control Panel calls SL2_send_note_on(h, 0x5C, 0) for "deck 1 thru on"
-   and SL2_send_note_off(h, 0x5C) for off (0x5D = deck 2). LINE/PHONO (note 0x61) is a physical
+/* Rane's API: the SL 2 Audio Control Panel calls SL2_send_note_on(h, 0x5C, 0) for "deck 1 thru on" (deck 1 is the left deck, 1/2)
+   and SL2_send_note_off(h, 0x5C) for off (0x5D = deck 2, the right deck). CD / Phono (note 0x61) is a physical
    switch: the box reports it but ignores a note sent for it. */
 EXPORT int RH_send_note_on(void *h, uint8_t note, uint8_t vel) { return send_three(h, 0x90, note, vel); }
 EXPORT int RH_send_note_off(void *h, uint8_t note)             { return send_three(h, 0x80, note, 0x00); }

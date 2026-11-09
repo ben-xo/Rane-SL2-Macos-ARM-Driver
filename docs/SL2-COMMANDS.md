@@ -134,6 +134,9 @@ the flash of Rane's flash-based devices); the SL 2 answers all of them `0xFF`.
 
 ## `0x41` — Hidi messages (running firmware only)
 
+The firmware numbers the decks 1 and 2. Deck 1 is the left deck, channels 1/2, and deck 2 the
+right deck, channels 3/4, as the box marks them, for inputs and outputs alike.
+
 The bytes from `[6]` are MIDI-style messages, processed in order:
 
 | message | effect |
@@ -157,11 +160,11 @@ velocity `0x40`):
 |------|-----------|---------|
 | `0x5C` / `0x5D` | a `0x41` message changes it, or on a state dump | deck 1 / deck 2 analogue thru (On = thru on) |
 | `0x60` | input PC7 changes (debounced), or on a state dump | state of PC7 |
-| `0x61` | input PE0 changes, or on a state dump | the LINE/PHONO switch (one, for both decks): On = phono |
+| `0x61` | input PE0 changes, or on a state dump | the CD / Phono switch (one, for both decks): On = phono |
 
 These reports are sent **only after `0x36` has enabled them**; until then, queued messages
 are discarded. The bootstrap contains the same sender but nothing in it ever queues a
-message. PE0 is the LINE/PHONO switch (verified on the hardware by flipping it); what PC7 is wired to was not traced.
+message. PE0 is the CD / Phono switch (verified on the hardware by flipping it); what PC7 is wired to was not traced.
 
 ## Running-firmware hardware map (as far as traced)
 
@@ -174,7 +177,7 @@ message. PE0 is the LINE/PHONO switch (verified on the hardware by flipping it);
 | PC5 | out (only in `0x16`) | pulsed low after disconnecting in `0x16`; most likely resets the FX2 so it reboots from EEPROM |
 | PC6, PE4, PE5 | out | audio clock / power: PE4 = 44.1 kHz, PE5 = 48 kHz; all raised when powering down |
 | PC7 | in | unknown input (debounced, 6 ms); reported as note `0x60`; decides the thru default and whether the audio side is powered down on suspend |
-| PE0 | in | the LINE/PHONO switch; reported as note `0x61` (On = phono). Any change, in either direction, also sends the constant word `0x8000` to the FPGA: a change notification, without the switch position (also sent once when the FPGA has loaded) |
+| PE0 | in | the CD / Phono switch; reported as note `0x61` (On = phono). Any change, in either direction, also sends the constant word `0x8000` to the FPGA: a change notification, without the switch position (also sent once when the FPGA has loaded) |
 | PE1, PE2 | out | deck 2 / deck 1 analogue thru |
 | PE6 | out | select line for 16-bit writes to the FPGA over serial port 0 |
 | serial port 0 | out | FPGA configuration data and clock (LSB first), then 16-bit FPGA writes |

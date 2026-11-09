@@ -9,7 +9,7 @@ SL 4 drivers, which share much of this architecture.
 > **Fixing a playback or capture bug? Start here.**
 > 1. Build and install a debug driver: `make plugin DEBUG=1 && sudo tools/install-sl2.sh`, and the test tools:
 >    `make latency`.
-> 2. Connect a loopback cable from Left Deck Out L to Left Deck In L, with the LINE/PHONO switch on **LINE**
+> 2. Connect a loopback cable from Left Deck Out L to Left Deck In L, with the CD / Phono switch on **CD** (line level)
 >    (`tools/latency/README.md`).
 > 3. Run `tools/latency/restartcheck.sh` and `tools/latency/dptest.sh 60`. Both print PASS or FAIL. The driver's
 >    counters should read as in [Testing](#testing).
@@ -207,7 +207,7 @@ shift it slightly. Only 44.1 kHz has been measured.
 
 The SL 2 has no volume control of its own. No HID command sets a level, and the FPGA that carries the
 audio gets no level from the host: after configuring it, the firmware only ever sends it one constant
-word, when the LINE/PHONO switch moves. Rane's own driver had none either; its volume hooks were empty.
+word, when the CD / Phono switch moves. Rane's own driver had none either; its volume hooks were empty.
 So the driver scales the samples itself: a master **Output Volume** and **Output Mute**, which the
 menu-bar slider and the volume keys use, and a **volume for each output channel**, shown per channel
 in Audio MIDI Setup. All run from −64 to 0 dB, linear in dB along the slider, with the bottom silent.
@@ -253,7 +253,7 @@ converters' pre-ringing, which is smaller on a quieter click. It is not latency.
   or off depending on a board input), and the box is given the driver's sample rate (it powers up at
   44.1 kHz). The link speed is checked: at full speed the log says so.
 - **Status.** At open the driver enables the box's unsolicited reports (`0x36`) and asks for a state dump
-  (`0x41` SysEx `F0 17 04 F7`). The reports give each deck's thru state and the LINE/PHONO switch (one
+  (`0x41` SysEx `F0 17 04 F7`). The reports give each deck's thru state and the CD / Phono switch (one
   physical switch for both decks, note `0x61`, On = phono), which the `sl2s` status carries.
 - **Unplugging while streaming.** The stream stops (nothing is sent to the box), and the client count is
   reset: the device leaves the HAL's list, and a client using it again after a replug sends a new StartIO.
@@ -271,7 +271,7 @@ converters' pre-ringing, which is smaller on a quieter click. It is not latency.
   see `docs/SL2-COMMANDS.md`.
 - **`sl2q`:** the box's unsolicited `0x40` reports and the driver's own events (`0x4F`: sample rate), kept
   in a ring of 256 with a read position per client process, so every client gets every report.
-- **`sl2s`:** the status (connected, streaming, rate, version, serial, thru and LINE/PHONO, frame counts,
+- **`sl2s`:** the status (connected, streaming, rate, version, serial, thru and CD / Phono, frame counts,
   boot mode). Reading it has no side effects.
 - **`sl2m`:** level meters for the control panel: the peak level (0–1) of each input channel as captured and
   each output channel as sent (after the volume) since the last read, which resets them. The driver
@@ -332,7 +332,7 @@ Entries refer to the [bug catalogue](#bug-catalogue).
 |---|---|
 | **Directly**: shared code or a shared HAL/USB pattern | 1 sample-rate handshake; 2 fixed timeline anchor; 4 clock tracking; 5, 31 reporting real latency (measure with `rtlat`); 15 bus time; 19, 20 capture gaps filled with silence; 21 ReadInput's write head; 22, 23 teardown on the USB queue and stream generations; 24, 25 failed opens and unplug while streaming; 26 opening at connect; 27 property buffer sizes; 28 the `sl2h` passthrough; 30 the zero-timestamp period; 39 the status frame count; 35 device listed only while attached; 38 retry a refused first open |
 | **With the deep schedule** (late writes into queued transfers) | 7, 9, 10, 11, 12, 13, 14, 16, 17, 18 |
-| **SL 2 only, or check on the SL 3/SL 4 first** | 8 input safety value (measure); 29 the heartbeat (check the SL 3/SL 4 firmware); 36 LINE/PHONO report (note `0x61`); 37 thru at connect (board input PC7); 32–34, 40–43 SL2Api, `sl2panel` and the test tools (each device's API has its own signatures; the SL 3 uses `0x10` for its version) |
+| **SL 2 only, or check on the SL 3/SL 4 first** | 8 input safety value (measure); 29 the heartbeat (check the SL 3/SL 4 firmware); 36 CD / Phono report (note `0x61`); 37 thru at connect (board input PC7); 32–34, 40–43 SL2Api, `sl2panel` and the test tools (each device's API has its own signatures; the SL 3 uses `0x10` for its version) |
 
 ## Bug catalogue
 
@@ -535,7 +535,7 @@ build; *(hook)* uses `tools/latency/bin/sl2dbg`.
 38. **A refused first open at connect left the decks off thru.**
     - Fix: retry the open for about a second (about 1 connect in 30 is refused at first). `a60bc35`.
 39. **The status packet's playback frame count stayed at 0.** `226c7d2`.
-40. **`sl2panel phono` / `line` did nothing**: LINE/PHONO is a physical switch. `08cf301`.
+40. **`sl2panel phono` / `line` did nothing**: CD / Phono is a physical switch. `08cf301`.
 41. **`sl2panel` said "driver not loaded" with the box just unplugged.** `3c5b37e`.
 42. **Test scripts passed silently against a release build, and the release build forwarded debug commands to
     the box.** `cde1bd7`.
@@ -553,7 +553,7 @@ build; *(hook)* uses `tools/latency/bin/sl2dbg`.
 `make hwtest` runs the hardware tests in one go, in the order that needs the fewest physical steps, and
 ends with a PASS / FAIL / SKIP summary (`ARGS="--loopback"` with the loopback cable in). It covers the
 status, SL2Api as Serato calls it, rate switching, restarts, glitches (idle and loaded), 48 kHz, the
-output volume and mute (and that they survive a replug), the level meters, the fault hooks, the LINE/PHONO report, and unplug and replug while idle and mid-stream.
+output volume and mute (and that they survive a replug), the level meters, the fault hooks, the CD / Phono report, and unplug and replug while idle and mid-stream.
 
 The tools are in `tools/latency/` (build them with `make latency`). Its README covers the loopback setup,
 what each tool does and the expected results. The main ones:

@@ -18,7 +18,7 @@
 #define SERATO_PATH "/Library/Frameworks/Sl2Api.framework/SL2Api"
 
 enum { RH_OK = 0, RH_ERR_BAD_ARG = 8 };
-enum { NOTE_THRU_1 = 0x5C, NOTE_THRU_2 = 0x5D, NOTE_LINE_PHONO = 0x61 };
+enum { NOTE_THRU_1 = 0x5C, NOTE_THRU_2 = 0x5D, NOTE_CD_PHONO = 0x61 };
 
 typedef struct { uint8_t length; uint8_t data[59]; } RH_hidimsg_data_t;
 
@@ -83,10 +83,10 @@ static int send_note(void *h, uint8_t status, uint8_t note) {
 
 // Switch a deck with Note Off and Note On (as Serato and Rane's control panel do) and check each
 // reaches the box, by the box's own state dump; leave the deck as it was.
-static void check_thru(void *h, int note, int deck) {
+static void check_thru(void *h, int note, const char *deck) {
     char what[128];
     int before = dump_note(h, note);
-    snprintf(what, sizeof what, "deck %d: the state dump reports its thru note (0x%02X)", deck, note);
+    snprintf(what, sizeof what, "%s: the state dump reports its thru note (0x%02X)", deck, note);
     check(before >= 0, what);
     if (before < 0) return;
     // Note Off, then Note On: each must be accepted and must change what the box reports.
@@ -94,14 +94,14 @@ static void check_thru(void *h, int note, int deck) {
     int after_off = dump_note(h, note);
     int e_on = send_note(h, 0x90, note);
     int after_on = dump_note(h, note);
-    snprintf(what, sizeof what, "deck %d: send_hidimsg Note Off / Note On accepted (%d, %d)", deck, e_off, e_on);
+    snprintf(what, sizeof what, "%s: send_hidimsg Note Off / Note On accepted (%d, %d)", deck, e_off, e_on);
     check(e_off == RH_OK && e_on == RH_OK, what);
-    snprintf(what, sizeof what, "deck %d: the box's state follows (initial %04x, after off %04x, after on %04x)",
+    snprintf(what, sizeof what, "%s: the box's state follows (initial %04x, after off %04x, after on %04x)",
              deck, before, after_off, after_on);
     check(after_off >= 0 && after_on >= 0 && after_off != after_on && (before == after_off || before == after_on), what);
     // Put the deck back as it was.
     if (before == after_off) send_note(h, 0x80, note);
-    snprintf(what, sizeof what, "deck %d: restored", deck);
+    snprintf(what, sizeof what, "%s: restored", deck);
     check(dump_note(h, note) == before, what);
 }
 
@@ -137,9 +137,9 @@ int main(int argc, char **argv) {
     check(e == RH_OK && ps[0] == 1 && ps[1] == 0, what);
     if (e != RH_OK) { printf("no box connected: stopping\n"); return 1; }
 
-    // The state dump: thru for both decks and the LINE/PHONO switch arrive through the callback.
-    int t1 = dump_note(h, NOTE_THRU_1), t2 = dump_note(h, NOTE_THRU_2), lp = dump_note(h, NOTE_LINE_PHONO);
-    snprintf(what, sizeof what, "SL2_get_all_controls: callback reports deck 1 %04x, deck 2 %04x, LINE/PHONO %04x", t1, t2, lp);
+    // The state dump: thru for both decks and the CD/PHONO switch arrive through the callback.
+    int t1 = dump_note(h, NOTE_THRU_1), t2 = dump_note(h, NOTE_THRU_2), lp = dump_note(h, NOTE_CD_PHONO);
+    snprintf(what, sizeof what, "SL2_get_all_controls: callback reports left deck (1/2) %04x, right deck (3/4) %04x, CD/PHONO %04x", t1, t2, lp);
     check(t1 >= 0 && t2 >= 0 && lp >= 0, what);
 
     // The genuine-hardware check: the box's 8-byte answer is a function of the 8-byte challenge.
@@ -157,8 +157,8 @@ int main(int argc, char **argv) {
     // Per-deck thru, as Serato switches it.
     RH_hidimsg_data_t empty = { 0 };
     check(SL2_send_hidimsg(h, &empty) == RH_ERR_BAD_ARG, "SL2_send_hidimsg: an empty message is refused (8)");
-    check_thru(h, NOTE_THRU_1, 1);
-    check_thru(h, NOTE_THRU_2, 2);
+    check_thru(h, NOTE_THRU_1, "left deck (1/2)");
+    check_thru(h, NOTE_THRU_2, "right deck (3/4)");
 
     // Close.
     check(SL2_close(h) == RH_OK, "SL2_close");

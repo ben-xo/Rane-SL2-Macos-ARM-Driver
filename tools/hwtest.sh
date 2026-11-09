@@ -9,7 +9,7 @@
 #      loud tone into that output, so pass it only when the cable is in): restarts, a glitch test,
 #      48 kHz, the output volume and mute, the level meters, and in a debug build (make plugin DEBUG=1) the glitch test under load and the fault
 #      hooks;
-#   3. unless --no-physical: steps for a person at the box (flip the LINE/PHONO switch, unplug and
+#   3. unless --no-physical: steps for a person at the box (flip the CD/PHONO switch, unplug and
 #      replug while idle and while a stream runs). The script prints what to do and waits until it
 #      sees the change, so nothing needs typing.
 #
@@ -44,7 +44,7 @@ record() {   # <PASS|FAIL|SKIP> <test> [detail]
 }
 
 status() { "$PANEL" status 2>&1; }
-connected() { status | grep -q 'USB Connected : YES'; }
+connected() { [ "$(field 'USB Connected')" = YES ]; }
 field() {    # the value of an sl2panel status line, e.g. field 'Sample Rate'
     status | sed -nE "s/^  $1 *: *//p" | head -1
 }
@@ -100,8 +100,8 @@ restore_volume() {
     [ $ok = 1 ]
 }
 
-both_thru() { [ "$(status | grep -c 'Mode: ANALOG THRU')" = 2 ]; }
-input_is() { field 'Deck 1 Input' | grep -q "^$1"; }
+both_thru() { [ "$(status | grep -cE '^  (Left|Right) deck .*: ANALOG THRU')" = 2 ]; }
+input_is() { field 'Input switch' | grep -q "^$1"; }   # PHONO or CD
 
 # ---------------------------------------------------------------------------- 0. preconditions
 
@@ -145,7 +145,7 @@ orig=$("$B/setrate" "$DEV" | grep -oE '[0-9]{5}' | head -1); orig=${orig:-44100}
 ok=1
 for r in 48000 44100; do
     "$B/setrate" "$DEV" "$r" >/dev/null
-    wait_until "the driver to report $r Hz" sh -c "'$PANEL' status | grep -q 'Sample Rate   : $r Hz'" || ok=0
+    wait_until "the driver to report $r Hz" sh -c "'$PANEL' status | grep -qE '^  Sample Rate +: $r Hz'" || ok=0
 done
 "$B/setrate" "$DEV" "$orig" >/dev/null
 [ $ok = 1 ] && record PASS "sample rate 44.1 -> 48 -> 44.1 kHz" || record FAIL "sample rate 44.1 -> 48 -> 44.1 kHz"
@@ -159,10 +159,10 @@ if [ $LOOPBACK = 0 ]; then
         record SKIP "$t" "no --loopback"
     done
 else
-    # The line-level loopback signal clips the phono preamp: wait for the switch to be on LINE.
-    if ! input_is LINE; then
-        echo "   >>> Set the LINE/PHONO switch on the box to LINE."
-        wait_until "the switch on LINE" input_is LINE
+    # The line-level loopback signal clips the phono preamp: wait for the switch to be on CD.
+    if ! input_is CD; then
+        echo "   >>> Set the CD/PHONO switch on the box to CD."
+        wait_until "the switch on CD" input_is CD
     fi
 
     # Every test here plays at full level: the user's output volume and mute are saved, set to 0 dB
@@ -286,20 +286,20 @@ echo
 
 echo "== 3. steps at the box"
 if [ $PHYSICAL = 0 ]; then
-    for t in "LINE/PHONO switch reported" "unplug and replug, idle" "volume and mute survive a replug" "unplug and replug, mid-stream"; do
+    for t in "CD/PHONO switch reported" "unplug and replug, idle" "volume and mute survive a replug" "unplug and replug, mid-stream"; do
         record SKIP "$t" "--no-physical"
     done
 else
-    # The LINE/PHONO switch: the status must follow it both ways. It ends where it started.
-    first=$(input_is PHONO && echo LINE || echo PHONO)
-    second=$([ $first = PHONO ] && echo LINE || echo PHONO)
-    echo "   >>> Flip the LINE/PHONO switch to $first."
+    # The CD/PHONO switch: the status must follow it both ways. It ends where it started.
+    first=$(input_is PHONO && echo CD || echo PHONO)
+    second=$([ $first = PHONO ] && echo CD || echo PHONO)
+    echo "   >>> Flip the CD/PHONO switch to $first."
     if wait_until "the switch on $first" input_is $first; then
         echo "   >>> Flip it back to $second."
-        wait_until "the switch on $second" input_is $second && record PASS "LINE/PHONO switch reported" \
-            || record FAIL "LINE/PHONO switch reported" "not seen back on $second"
+        wait_until "the switch on $second" input_is $second && record PASS "CD/PHONO switch reported" \
+            || record FAIL "CD/PHONO switch reported" "not seen back on $second"
     else
-        record FAIL "LINE/PHONO switch reported" "not seen on $first"
+        record FAIL "CD/PHONO switch reported" "not seen on $first"
     fi
 
     # Unplug and replug with nothing playing: the device goes, comes back, and puts both decks on

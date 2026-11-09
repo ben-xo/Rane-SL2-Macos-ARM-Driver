@@ -94,11 +94,11 @@ OPCION B (Con el asistente grafico RaneSL2-macOS-Universal.pkg):
   cualquier momento. La SL2 solo aparece en la lista de dispositivos de audio
   mientras esta conectada.
 - Canales de Audio (4 Entradas / 4 Salidas a 24-bit / 44.1 o 48 kHz):
-    * Canales 1 y 2: Left Deck (Plato / CDJ Izquierdo)
-    * Canales 3 y 4: Right Deck (Plato / CDJ Derecho)
+    * Canales 1 y 2: Left deck (1/2), el plato / CDJ izquierdo
+    * Canales 3 y 4: Right deck (3/4), el plato / CDJ derecho
 - App SL 2 Control Panel (en Aplicaciones):
     * Muestra el estado de la SL2, su firmware, el driver y la latencia;
-      consulta el selector Phono / Line (es un interruptor fisico de la SL2,
+      consulta el selector CD / Phono (es un interruptor fisico de la SL2,
       el mismo para los dos platos: la app lo muestra pero no puede
       cambiarlo); activa o desactiva Thru en cada plato y cambia la
       frecuencia de muestreo (44100 Hz / 48000 Hz).

@@ -109,21 +109,24 @@ static void print_status(AudioObjectID dev) {
     printf("==================================================\n");
     printf("  Rane SL 2 — Hardware & CoreAudio Status\n");
     printf("==================================================\n");
-    printf("  USB Connected : %s\n", s.connected ? "YES" : "NO");
+    printf("  USB Connected    : %s\n", s.connected ? "YES" : "NO");
     if (s.boot_mode) {
-        printf("  Firmware      : NOT LOADED — box is in USB bootloader mode\n");
-        printf("                  the box needs its firmware restored\n");
+        printf("  Firmware         : NOT LOADED — box is in USB bootloader mode\n");
+        printf("                     the box needs its firmware restored\n");
         printf("==================================================\n");
         return;
     }
-    printf("  Streaming I/O : %s\n", s.streaming ? "ACTIVE" : "IDLE");
-    printf("  Sample Rate   : %u Hz\n", s.sample_rate);
-    printf("  Firmware Ver  : %u.%02u\n", s.version_maj, s.version_min);
-    printf("  Serial Number : %s\n", s.serial[0] ? (const char *)s.serial : "N/A");
-    printf("  Deck 1 Input  : %s  |  Mode: %s\n", s.phono[0] ? "PHONO" : "LINE ", s.thru[0] ? "ANALOG THRU" : "USB AUDIO");
-    printf("  Deck 2 Input  : %s  |  Mode: %s\n", s.phono[1] ? "PHONO" : "LINE ", s.thru[1] ? "ANALOG THRU" : "USB AUDIO");
-    printf("  Captured Frms : %llu\n", s.cap_frames);
-    printf("  Playback Frms : %llu\n", s.play_frames);
+    printf("  Streaming I/O    : %s\n", s.streaming ? "ACTIVE" : "IDLE");
+    printf("  Sample Rate      : %u Hz\n", s.sample_rate);
+    printf("  Firmware Ver     : %u.%02u\n", s.version_maj, s.version_min);
+    printf("  Serial Number    : %s\n", s.serial[0] ? (const char *)s.serial : "N/A");
+    /* The decks as the box marks them (the firmware's deck 1 and deck 2), and its one CD / Phono
+       switch, shared by both decks. */
+    printf("  Left deck (1/2)  : %s\n", s.thru[0] ? "ANALOG THRU" : "USB AUDIO");
+    printf("  Right deck (3/4) : %s\n", s.thru[1] ? "ANALOG THRU" : "USB AUDIO");
+    printf("  Input switch     : %s\n", s.phono[0] ? "PHONO" : "CD (line)");
+    printf("  Captured Frms    : %llu\n", s.cap_frames);
+    printf("  Playback Frms    : %llu\n", s.play_frames);
     printf("==================================================\n");
 }
 
@@ -143,16 +146,16 @@ int main(int argc, const char *argv[]) {
             print_status(dev);
             return 0;
         }
-        /* "thru" / "usb": Note On / Note Off of notes 0x5C and 0x5D turns decks 1 and 2's thru
-           on or off. "sr": set the rate through CoreAudio, which changes the box's rate with it. */
+        /* "thru" / "usb": Note On / Note Off of notes 0x5C and 0x5D (the left and right decks) turns
+           their thru on or off. "sr": set the rate through CoreAudio, which changes the box's rate with it. */
         if (strcmp(argv[1], "thru") == 0) {
             send_hidi(dev, 0x90, 0x5C, 0x00);
             send_hidi(dev, 0x90, 0x5D, 0x00);
-            printf("Enabled Analog Feed-Thru on Decks 1 & 2.\n");
+            printf("Enabled Analog Feed-Thru on both decks.\n");
         } else if (strcmp(argv[1], "usb") == 0) {
             send_hidi(dev, 0x80, 0x5C, 0x00);
             send_hidi(dev, 0x80, 0x5D, 0x00);
-            printf("Enabled USB Audio (Feed-Thru Off) on Decks 1 & 2.\n");
+            printf("Enabled USB Audio (Feed-Thru Off) on both decks.\n");
         } else if (strcmp(argv[1], "sr") == 0 && argc >= 3) {
             Float64 sr = atof(argv[2]);
             AudioObjectPropertyAddress a = {
@@ -163,7 +166,7 @@ int main(int argc, const char *argv[]) {
             AudioObjectSetPropertyData(dev, &a, 0, NULL, sizeof(Float64), &sr);
             printf("Set Sample Rate to %.0f Hz.\n", sr);
         } else {
-            /* LINE/PHONO is a physical switch on the box: reported in the status, not settable */
+            /* CD / Phono is a physical switch on the box: reported in the status, not settable */
             printf("Usage: sl2panel [status | usb | thru | sr 44100|48000]\n");
         }
     }
