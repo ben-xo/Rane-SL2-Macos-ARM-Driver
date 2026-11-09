@@ -76,13 +76,15 @@ save_volume() {
     SAVED_CH=$(echo "$v" | sed -nE 's/.*, channels (.*) dB, mute [01]$/\1/p')
     SAVED_MUTE=$(echo "$v" | sed -nE 's/.*mute ([01])$/\1/p')
     [ -n "$SAVED_DB" ] && [ -n "$SAVED_MUTE" ] || return 1
-    trap 'restore_volume' EXIT
+    trap 'EXITING=1; restore_volume' EXIT
     trap 'exit 130' INT TERM
 }
-neutral_volume() {   # the main volume and every channel at 0 dB, unmuted
-    local ch
-    "$B/volctl" "$DEV" unmute >/dev/null; "$B/volctl" "$DEV" 0 >/dev/null
-    for ch in 1 2 3 4; do "$B/volctl" "$DEV" 0 $ch >/dev/null; done
+neutral_volume() {   # the main volume and every channel at 0 dB, unmuted; fails if any setting does
+    local ch ok=0
+    "$B/volctl" "$DEV" unmute >/dev/null || ok=1
+    "$B/volctl" "$DEV" 0 >/dev/null || ok=1
+    for ch in 1 2 3 4; do "$B/volctl" "$DEV" 0 $ch >/dev/null || ok=1; done
+    return $ok
 }
 restore_volume() {
     trap - EXIT INT TERM
@@ -95,9 +97,17 @@ restore_volume() {
         "$B/volctl" "$DEV" "$db" $ch >/dev/null || ok=0
     done
     "$B/volctl" "$DEV" $m >/dev/null || ok=0
-    [ $ok = 1 ] || echo "      could not put the output volume back ($SAVED_DB dB, channels $SAVED_CH dB, mute $SAVED_MUTE): set it by hand"
-    SAVED_DB=
-    [ $ok = 1 ]
+    if [ $ok = 1 ]; then SAVED_DB=; return 0; fi
+    # Failed (the box may be unplugged): try once more when the script ends, then give up.
+    if [ -z "${RESTORE_RETRY:-}" ] && [ -z "${EXITING:-}" ]; then
+        RESTORE_RETRY=1
+        trap 'EXITING=1; restore_volume' EXIT
+        echo "      could not put the output volume back yet: will try again when the tests end"
+    else
+        echo "      could not put the output volume back ($SAVED_DB dB, channels $SAVED_CH dB, mute $SAVED_MUTE): set it by hand"
+        SAVED_DB=
+    fi
+    return 1
 }
 
 both_thru() { [ "$(status | grep -c 'Mode: ANALOG THRU')" = 2 ]; }
@@ -167,7 +177,10 @@ else
 
     # Every test here plays at full level: the user's output volume and mute are saved, set to 0 dB
     # and unmuted for the section, and put back at its end (by a trap if the script is interrupted).
-    if save_volume; then have_volume=1; neutral_volume; else have_volume=0; fi
+    if save_volume; then have_volume=1; else have_volume=0; fi
+    if [ $have_volume = 0 ] || ! neutral_volume; then
+        echo "   (could not set the output to 0 dB, unmuted: the loopback tests may fail for that reason)"
+    fi
 
     # Three streams in a row, each starting cleanly and finding all its clicks.
     if "$ROOT/tools/latency/restartcheck.sh" > /dev/null 2>&1; then record PASS "restarts"

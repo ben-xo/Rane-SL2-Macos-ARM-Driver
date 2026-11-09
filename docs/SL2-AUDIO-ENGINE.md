@@ -214,6 +214,8 @@ in Audio MIDI Setup. All run from −64 to 0 dB, with the bottom silent. The sli
 standard volume curve (its "2 over 1" transfer function: the slider position is the square of the
 level's position in the dB range), as the Mac's built-in output and Apple-driven USB interfaces do, so
 half-way is about −19 dB and each volume-key step is about 2 dB near the top and 3 dB around the middle.
+The steps get coarser towards the bottom, where the last one goes from −48 dB to silence, as on the
+Mac's own outputs.
 A channel's gain is the master's times its own. The master is needed: without one, the HAL's virtual
 main volume (the volume keys) moves only the preferred stereo pair, channels 1–2, because the four
 channels are discrete rather than a speaker layout it could follow, so the keys would turn down one

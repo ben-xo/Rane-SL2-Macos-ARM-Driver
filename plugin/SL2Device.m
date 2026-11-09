@@ -1694,10 +1694,11 @@ static _Atomic bool  g_vol_mute = false;
 static _Atomic float g_vol_gain[NCH]    = { 1.0f, 1.0f, 1.0f, 1.0f };
 static _Atomic float g_vol_applied[NCH] = { 1.0f, 1.0f, 1.0f, 1.0f };
 
-static const AudioObjectID kVolObjs[1 + NCH] = { kObjVolume, kObjVolCh1, kObjVolCh2, kObjVolCh3, kObjVolCh4 };
-/* Every control the device owns, in its ControlList order: the volumes, then the mute. */
+/* Every control the device owns, in its ControlList order: the volumes (master, then each channel),
+   then the mute. kVolObjs is the volumes: the first 1 + NCH entries. */
 #define VOL_NCONTROLS   (2 + NCH)
 static const AudioObjectID kControlObjs[VOL_NCONTROLS] = { kObjVolume, kObjVolCh1, kObjVolCh2, kObjVolCh3, kObjVolCh4, kObjMute };
+#define kVolObjs kControlObjs
 /* Serialises volume and mute changes (on the HAL's property threads; never taken on the IO path), so
    two changes at once can't leave the gains computed from a half-updated state. */
 static pthread_mutex_t g_vol_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -1714,11 +1715,11 @@ static bool vol_is_control(AudioObjectID oid) { return oid == kObjMute || vol_in
    built-in output and Apple-driven USB interfaces follow it, so the slider and the volume keys feel
    the same here as there: half-way is about -19 dB, not half the dB range. */
 static float vol_scalar_to_db(float s) {
-    if (s < 0) s = 0; else if (s > 1) s = 1;
+    if (!isfinite(s) || s < 0) s = 0; else if (s > 1) s = 1;
     return VOL_MIN_DB + sqrtf(s) * (VOL_MAX_DB - VOL_MIN_DB);
 }
 static float vol_db_to_scalar(float db) {
-    if (db <= VOL_MIN_DB) return 0;
+    if (!isfinite(db) || db <= VOL_MIN_DB) return 0;
     if (db >= VOL_MAX_DB) return 1;
     float x = (db - VOL_MIN_DB) / (VOL_MAX_DB - VOL_MIN_DB);
     return x * x;
