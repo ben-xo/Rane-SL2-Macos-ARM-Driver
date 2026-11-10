@@ -536,7 +536,7 @@ struct PanelView: View {
                 Picker("Input safety offset", selection: Binding(get: { input.settingUs },
                                                                  set: { model.setInputSafety($0) })) {
                     ForEach(Self.safetyChoices(input.settingUs), id: \.self) { us in
-                        Text(Self.ms(us) + (us == 1500 ? " (default)" : "")).tag(us)
+                        Text(Self.ms(us) + Self.safetyNote(us)).tag(us)
                     }
                 }
                 .disabled(box.streaming)
@@ -563,8 +563,12 @@ struct PanelView: View {
 
     /// The input safety offsets to choose from, with the current setting among them.
     static func safetyChoices(_ setting: Int) -> [Int] {
-        let choices = [1500, 2000, 3000, 4000, 8000]
+        let choices = [500, 1000, 1500, 2000, 3000, 4000, 8000]
         return choices.contains(setting) ? choices : (choices + [setting]).sorted()
+    }
+    /// Below the default, input can drop out under load (measured: at 1 ms, 0.23 ms of margin left).
+    static func safetyNote(_ us: Int) -> String {
+        us == 1500 ? " (default)" : us < 1500 ? " (not recommended)" : ""
     }
     static func ms(_ us: Int) -> String {
         us % 1000 == 0 ? "\(us / 1000) ms" : String(format: "%.1f ms", Double(us) / 1000)
