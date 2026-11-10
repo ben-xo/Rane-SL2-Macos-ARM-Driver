@@ -2,8 +2,8 @@
 
 These tools measure what a DJ feels: the round trip from a deck input, through the computer, back out to
 the deck output, and whether that audio ever breaks up. They were used to take the SL 2 driver's estimated
-DVS round trip from ~105 ms to 18.6 ms measured at a 128-frame IO buffer (≈15 ms calculated at Serato's
-1 ms USB buffer setting), with no glitches under load. See `docs/SL2-AUDIO-ENGINE.md`.
+DVS round trip from ~105 ms to 12.2 ms measured at a 128-frame IO buffer and 9.3 ms at a 64-frame one,
+with no glitches under load. See `docs/SL2-AUDIO-ENGINE.md`.
 
 They are written for the SL 2 driver, but they are a model for testing the SL 3 and SL 4 drivers. The
 measurement tools work with any CoreAudio device. `dptest.sh`, `restartcheck.sh` and `logq.sh` take the
@@ -56,7 +56,7 @@ need the debug build's counters and hooks; run it again with a debug build to co
 | `bin/sinetest <device> <out-ch> <in-ch> <seconds> [buffer]` | Glitch test. Plays a continuous 997 Hz sine and checks every captured sample against the sine recurrence: any dropout, repeat, skip or click breaks it. Analysis starts after the first second | "0 glitches, 0 level drops" |
 | `dptest.sh <seconds>` | `sinetest` idle, then with every core busy, plus the driver's counters from its log (debug build) | prints PASS |
 | `restartcheck.sh` | Three streams in a row: each must start cleanly and find all its clicks | prints PASS |
-| `bin/sl2dbg insafe <ms> \| stall <ms> \| errpkts <n>` | Debug build only: the input safety offset (the HAL reads it only at device setup), and test hooks that stall the driver's USB queue or error capture packets on demand | — |
+| `bin/sl2dbg insafe <ms> \| stall <ms> \| errpkts <n>` | Debug build only: the input safety offset, to 0.1 ms (the HAL reads it only at device setup, so with nothing streaming the driver briefly takes the device out of the device list to have it set up again), and test hooks that stall the driver's USB queue or error capture packets on demand | — |
 | `bin/chtone <device> <seconds> <ch...>` | A 440 Hz tone on chosen output channels, the way Audio MIDI Setup's test tone plays it | heard on each channel |
 | `bin/chrec <device> <seconds> <out.wav>` | Starts IO from cold and records the input, reporting when signal first appears and any dropouts | no dropouts |
 | `envelope.py <wav>` | Peak level of a `chrec` recording in 100 ms windows | — |
@@ -72,10 +72,13 @@ go stale when it restarts; `restart-audio.sh` does the restart alone.
 
 ## Expected results (SL 2, 44.1 kHz, 128-frame buffer)
 
-- `restartcheck.sh`: three streams, each "DVS round trip est. 18.6 ms (4/4 clicks)", then PASS.
+- `restartcheck.sh`: three streams, each "DVS round trip est. 12.2 ms (4/4 clicks)", then PASS.
+- `rtlat "SL 2" 1 1 20 64` (a 64-frame buffer): "DVS round trip est. 9.3 ms".
 - `dptest.sh 60` (debug build): "0 glitches" idle and loaded, then PASS.
 - The debug build's `DBG dp` counters (`logq.sh`): late 0, unscheduled flat after start-up, enqueue refused
-  0, resyncs 0, sent − captured within ±2, rewritten samples 0.
+  0, resyncs 0, sent − captured within ±2, rewritten samples 0. Its `DBG early read` lines: completion
+  found 0 different, SILENCE (not captured yet) 0, least margin above 0.5 ms.
 - `sl2dbg stall 100` during a `sinetest`: one gap, shorter than the stall (the 64 one-millisecond capture
   transfers already queued keep receiving audio, so only the rest is lost: about 40 ms for a 100 ms stall),
-  the driver logs "Capture: N ms not captured", and the stream carries on. `sl2dbg errpkts 20`: a gap of about 3 ms, sent − captured within ±2.
+  the driver logs "Capture: N ms not captured", and the stream carries on. `sl2dbg stall 20`: no gap (the
+  early capture read covers it). `sl2dbg errpkts 20`: a gap of about 3 ms, sent − captured within ±2.
