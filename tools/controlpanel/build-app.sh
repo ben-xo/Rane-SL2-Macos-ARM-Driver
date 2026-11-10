@@ -15,10 +15,16 @@ for arch in arm64 x86_64; do
         "$HERE/SL2ControlPanel.swift" -o "$TMP/SL2ControlPanel-$arch"
 done
 
+# Draw the icon (make-icon.swift) and pack it into an .icns.
+swiftc -O "$HERE/make-icon.swift" -o "$TMP/make-icon"
+"$TMP/make-icon" "$TMP/AppIcon.iconset"
+iconutil -c icns "$TMP/AppIcon.iconset" -o "$TMP/AppIcon.icns"
+
 # Lay out the bundle and sign it.
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 lipo -create "$TMP/SL2ControlPanel-arm64" "$TMP/SL2ControlPanel-x86_64" -output "$APP/Contents/MacOS/SL2ControlPanel"
 cp "$HERE/Info.plist" "$APP/Contents/Info.plist"
+cp "$TMP/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 codesign --force --sign - "$APP"
 echo "built $APP"
