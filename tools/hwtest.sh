@@ -163,24 +163,28 @@ done
 
 # The input safety offset setting: set 2 ms with nothing streaming, and the driver must set the device
 # up again with it (the status reports what CoreAudio is using); then put the setting back.
-orig_us=$("$PANEL" safety | grep -oE '[0-9]+\.[0-9]' | head -1)
-if [ -z "$orig_us" ]; then
+# sl2panel prints the setting exactly (to the microsecond), so it is put back exactly.
+orig_ms=$("$PANEL" safety | grep -oE '[0-9]+(\.[0-9]+)? ms' | head -1 | cut -d' ' -f1)
+if [ -z "$orig_ms" ]; then
     record FAIL "input safety offset setting" "sl2panel safety: no setting"
 else
     ok=1
     "$PANEL" safety 2 >/dev/null || ok=0
-    WAIT_S=5 wait_until "the driver to use 2.0 ms" sh -c "'$PANEL' status | grep -q 'Input Safety  : 2.0 ms'" || ok=0
-    "$PANEL" safety "$orig_us" >/dev/null || ok=0
-    WAIT_S=5 wait_until "the driver to use $orig_us ms again" sh -c "'$PANEL' status | grep -q 'Input Safety  : $orig_us ms'" || ok=0
-    [ $ok = 1 ] && record PASS "input safety offset setting" "2.0 ms, then back to $orig_us ms" \
+    WAIT_S=5 wait_until "the driver to use 2 ms" sh -c "'$PANEL' status | grep -q 'Input Safety  : 2 ms'" || ok=0
+    "$PANEL" safety "$orig_ms" >/dev/null || ok=0
+    WAIT_S=5 wait_until "the driver to use $orig_ms ms again" sh -c "'$PANEL' status | grep -q 'Input Safety  : $orig_ms ms'" || ok=0
+    [ $ok = 1 ] && record PASS "input safety offset setting" "2 ms, then back to $orig_ms ms" \
                 || record FAIL "input safety offset setting" "status: $(field 'Input Safety')"
 fi
 
 # The early capture read: after a few seconds of capture (any input, no cable needed), the driver
-# must judge it working, and no input must have dropped out.
+# must judge it working, and no input must have dropped out during it (the dropout count runs from
+# when the box connected, so compare before and after).
+drops0=$(field 'Input Dropouts')
 "$B/chrec" "$DEV" 3 "${TMPDIR:-/tmp}/sl2-hwtest-chrec.wav" >/dev/null 2>&1
-er=$(field 'Early Read'); drops=$(field 'Input Dropouts')
-if [ "$er" = "working" ] && [ "${drops:-x}" = 0 ]; then
+er=$(field 'Early Read'); drops1=$(field 'Input Dropouts')
+drops=$(( ${drops1:-0} - ${drops0:-0} ))
+if [ "$er" = "working" ] && [ -n "$drops1" ] && [ "$drops" = 0 ]; then
     record PASS "early capture read working" "USB hubs: $(field 'USB Hubs')"
 else
     record FAIL "early capture read working" "early read '$er', input dropouts '$drops'"

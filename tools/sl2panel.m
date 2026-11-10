@@ -133,7 +133,7 @@ static void print_status(AudioObjectID dev) {
     printf("  Captured Frms : %llu\n", s.cap_frames);
     printf("  Playback Frms : %llu\n", s.play_frames);
     if (s.in_safety_us) {
-        printf("  Input Safety  : %.1f ms\n", s.in_safety_us / 1000.0);
+        printf("  Input Safety  : %g ms\n", s.in_safety_us / 1000.0);
         printf("  Early Read    : %s\n", s.early_read == 1 ? "working" : s.early_read == 2 ? "NOT WORKING (use an input safety offset of 8 ms)" : "not judged yet");
         printf("  Input Dropouts: %llu\n", s.in_dropouts);
         printf("  USB Hubs      : %u%s\n", s.hub_depth, s.hub_depth ? "" : " (connected directly)");
@@ -189,7 +189,7 @@ int main(int argc, const char *argv[]) {
                     printf("Refused (error %d): the setting must be 0.5 to 20 ms, with nothing streaming.\n", (int)e);
                     return 1;
                 }
-                printf("Input safety offset setting: %.1f ms.\n", us / 1000.0);
+                printf("Input safety offset setting: %g ms.\n", us / 1000.0);
             } else {
                 CFNumberRef n = NULL;
                 UInt32 sz = sizeof n;
@@ -200,7 +200,7 @@ int main(int argc, const char *argv[]) {
                 }
                 CFNumberGetValue(n, kCFNumberIntType, &us);
                 CFRelease(n);
-                printf("Input safety offset setting: %.1f ms.\n", us / 1000.0);
+                printf("Input safety offset setting: %g ms.\n", us / 1000.0);
             }
         } else {
             /* LINE/PHONO is a physical switch on the box: reported in the status, not settable */
