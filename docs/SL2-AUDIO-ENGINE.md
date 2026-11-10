@@ -592,7 +592,8 @@ build; *(hook)* uses `tools/latency/bin/sl2dbg`.
       microframe.
     - Fix: the early read (ReadInput places arrived packets from the queued buffers, counted by marking
       the buffers), and an input safety offset of 1.5 ms.
-    - Test: `sl2dbg stall 20` during `sinetest` *(hook)*: no gap; `dptest.sh`; `rtlat` at 64 frames
+    - Test: `make hwtest` "early capture read" *(debug)*: `sl2dbg stall 20` during `sinetest`, no gap and
+      the counters clean; `dptest.sh`; `rtlat` at 64 frames
       (≈9.3 ms DVS round trip); `DBG early read` counters *(debug)*.
     - `19669c5`, `ffbe09c`.
 
@@ -601,7 +602,7 @@ build; *(hook)* uses `tools/latency/bin/sl2dbg`.
 `make hwtest` runs the hardware tests in one go, in the order that needs the fewest physical steps, and
 ends with a PASS / FAIL / SKIP summary (`ARGS="--loopback"` with the loopback cable in). It covers the
 status, SL2Api as Serato calls it, rate switching, restarts, glitches (idle and loaded), 48 kHz, the
-output volume and mute (and that they survive a replug), the level meters, the fault hooks, the LINE/PHONO report, and unplug and replug while idle and mid-stream.
+output volume and mute (and that they survive a replug), the level meters, the early capture read, the fault hooks, the LINE/PHONO report, and unplug and replug while idle and mid-stream.
 
 The tools are in `tools/latency/` (build them with `make latency`). Its README covers the loopback setup,
 what each tool does and the expected results. The main ones:

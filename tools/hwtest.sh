@@ -8,7 +8,7 @@
 #   2. with --loopback (a cable from Left Deck Out L to Left Deck In L; the tests play clicks and a
 #      loud tone into that output, so pass it only when the cable is in): restarts, a glitch test,
 #      48 kHz, the output volume and mute, the level meters, and in a debug build (installed with
-#      make install DEBUG=1) the glitch test under load and the fault hooks;
+#      make install DEBUG=1) the glitch test under load, the early capture read and the fault hooks;
 #   3. unless --no-physical: steps for a person at the box (flip the LINE/PHONO switch, unplug and
 #      replug while idle and while a stream runs). The script prints what to do and waits until it
 #      sees the change, so nothing needs typing.
@@ -166,7 +166,7 @@ echo
 
 echo "== 2. loopback cable"
 if [ $LOOPBACK = 0 ]; then
-    for t in "restarts" "glitch test, 30 s" "glitch test idle + loaded (dptest)" "48 kHz" "output volume and mute" "level meters" "fault hook: USB stall" "fault hook: errored capture packets"; do
+    for t in "restarts" "glitch test, 30 s" "glitch test idle + loaded (dptest)" "48 kHz" "output volume and mute" "level meters" "early capture read" "fault hook: USB stall" "fault hook: errored capture packets"; do
         record SKIP "$t" "no --loopback"
     done
 else
@@ -262,6 +262,26 @@ else
         record FAIL "level meters" "${m:-no reading}"
     fi
 
+    # The early capture read (debug build): a 20 ms stall in USB completion delivery, 3 s into a 10 s
+    # glitch test at a 64-frame buffer, must make no gap (ReadInput takes the packets from the queued
+    # buffers, not from the late completions), and the driver's early-read counters must show no frame
+    # placed differently from the completion and none missing when ReadInput asked for it.
+    if [ $BUILD = debug ]; then
+        start=$(now)
+        ( sleep 3; "$B/sl2dbg" stall 20 >/dev/null ) &
+        sine=$("$B/sinetest" "$DEV" 1 1 10 64 | grep RESULT); wait
+        er=$(driver_log_since "$start" 'DBG early read result' | head -1)
+        gap=$(driver_log_since "$start" 'Capture: [0-9]+ ms not captured' | head -1)
+        diff=$(echo "$er" | grep -oE 'completion found [0-9]+ different' | grep -oE '[0-9]+')
+        short=$(echo "$er" | grep -oE 'SILENCE \(not captured yet\) [0-9]+' | grep -oE '[0-9]+$')
+        margin=$(echo "$er" | grep -oE 'least margin -?[0-9.]+ ms')
+        if echo "$sine" | grep -q ' 0 glitches' && [ -z "$gap" ] && [ "${diff:-x}" = 0 ] && [ "${short:-x}" = 0 ]; then
+            record PASS "early capture read" "20 ms stall, no gap; $margin"
+        else
+            record FAIL "early capture read" "result '$sine', different ${diff:-?}, missing ${short:-?}, ${gap:-no gap logged}"
+        fi
+    fi
+
     # The fault hooks (debug build), each injected 3 s into a 10 s glitch test: a 100 ms stall in USB
     # completion delivery (the driver must fill the gap with silence and log it) and 20 errored
     # capture packets (the driver must take them, and playback must stay matched to capture: sent -
@@ -290,6 +310,7 @@ else
             fi
         done
     else
+        record SKIP "early capture read" "release build (make install DEBUG=1)"
         record SKIP "fault hook: USB stall" "release build (make install DEBUG=1)"
         record SKIP "fault hook: errored capture packets" "release build (make install DEBUG=1)"
     fi
