@@ -45,7 +45,7 @@ unless noted.
 `0672a0e` and the deep-schedule build, were assigned to "A" and "B" at random. The tester judged A "much
 laggier" than B, conclusively. A was the old driver.
 
-At a 64-frame IO buffer (the size the Windows driver uses), the round trip breaks down as:
+At a 64-frame IO buffer, the round trip breaks down as:
 
 | Part | Time |
 |---|---|
