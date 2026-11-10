@@ -117,7 +117,7 @@ static os_log_t g_log;
 #define LOG(fmt, ...) os_log(g_log, "[SL2] " fmt, ##__VA_ARGS__)
 
 /* Debug build (make plugin DEBUG=1): streaming diagnostics (counters, timing histograms, periodic
-   "DBG" log lines) and the 'sl2h' debug commands 0xF2-0xF5 (input safety offset and test hooks,
+   "DBG" log lines) and the 'sl2h' debug commands 0xF2-0xF4 (input safety offset and test hooks,
    handled by the driver and never sent to the box; see dbg_command). A release build compiles
    none of it, and refuses every 'sl2h' command from 0xF0 up. */
 #ifndef SL2_DEBUG
@@ -147,50 +147,8 @@ static double   dbg_dp_err_max;
 /* Test hooks */
 static _Atomic uint32_t dbg_stall_ms;      /* 0xF3: hold the USB queue (g_q) this many ms, once */
 static _Atomic uint32_t dbg_err_pkts;      /* 0xF4: treat this many more capture packets as errored */
-static _Atomic uint32_t dbg_capbuf_iodata; /* 0xF5: capture buffers from ioDataWithCapacity: (from the next stream) */
-
-/* Early-read probe (measurement only: what ReadInput returns is unchanged). Each capture buffer is
-   filled with 0xFF before it is queued; the low byte of every real 32-bit sample is 0 (24-bit audio,
-   left-justified), so a frame whose first byte reads 0x00 has landed in memory. On every ReadInput
-   the IO thread looks into the queued capture buffers and notes, per packet, the latest age at which
-   it was still not visible and the age at which it was first seen, where age is the time since the
-   end of the packet's microframe on the bus. cap_complete bins both when the transfer completes.
-   If the controller writes straight into our buffer, packets become visible within a fraction of a
-   ms of their microframe's end, long before their completion is delivered. */
-#define PR_BINS   44                        /* 0.25 ms bins from -1 ms */
-#define PR_NONE   INT32_MIN
-static uint8_t *g_cap_ptr[CAP_NXF];         /* capture buffers' bytes, for the IO thread */
-static _Atomic uint64_t g_cap_probe_tag[CAP_NXF];            /* USB frame a queued buffer is for, 0 = not queued */
-static _Atomic uint8_t  dbg_pr_seen[CAP_NXF][CAP_PKTS];      /* frames seen early in each packet */
-static _Atomic int32_t  dbg_pr_invis[CAP_NXF][CAP_PKTS];     /* latest age (us) still not visible */
-static _Atomic int32_t  dbg_pr_first[CAP_NXF][CAP_PKTS];     /* age (us) first seen visible */
-/* The same for the transfer's own transaction list: completeCount and timeStamp are 0 when it is
-   queued, so a nonzero one before the completion means the kernel updates our array as it goes. */
-static _Atomic int32_t  dbg_pr_txfirst[CAP_NXF][CAP_PKTS];   /* age (us) first seen updated */
-static uint32_t dbg_pr_tx_early, dbg_pr_tx_count_ok, dbg_pr_done_is_ours, dbg_pr_done_other;   /* g_q */
-static uint32_t dbg_pr_htx[PR_BINS];                              /* g_q */
-static uint32_t dbg_pr_hinvis[PR_BINS], dbg_pr_hfirst[PR_BINS];   /* g_q */
-static int32_t  dbg_pr_invis_max_k[CAP_PKTS];                     /* g_q: per packet index */
-static uint32_t dbg_pr_match, dbg_pr_partial, dbg_pr_over, dbg_pr_unseen, dbg_pr_pkts;   /* g_q */
-static uint64_t dbg_pr_lowbyte_nz, dbg_pr_samples;                /* g_q */
-static _Atomic uint32_t dbg_pr_torn, dbg_pr_probes;
-static int32_t  dbg_rd_lag_min, dbg_rd_lag_max;   /* IO thread: ReadInput's end, us behind the timeline's now */
-
-static void dbg_probe_reset(void) {
-    memset(dbg_pr_hinvis, 0, sizeof dbg_pr_hinvis);
-    memset(dbg_pr_hfirst, 0, sizeof dbg_pr_hfirst);
-    for (int k = 0; k < CAP_PKTS; k++) dbg_pr_invis_max_k[k] = PR_NONE;
-    dbg_pr_match = dbg_pr_partial = dbg_pr_over = dbg_pr_unseen = dbg_pr_pkts = 0;
-    dbg_pr_lowbyte_nz = dbg_pr_samples = 0;
-    memset(dbg_pr_htx, 0, sizeof dbg_pr_htx);
-    dbg_pr_tx_early = dbg_pr_tx_count_ok = dbg_pr_done_is_ours = dbg_pr_done_other = 0;
-    dbg_pr_torn = dbg_pr_probes = 0;
-    dbg_rd_lag_min = INT32_MAX; dbg_rd_lag_max = INT32_MIN;
-    for (int i = 0; i < CAP_NXF; i++) atomic_store(&g_cap_probe_tag[i], 0);
-}
 
 static void dbg_reset(void) {
-    dbg_probe_reset();
     memset(dbg_capdelay_hist, 0, sizeof dbg_capdelay_hist);
     dbg_capdelay_min = dbg_capstamp_min = 1e9; dbg_capdelay_max = dbg_capstamp_max = -1e9;
     dbg_cap_pkt_err = 0;
@@ -1118,134 +1076,6 @@ static uint64_t cap_frames_in(uint64_t uframes) {
     return n;
 }
 
-#if SL2_DEBUG
-/* Early-read probe (see dbg_pr_*). */
-static int pr_bin(int32_t us) {
-    int b = (int)floor((us + 1000) / 250.0);
-    return b < 0 ? 0 : b >= PR_BINS ? PR_BINS - 1 : b;
-}
-
-/* cap_submit, before queueing transfer idx for frame f: mark the buffer and publish it. */
-static void dbg_probe_arm(int idx, uint64_t f) {
-    atomic_store_explicit(&g_cap_probe_tag[idx], 0, memory_order_release);
-    if (g_cap_ptr[idx]) memset(g_cap_ptr[idx], 0xFF, CAP_PKTS * PKT_MAX);
-    for (int k = 0; k < CAP_PKTS; k++) {
-        atomic_store_explicit(&dbg_pr_seen[idx][k], 0, memory_order_relaxed);
-        atomic_store_explicit(&dbg_pr_invis[idx][k], PR_NONE, memory_order_relaxed);
-        atomic_store_explicit(&dbg_pr_first[idx][k], PR_NONE, memory_order_relaxed);
-        atomic_store_explicit(&dbg_pr_txfirst[idx][k], PR_NONE, memory_order_relaxed);
-    }
-    if (g_cap_ptr[idx]) atomic_store_explicit(&g_cap_probe_tag[idx], f, memory_order_release);
-}
-
-/* ReadInput (IO thread): look into every queued capture buffer. No locks, no allocation. */
-static void dbg_probe_scan(void) {
-    uint64_t now = mach_absolute_time();
-    uint64_t uf, ut;
-    dp_ref_get(&uf, &ut);
-    double tpu = ticks_per_ms() / 8.0;              /* host ticks per microframe */
-    double us_per_tick = 1000.0 / ticks_per_ms();
-    atomic_fetch_add_explicit(&dbg_pr_probes, 1, memory_order_relaxed);
-    for (int i = 0; i < CAP_NXF; i++) {
-        uint64_t f = atomic_load_explicit(&g_cap_probe_tag[i], memory_order_acquire);
-        const uint8_t *b = g_cap_ptr[i];
-        const volatile IOUSBHostIsochronousTransaction *tx = g_cap_xf[i].tx;
-        if (!f || !b || !tx) continue;
-        for (int k = 0; k < CAP_PKTS; k++) {
-            /* Age: now minus the end of the packet's microframe (8f + k + 1). */
-            double end = (double)ut + ((double)(8 * f + k + 1) - (double)uf) * tpu;
-            double a = ((double)now - end) * us_per_tick;
-            if (a < -1000.0) break;                 /* this and later packets are still in the future */
-            int32_t age = (int32_t)a;
-            if ((tx[k].completeCount || tx[k].timeStamp) &&
-                atomic_load_explicit(&dbg_pr_txfirst[i][k], memory_order_relaxed) == PR_NONE)
-                atomic_store_explicit(&dbg_pr_txfirst[i][k], age, memory_order_relaxed);
-            const volatile uint8_t *p = b + k * PKT_MAX;
-            int n = 0;
-            while (n < PKT_MAX / FRAME_BYTES && p[n * FRAME_BYTES] == 0x00) n++;
-            if (n == 0) {
-                atomic_store_explicit(&dbg_pr_invis[i][k], age, memory_order_relaxed);
-            } else {
-                if (atomic_load_explicit(&dbg_pr_seen[i][k], memory_order_relaxed) == 0)
-                    atomic_store_explicit(&dbg_pr_first[i][k], age, memory_order_relaxed);
-                atomic_store_explicit(&dbg_pr_seen[i][k], (uint8_t)n, memory_order_relaxed);
-            }
-        }
-        /* The buffer was completed and re-queued while we looked: what we noted may be mixed up. */
-        if (atomic_load_explicit(&g_cap_probe_tag[i], memory_order_acquire) != f)
-            atomic_fetch_add_explicit(&dbg_pr_torn, 1, memory_order_relaxed);
-    }
-}
-
-static void dbg_hist_str(char *out, size_t sz, const uint32_t *h) {
-    int o = 0;
-    out[0] = 0;
-    for (int i = 0; i < PR_BINS && o < (int)sz - 16; i++)
-        if (h[i]) o += snprintf(out + o, sz - o, " %+.2f:%u", -1.0 + 0.25 * i, h[i]);
-}
-
-static void dbg_probe_log(const char *what) {
-    char hi[700], hf[700], mk[200];
-    dbg_hist_str(hi, sizeof hi, dbg_pr_hinvis);
-    dbg_hist_str(hf, sizeof hf, dbg_pr_hfirst);
-    int o = 0;
-    for (int k = 0; k < CAP_PKTS; k++)
-        o += snprintf(mk + o, sizeof mk - o, " %.2f", dbg_pr_invis_max_k[k] == PR_NONE ? -9.99 : dbg_pr_invis_max_k[k] / 1000.0);
-    DBG_LOG("DBG probe %{public}s (%{public}s buffers): packets %u: seen early %u (all frames %u, partial %u, "
-        "MORE than delivered %u), never seen before completion %u | probes %u, torn %u | sample low byte "
-        "nonzero %llu of %llu | ReadInput end behind now %.2f..%.2f ms",
-        what, atomic_load(&dbg_capbuf_iodata) ? "ioData" : "heap", dbg_pr_pkts,
-        dbg_pr_match + dbg_pr_partial + dbg_pr_over, dbg_pr_match, dbg_pr_partial, dbg_pr_over, dbg_pr_unseen,
-        atomic_load(&dbg_pr_probes), atomic_load(&dbg_pr_torn), dbg_pr_lowbyte_nz, dbg_pr_samples,
-        dbg_rd_lag_min / 1000.0, dbg_rd_lag_max / 1000.0);
-    DBG_LOG("DBG probe %{public}s: last NOT visible, ms after microframe end (bin:count):%{public}s", what, hi);
-    DBG_LOG("DBG probe %{public}s: first visible, ms after microframe end (bin:count):%{public}s", what, hf);
-    DBG_LOG("DBG probe %{public}s: latest still-not-visible age per packet 0-7 (ms):%{public}s", what, mk);
-    char ht[700];
-    dbg_hist_str(ht, sizeof ht, dbg_pr_htx);
-    DBG_LOG("DBG probe %{public}s: transaction list: completion's array is ours %u / a copy %u | packets whose "
-        "completeCount/timeStamp changed in our array before completion %u (count matches %u), first seen "
-        "(ms after microframe end, bin:count):%{public}s",
-        what, dbg_pr_done_is_ours, dbg_pr_done_other, dbg_pr_tx_early, dbg_pr_tx_count_ok, ht);
-}
-
-/* cap_complete (g_q): take transfer idx's probe results. */
-static void dbg_probe_complete(int idx, const IOUSBHostIsochronousTransaction *done) {
-    atomic_store_explicit(&g_cap_probe_tag[idx], 0, memory_order_release);
-    if (!g_cap_ptr[idx]) return;
-    if (done == g_cap_xf[idx].tx) dbg_pr_done_is_ours++; else dbg_pr_done_other++;
-    for (int k = 0; k < CAP_PKTS; k++) {
-        if (done[k].status != kIOReturnSuccess || done[k].completeCount > PKT_MAX) continue;
-        int actual = done[k].completeCount / FRAME_BYTES;
-        if (!actual) continue;
-        dbg_pr_pkts++;
-        /* The low byte of each delivered sample: the probe relies on it being 0. */
-        const uint8_t *p = g_cap_ptr[idx] + k * PKT_MAX;
-        for (int s = 0; s < actual * NCH; s++) { dbg_pr_samples++; if (p[s * 4]) dbg_pr_lowbyte_nz++; }
-        int seen = atomic_load_explicit(&dbg_pr_seen[idx][k], memory_order_relaxed);
-        int32_t inv = atomic_load_explicit(&dbg_pr_invis[idx][k], memory_order_relaxed);
-        int32_t fst = atomic_load_explicit(&dbg_pr_first[idx][k], memory_order_relaxed);
-        if (!seen) dbg_pr_unseen++;
-        else if (seen == actual) dbg_pr_match++;
-        else if (seen < actual) dbg_pr_partial++;
-        else dbg_pr_over++;
-        if (inv != PR_NONE) {
-            dbg_pr_hinvis[pr_bin(inv)]++;
-            if (inv > dbg_pr_invis_max_k[k]) dbg_pr_invis_max_k[k] = inv;
-        }
-        if (fst != PR_NONE) dbg_pr_hfirst[pr_bin(fst)]++;
-        int32_t txf = atomic_load_explicit(&dbg_pr_txfirst[idx][k], memory_order_relaxed);
-        if (txf != PR_NONE) {
-            dbg_pr_tx_early++;
-            dbg_pr_htx[pr_bin(txf)]++;
-            if (g_cap_xf[idx].tx[k].completeCount == done[k].completeCount) dbg_pr_tx_count_ok++;
-        }
-    }
-    static uint32_t n;
-    if (++n % 4000 == 0) dbg_probe_log("so far");
-}
-#endif
-
 static void cap_submit(int idx, uint32_t gen);
 
 /* A capture transfer for USB frame fc completed: put its frames in the ring, keep the clock and the
@@ -1273,7 +1103,6 @@ static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *
         if (stamp < dbg_capstamp_min) dbg_capstamp_min = stamp;
         if (stamp > dbg_capstamp_max) dbg_capstamp_max = stamp;
     }
-    dbg_probe_complete(idx, done);
 #endif
     uint64_t before = atomic_load_explicit(&g_total_cap_frames, memory_order_relaxed);   /* frames captured so far */
 
@@ -1377,7 +1206,6 @@ static void cap_submit(int idx, uint32_t gen) {
         IOUSBHostIsochronousTransaction *tx = g_cap_xf[idx].tx;
         for (int k = 0; k < CAP_PKTS; k++)
             tx[k] = (IOUSBHostIsochronousTransaction){ .requestCount = PKT_MAX, .offset = (uint32_t)(k * PKT_MAX) };
-        DBG_DO(dbg_probe_arm(idx, f));
 
         /* Queue it for frame f; its completion hands the packets to cap_complete. */
         NSError *e = nil;
@@ -1389,7 +1217,6 @@ static void cap_submit(int idx, uint32_t gen) {
             cap_complete(idx, f, done, gen);
         }];
         if (ok) return;
-        DBG_DO(atomic_store(&g_cap_probe_tag[idx], 0));
         /* Refused (the frame passed while this ran): take the next one. */
         LOG("Capture enqueue refused for frame %llu (now ~%llu): %{public}@", f, now_f, e.localizedDescription);
         g_cap_frame = now_f + DP_START_LEAD + attempt + 1;
@@ -1525,13 +1352,6 @@ static void usb_release_audio(void) {
     /* Release buffers and pipes on g_q, behind any completion handler already queued there. */
     if (g_q) dispatch_sync(g_q, ^{
         dp_release();
-#if SL2_DEBUG   /* ioData capture buffers (0xF5) hold the capture interface open, like the schedule's */
-        for (int i = 0; i < CAP_NXF; i++) {
-            atomic_store(&g_cap_probe_tag[i], 0);
-            g_cap_ptr[i] = NULL;
-            g_cap_xf[i].buf = nil;
-        }
-#endif
         g_cpipe = nil; g_ppipe = nil;
     });
     /* Put the interfaces back to alternate setting 0 and let them go for the next stream. */
@@ -1592,19 +1412,8 @@ static bool usb_open_all(void) {
         return false;
     }
     for (int i = 0; i < CAP_NXF; i++) {
-#if SL2_DEBUG   /* early-read probe: capture buffers from the capture interface, if asked (0xF5) */
-        if (atomic_load(&dbg_capbuf_iodata)) {
-            g_cap_xf[i].buf = [g_cap ioDataWithCapacity:CAP_PKTS * PKT_MAX error:&e];
-            if (!g_cap_xf[i].buf) {
-                LOG("Capture: buffer allocation failed: %{public}@", e);
-                usb_release_audio();
-                return false;
-            }
-        }
-#endif
         if (!g_cap_xf[i].buf) g_cap_xf[i].buf = [NSMutableData dataWithLength:CAP_PKTS * PKT_MAX];
         if (!g_cap_xf[i].tx)  g_cap_xf[i].tx  = calloc(CAP_PKTS, sizeof(IOUSBHostIsochronousTransaction));
-        DBG_DO(g_cap_ptr[i] = g_cap_xf[i].buf.mutableBytes);
     }
 
     /* Decks to USB audio. */
@@ -1651,7 +1460,6 @@ static void usb_stop_streaming(bool box_attached) {
             "min %.2f max %.2f | stack stamp min %.2f max %.2f",
             hb, dbg_capdelay_min, dbg_capdelay_max, dbg_capstamp_min, dbg_capstamp_max);
     }
-    dbg_probe_log("result");
 #endif
     /* Release the audio interfaces, then put the decks back on analogue thru if the box is here. */
     usb_release_audio();
@@ -2672,9 +2480,7 @@ static OSStatus SL2_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
      0xF2 <ms>         input safety offset (the HAL reads it only at device setup, so it applies to
                        a device set up again, not to the running one)
      0xF3 <ms hi> <lo> hold the USB queue this long, once, as a completion stall would
-     0xF4 <n>          treat the next n capture packets as errored
-     0xF5 <0|1>        capture buffers from the heap (0) or ioDataWithCapacity: (1), from the next
-                       stream (early-read probe, see dbg_pr_*) */
+     0xF4 <n>          treat the next n capture packets as errored */
 static OSStatus dbg_command(const uint8_t *c, CFIndex len) {
     /* Every command needs at least its first argument byte, [5]. */
     if (len < 6) return kAudioHardwareBadPropertySizeError;
@@ -2693,10 +2499,6 @@ static OSStatus dbg_command(const uint8_t *c, CFIndex len) {
         case 0xF4:
             atomic_store(&dbg_err_pkts, c[5]);
             DBG_LOG("DBG next %u capture packets treated as errored", c[5]);
-            return 0;
-        case 0xF5:
-            atomic_store(&dbg_capbuf_iodata, c[5] ? 1 : 0);
-            DBG_LOG("DBG capture buffers from the next stream: %{public}s", c[5] ? "ioDataWithCapacity:" : "heap (NSMutableData)");
             return 0;
     }
     return kAudioHardwareIllegalOperationError;
@@ -2849,19 +2651,6 @@ static OSStatus SL2_DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID oi
             }
             memcpy(buf + f * NCH, &g_in_ring[(p & RING_MASK) * NCH], NCH * sizeof(float));
         }
-#if SL2_DEBUG
-        {   /* Early-read probe, while the stream's buffers exist (dp_stop waits for g_dp_writers),
-               and where ReadInput's end sits behind the timeline's "now". */
-            atomic_fetch_add_explicit(&g_dp_writers, 1, memory_order_seq_cst);
-            if (atomic_load_explicit(&g_dp_active, memory_order_seq_cst)) {
-                dbg_probe_scan();
-                int32_t lag = (int32_t)((clk_sample_at(mach_absolute_time()) - (double)(pos + frames)) * 1e6 / g_sr);
-                if (lag < dbg_rd_lag_min) dbg_rd_lag_min = lag;
-                if (lag > dbg_rd_lag_max) dbg_rd_lag_max = lag;
-            }
-            atomic_fetch_sub_explicit(&g_dp_writers, 1, memory_order_release);
-        }
-#endif
 
         /* ProcessMix: the mix of all clients, before WriteMix: apply the output volume. */
     } else if (op == kAudioServerPlugInIOOperationProcessMix) {
