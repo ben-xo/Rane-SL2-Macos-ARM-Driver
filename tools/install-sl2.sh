@@ -70,5 +70,4 @@ killall -9 AirPlayXPCHelper 2>/dev/null || true   # can loop re-registering with
 sleep 2
 killall ControlCenter 2>/dev/null || true
 killall -9 QuickLookUIService 2>/dev/null || true   # ignores SIGTERM
-echo "note: quit and reopen Audio MIDI Setup if it is open"
 echo "installed $(shasum -a 256 "$DRV/Contents/MacOS/SL2Device" | cut -c1-16) and restarted coreaudiod"
