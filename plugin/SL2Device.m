@@ -123,7 +123,7 @@ static os_log_t g_log;
 #define LOG(fmt, ...) os_log(g_log, "[SL2] " fmt, ##__VA_ARGS__)
 
 /* Debug build (make plugin DEBUG=1): streaming diagnostics (counters, timing histograms, periodic
-   "DBG" log lines) and the 'sl2h' debug commands 0xF2-0xF4 (input safety offset and test hooks,
+   "DBG" log lines) and the 'sl2h' debug commands 0xF3-0xF5 (test hooks,
    handled by the driver and never sent to the box; see dbg_command). A release build compiles
    none of it, and refuses every 'sl2h' command from 0xF0 up. */
 #ifndef SL2_DEBUG
@@ -1284,8 +1284,10 @@ static void cap_read_early(void) {
             break;
         }
         /* Count the frames that arrived by their marks; none means missing or errored. A frame counts
-           only once the pad bytes of its first and last samples both read 0, so one caught part-way
-           through being written is not taken. */
+           only once the pad bytes of its first and last samples both read 0. That catches most frames
+           caught part-way through being written, but not the last sample's three audio bytes (no byte
+           value marks those): the settle time (CAP_SETTLE_UF) is what keeps the early reader clear of
+           a packet still being written. */
         const volatile uint8_t *p = g_cap_bytes[idx] + k * PKT_MAX;
         int n = 0;
         while (n < PKT_MAX / FRAME_BYTES && p[n * FRAME_BYTES] == 0x00 &&
@@ -1538,7 +1540,6 @@ static int svc_bcd(io_service_t svc) {
     return v;
 }
 
-/* The attached SL 2 running its firmware (the caller releases it), or IO_OBJECT_NULL. */
 /* USB hubs between the box and the Mac: the USB devices among the box's ancestors (each hub is one;
    the Mac's own ports belong to its controller). Reported in the status. */
 static _Atomic uint32_t g_hub_depth;
@@ -1555,6 +1556,7 @@ static uint32_t usb_hub_depth(io_service_t svc) {
     return hubs;
 }
 
+/* The attached SL 2 running its firmware (the caller releases it), or IO_OBJECT_NULL. */
 static io_service_t find_sl2_service(void) {
     /* Every USB device with the SL 2's vendor and product IDs. */
     CFMutableDictionaryRef m = IOServiceMatching(kIOUSBDeviceClassName);
