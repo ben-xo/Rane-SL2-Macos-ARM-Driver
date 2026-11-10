@@ -191,7 +191,7 @@ echo
 
 echo "== 2. loopback cable"
 if [ $LOOPBACK = 0 ]; then
-    for t in "restarts" "glitch test, 30 s" "glitch test idle + loaded (dptest)" "48 kHz" "output volume and mute" "level meters" "early capture read" "early-read fallback" "fault hook: USB stall" "fault hook: errored capture packets"; do
+    for t in "restarts" "glitch test, 30 s" "glitch test idle + loaded (dptest)" "48 kHz" "output volume and mute" "level meters" "early capture read" "early read reported not working" "fault hook: USB stall" "fault hook: errored capture packets"; do
         record SKIP "$t" "no --loopback"
     done
 else
@@ -307,25 +307,21 @@ else
         fi
     fi
 
-    # The early-read fallback (debug build): with the early reader switched off (as on a Mac where it
-    # can't work), a stream must judge it not working, and once the stream stops the driver must set
-    # the device up again with the 8 ms fallback, keeping the setting. Setting the setting again clears
-    # the fallback.
+    # The early read reported not working (debug build): with the early reader switched off (as on a
+    # Mac where it can't work), a stream must judge it not working, and leave the input safety offset
+    # alone; setting the setting again has the next stream judge it afresh.
     if [ $BUILD = debug ]; then
-        set_us=$("$PANEL" safety | grep -oE '[0-9]+\.[0-9]' | head -1)
+        set_ms=$("$PANEL" safety | grep -oE '[0-9]+(\.[0-9]+)? ms' | head -1 | cut -d' ' -f1)
         "$B/sl2dbg" noearly 1 >/dev/null
         "$B/sinetest" "$DEV" 1 1 3 64 >/dev/null 2>&1
-        # The driver sets the device up again once the stream stops (the device is out of the list
-        # for about half a second): wait for that before talking to it again.
-        WAIT_S=5 wait_until "the 8 ms fallback" sh -c "'$PANEL' status | grep -q 'Input Safety  : 8.0 ms'"; fell=$?
-        WAIT_S=5 wait_until "the early reader back on" "$B/sl2dbg" noearly 0
-        er=$(field 'Early Read')
-        "$PANEL" safety "$set_us" >/dev/null
-        WAIT_S=5 wait_until "the setting again" sh -c "'$PANEL' status | grep -q 'Input Safety  : $set_us ms'"; back=$?
-        if [ "${er#NOT WORKING}" != "$er" ] && [ $fell = 0 ] && [ $back = 0 ]; then
-            record PASS "early-read fallback" "judged not working, 8 ms, then $set_us ms again"
+        "$B/sl2dbg" noearly 0 >/dev/null
+        er=$(field 'Early Read'); safety=$(field 'Input Safety')
+        "$PANEL" safety "$set_ms" >/dev/null
+        WAIT_S=5 wait_until "the judgement cleared" sh -c "'$PANEL' status | grep -q 'Early Read    : not judged yet'"; cleared=$?
+        if [ "${er#NOT WORKING}" != "$er" ] && [ "$safety" = "$("$PANEL" status | sed -nE 's/^  Input Safety *: *//p')" ] && [ $cleared = 0 ]; then
+            record PASS "early read reported not working" "offset left at $safety; judged afresh after setting it"
         else
-            record FAIL "early-read fallback" "early read '$er', fallback $([ $fell = 0 ] && echo yes || echo no), restored $([ $back = 0 ] && echo yes || echo no)"
+            record FAIL "early read reported not working" "early read '$er', offset '$safety', cleared $([ $cleared = 0 ] && echo yes || echo no)"
         fi
     fi
 
@@ -358,7 +354,7 @@ else
         done
     else
         record SKIP "early capture read" "release build (make install DEBUG=1)"
-        record SKIP "early-read fallback" "release build (make install DEBUG=1)"
+        record SKIP "early read reported not working" "release build (make install DEBUG=1)"
         record SKIP "fault hook: USB stall" "release build (make install DEBUG=1)"
         record SKIP "fault hook: errored capture packets" "release build (make install DEBUG=1)"
     fi

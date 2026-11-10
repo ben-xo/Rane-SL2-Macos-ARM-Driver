@@ -101,7 +101,6 @@ typedef struct {
     uint32_t debug_build;    /* 1 = this driver was built with SL2_DEBUG (make plugin DEBUG=1) */
     /* Input health (see "Early read" and the input safety offset) */
     uint32_t in_safety_us;          /* the input safety offset the HAL is using, in us */
-    uint32_t in_safety_setting_us;  /* the setting ('sl2i'); in_safety_us is larger while it has fallen back */
     uint32_t early_read;            /* 0 = not judged yet on this connection, 1 = working, 2 = not working */
     uint32_t hub_depth;             /* USB hubs between the box and the Mac: 0 = connected directly */
     uint64_t in_dropouts;           /* IO cycles since the box connected in which input wasn't captured in time */
@@ -233,27 +232,22 @@ static uint64_t g_clk_last_fix = 0;  /* captured-frame count at the last clk_tra
    1.5 ms, ReadInput found every frame it was asked for at least 0.6 ms early, idle and under load
    (measured).
    - g_in_safety_set_us is the setting: 'sl2i', kept in the plug-in's storage so it survives restarts.
-   - Where the early read turns out not to work (early_read_judge), the offset falls back to
-     IN_SAFETY_FALLBACK_US until the box is connected again or the setting is changed (g_in_fallback).
+   - Where the early read turns out not to work (early_read_judge), the driver says so (the log and
+     the status) and IN_SAFETY_SAFE_US is the setting to choose; it doesn't change it by itself,
+     which would take the device away from apps holding it.
    - The HAL reads the offset only when it sets the device up, so g_in_safety_us, the value the
      property reports, changes only just before the device is listed (in_safety_apply): it is always
      the value the HAL is using. */
 #define IN_SAFETY_DEFAULT_US   1500
-#define IN_SAFETY_FALLBACK_US  8000
+#define IN_SAFETY_SAFE_US      8000   /* covers completion delivery, for where the early read doesn't work */
 #define IN_SAFETY_MIN_US       500
 #define IN_SAFETY_MAX_US       20000
 #define IN_SAFETY_STORAGE_KEY  CFSTR("input safety offset us")
 static _Atomic int  g_in_safety_set_us = IN_SAFETY_DEFAULT_US;
-static _Atomic bool g_in_fallback;
 static _Atomic int  g_in_safety_us = IN_SAFETY_DEFAULT_US;
-/* The offset the device should be set up with: the setting, or the fallback if that is larger. */
-static int in_safety_wanted_us(void) {
-    int us = atomic_load(&g_in_safety_set_us);
-    return (atomic_load(&g_in_fallback) && us < IN_SAFETY_FALLBACK_US) ? IN_SAFETY_FALLBACK_US : us;
-}
 /* Just before the device is listed, so the HAL reads it as it sets the device up. */
 static void in_safety_apply(void) {
-    atomic_store(&g_in_safety_us, in_safety_wanted_us());
+    atomic_store(&g_in_safety_us, atomic_load(&g_in_safety_set_us));
 }
 /* The setting, from and to the plug-in's storage (the HAL keeps it for the plug-in). */
 static void in_safety_load(void) {
@@ -1159,8 +1153,8 @@ static int      g_er_k;
 static uint64_t g_er_at_fc[CAP_MAP_N], g_er_at_pos[CAP_MAP_N];   /* position at each USB frame's start */
 /* Whether the early read works on this connection. Each stream judges it once there is a second of
    capture and ReadInput has asked for half a second of it (early_read_judge): it works if it placed
-   frames and the completions found almost none of them different. If it doesn't, the input safety
-   offset falls back (g_in_fallback). Reported in the status, with the input dropouts. */
+   frames and the completions found almost none of them different. If it doesn't, the log and the
+   status say so, with the input dropouts. */
 enum { EARLY_UNKNOWN = 0, EARLY_WORKING = 1, EARLY_FAILED = 2 };
 static _Atomic uint32_t g_early_state;            /* this connection's latest judgement */
 static _Atomic uint64_t g_er_placed;              /* frames placed early in this stream */
@@ -1340,17 +1334,16 @@ static uint64_t cap_frames_in(uint64_t uframes) {
 }
 
 /* Judge whether the early read works on this connection (g_q; see g_early_state), and if it doesn't,
-   fall back to IN_SAFETY_FALLBACK_US from the next time no app is using the device (SL2_StopIO). */
+   say so, once per connection. */
 static void early_read_judge(void) {
     g_er_judged = true;
     uint64_t placed = atomic_load(&g_er_placed);
     bool works = placed > 0 && g_er_differ * 100 <= placed;
-    atomic_store(&g_early_state, works ? EARLY_WORKING : EARLY_FAILED);
-    if (works) return;
-    if (!atomic_exchange(&g_in_fallback, true))
+    uint32_t was = atomic_exchange(&g_early_state, works ? EARLY_WORKING : EARLY_FAILED);
+    if (!works && was != EARLY_FAILED)
         LOG("Capture can't be read early on this connection (%llu frames placed early, %llu of them differently "
-            "from their completion): input safety offset %.1f ms once no app is using the SL 2",
-            placed, g_er_differ, in_safety_wanted_us() / 1000.0);
+            "from their completion): input can drop out below an input safety offset of %d ms",
+            placed, g_er_differ, IN_SAFETY_SAFE_US / 1000);
 }
 
 static void cap_submit(int idx, uint32_t gen);
@@ -1892,11 +1885,11 @@ static void relist_device(void) {
         LOG("Device set up again: input safety offset %.1f ms", atomic_load(&g_in_safety_us) / 1000.0);
     });
 }
-/* ... if the offset the device should have differs from the one it was set up with. */
+/* ... if the setting differs from the offset the device was set up with. */
 static void relist_if_safety_changed(void) {
     if (!g_hotplug_q) return;
     dispatch_async(g_hotplug_q, ^{
-        if (atomic_load(&g_in_safety_us) != in_safety_wanted_us()) relist_device();
+        if (atomic_load(&g_in_safety_us) != atomic_load(&g_in_safety_set_us)) relist_device();
     });
 }
 
@@ -1944,8 +1937,7 @@ static void on_usb_added(void *refcon, io_iterator_t iter) {
 
     /* A box with firmware: open it. */
     if (audio) {
-        /* A new connection: its early read is judged afresh, without a fallback. */
-        atomic_store(&g_in_fallback, false);
+        /* A new connection: its early read is judged afresh. */
         atomic_store(&g_early_state, EARLY_UNKNOWN);
         atomic_store(&g_in_dropouts, 0);
         atomic_store(&g_boot_mode, false);
@@ -2722,7 +2714,6 @@ static OSStatus get_property_data(AudioServerPlugInDriverRef d, AudioObjectID oi
                 g_st.boot_mode = atomic_load(&g_boot_mode) ? 1 : 0;
                 g_st.debug_build = SL2_DEBUG ? 1 : 0;
                 g_st.in_safety_us = (uint32_t)atomic_load(&g_in_safety_us);
-                g_st.in_safety_setting_us = (uint32_t)atomic_load(&g_in_safety_set_us);
                 g_st.early_read = atomic_load(&g_early_state);
                 g_st.hub_depth = atomic_load(&g_hub_depth);
                 g_st.in_dropouts = atomic_load(&g_in_dropouts);
@@ -2881,8 +2872,8 @@ static OSStatus dbg_command(const uint8_t *c, CFIndex len) {
 static OSStatus SL2_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID oid, pid_t pid, const AudioObjectPropertyAddress *addr, UInt32 qsz, const void *qd, UInt32 inSize, const void *inData) {
     /* 'sl2i': the input safety offset setting, in us (IN_SAFETY_MIN_US to IN_SAFETY_MAX_US). The HAL
        reads safety offsets only when it sets the device up, so it changes only with nothing
-       streaming: refused otherwise. The setting is kept, and the device set up again with it. Setting
-       it also clears a fallback (see early_read_judge): the next stream judges the early read afresh. */
+       streaming: refused otherwise. The setting is kept, and the device set up again with it; the next
+       stream judges the early read afresh. */
     if (oid == kObjDevice && addr->mSelector == kSL2PropInSafety) {
         if (inSize != sizeof(CFNumberRef) || !inData) return kAudioHardwareBadPropertySizeError;
         CFNumberRef n = *(CFNumberRef*)inData;
@@ -2891,7 +2882,6 @@ static OSStatus SL2_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
             us < IN_SAFETY_MIN_US || us > IN_SAFETY_MAX_US) return kAudioHardwareIllegalOperationError;
         if (atomic_load(&g_io_running)) return kAudioHardwareIllegalOperationError;
         atomic_store(&g_in_safety_set_us, us);
-        atomic_store(&g_in_fallback, false);
         atomic_store(&g_early_state, EARLY_UNKNOWN);
         in_safety_save();
         LOG("Input safety offset setting: %.1f ms", us / 1000.0);
@@ -2996,11 +2986,7 @@ static OSStatus SL2_StopIO(AudioServerPlugInDriverRef d, AudioObjectID oid, UInt
     } else {
         LOG("StopIO with no client running (the box was unplugged while it streamed)");
     }
-    bool idle = g_io_clients == 0;
     pthread_mutex_unlock(&g_mutex);
-    /* Nothing streams now: if the early read was found not to work, set the device up again with the
-       fallback offset. */
-    if (idle) relist_if_safety_changed();
     return 0;
 }
 

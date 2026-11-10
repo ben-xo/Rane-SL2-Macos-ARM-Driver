@@ -30,7 +30,6 @@ typedef struct {
     uint32_t debug_build;    /* 1 = the driver is a debug build; 0 also from a driver too old to say */
     /* Input health (newer drivers; zero from an older one) */
     uint32_t in_safety_us;          /* the input safety offset the HAL is using, in us */
-    uint32_t in_safety_setting_us;  /* the setting ('sl2i'); in_safety_us is larger while it has fallen back */
     uint32_t early_read;            /* 0 = not judged yet on this connection, 1 = working, 2 = not working */
     uint32_t hub_depth;             /* USB hubs between the box and the Mac: 0 = connected directly */
     uint64_t in_dropouts;           /* IO cycles since the box connected in which input wasn't captured in time */
@@ -134,10 +133,8 @@ static void print_status(AudioObjectID dev) {
     printf("  Captured Frms : %llu\n", s.cap_frames);
     printf("  Playback Frms : %llu\n", s.play_frames);
     if (s.in_safety_us) {
-        printf("  Input Safety  : %.1f ms", s.in_safety_us / 1000.0);
-        if (s.in_safety_us != s.in_safety_setting_us) printf(" (setting %.1f ms)", s.in_safety_setting_us / 1000.0);
-        printf("\n");
-        printf("  Early Read    : %s\n", s.early_read == 1 ? "working" : s.early_read == 2 ? "NOT WORKING (offset fallen back)" : "not judged yet");
+        printf("  Input Safety  : %.1f ms\n", s.in_safety_us / 1000.0);
+        printf("  Early Read    : %s\n", s.early_read == 1 ? "working" : s.early_read == 2 ? "NOT WORKING (use an input safety offset of 8 ms)" : "not judged yet");
         printf("  Input Dropouts: %llu\n", s.in_dropouts);
         printf("  USB Hubs      : %u%s\n", s.hub_depth, s.hub_depth ? "" : " (connected directly)");
     }

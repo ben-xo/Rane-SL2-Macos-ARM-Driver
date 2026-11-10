@@ -232,8 +232,7 @@ struct BoxState: Equatable {
     var muted: Bool?         // the output mute; nil if none
     var input: InputHealth?  // nil from a driver too old to report it
     struct InputHealth: Equatable {
-        let safetyUs: Int        // the input safety offset CoreAudio is using
-        let settingUs: Int       // the setting; safetyUs is larger while it has fallen back
+        let safetyUs: Int        // the input safety offset (the setting, as CoreAudio is using it)
         let earlyRead: UInt32    // 0 not judged yet, 1 working, 2 not working
         let hubs: Int            // USB hubs between the box and the Mac
         let dropouts: UInt64     // IO cycles since connecting in which input wasn't captured in time
@@ -332,7 +331,7 @@ final class PanelModel: ObservableObject {
             volume: volume.map { BoxState.Volume(scalar: $0.scalar, db: $0.db) },
             muted: SL2Driver.muted(dev),
             input: s.in_safety_us == 0 ? nil : BoxState.InputHealth(
-                safetyUs: Int(s.in_safety_us), settingUs: Int(s.in_safety_setting_us), earlyRead: s.early_read,
+                safetyUs: Int(s.in_safety_us), earlyRead: s.early_read,
                 hubs: Int(s.hub_depth), dropouts: s.in_dropouts)))
     }
 
@@ -533,9 +532,9 @@ struct PanelView: View {
             LabeledContent("Output latency", value: String(format: "%.1f ms", box.outputLatencyMs))
             LabeledContent("Input latency", value: String(format: "%.1f ms", box.inputLatencyMs))
             if let input = box.input {
-                Picker("Input safety offset", selection: Binding(get: { input.settingUs },
+                Picker("Input safety offset", selection: Binding(get: { input.safetyUs },
                                                                  set: { model.setInputSafety($0) })) {
-                    ForEach(Self.safetyChoices(input.settingUs), id: \.self) { us in
+                    ForEach(Self.safetyChoices(input.safetyUs), id: \.self) { us in
                         Text(Self.ms(us) + Self.safetyNote(us)).tag(us)
                     }
                 }
@@ -578,10 +577,9 @@ struct PanelView: View {
     static func warnings(_ box: BoxState) -> [String] {
         guard let input = box.input else { return [] }
         var w: [String] = []
-        if input.earlyRead == 2 {
-            w.append("Input can't be read early on this Mac, so the input safety offset is \(ms(input.safetyUs)) until the SL 2 is connected again or the setting is changed (it is \(ms(input.settingUs))).")
-        } else if input.safetyUs != input.settingUs {
-            w.append("The input safety offset is \(ms(input.safetyUs)) until the SL 2 is connected again or the setting is changed (it is \(ms(input.settingUs))).")
+        // Where the early read doesn't work, input can drop out below 8 ms (completion delivery).
+        if input.earlyRead == 2 && input.safetyUs < 8000 {
+            w.append("Input can't be read early on this Mac, so it can drop out at \(ms(input.safetyUs)). Set the input safety offset to 8 ms.")
         }
         if input.dropouts > 0 {
             let times = input.dropouts == 1 ? "once" : "\(input.dropouts) times"

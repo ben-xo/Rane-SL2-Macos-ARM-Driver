@@ -152,18 +152,18 @@ At a 64-frame IO buffer, the round trip breaks down as:
     streaming. The driver then takes the device out of the device list for half a second, which sets it up
     again (`relist_device`). The value the property reports changes only at that moment, so it is always
     the value the HAL is using.
-- **Where the early read doesn't work, the offset falls back to 8 ms.**
+- **Where the early read doesn't work, the driver says so.**
   - Each stream judges the early read once it has a second of capture and ReadInput has asked for half a
     second of it (`early_read_judge`; an app that only plays doesn't read input, and leaves it unjudged).
     It works if it placed frames and the completions found under 1% of them different. This needs no
     signal at the inputs: silence is all zero bytes, distinct from the marks.
   - If it doesn't work (a USB controller that copies the data in only at completion, or a box whose pad
-    bytes aren't 0), the driver logs it, and once no app is using the SL 2 it sets the device up again with
-    8 ms, until the box is connected again or the setting is changed (which has the next stream judge
-    afresh). Only the stream that found it has input dropouts. `sl2dbg noearly 1` *(debug)* switches the
-    early reader off to test this.
-- **Input health is reported.** The status (`sl2s`) carries the offset in use and the setting, the early
-  read's judgement, the IO cycles since connecting in which input wasn't captured in time (ReadInput
+    bytes aren't 0), the driver logs it and reports it in the status, and the SL 2 Control Panel asks for an
+    input safety offset of 8 ms, which covers completion delivery. The driver doesn't change the setting by
+    itself: applying it takes the device out of the device list for a moment, which apps holding it idle
+    (or the system's default output) would see as the device going away. Changing the setting has the next
+    stream judge afresh. `sl2dbg noearly 1` *(debug)* switches the early reader off to test this.
+- **Input health is reported.** The status (`sl2s`) carries the offset in use, the early read's judgement, the IO cycles since connecting in which input wasn't captured in time (ReadInput
   returned silence), and how many USB hubs the box is behind (its ancestors in the I/O Registry that are USB
   devices). The SL 2 Control Panel warns about the first three and shows the hub count. A high-speed hub
   adds no latency that matters here (it forwards packets within microseconds, inside the 125 us
@@ -239,7 +239,7 @@ At a 64-frame IO buffer, the round trip breaks down as:
 | Output device latency | 1.5 ms (66 frames at 44.1 kHz) |
 | Output safety offset | 2 ms |
 | Input device latency | 32 frames |
-| Input safety offset | 1.5 ms (the default setting; 8 ms where the early read doesn't work) |
+| Input safety offset | 1.5 ms (the default setting; 8 ms recommended where the early read doesn't work) |
 | Output stream latency | 32 frames |
 | Input stream latency | 0 |
 | Zero-timestamp period | 16384 frames |
@@ -324,8 +324,8 @@ converters' pre-ringing, which is smaller on a quieter click. It is not latency.
 - **`sl2q`:** the box's unsolicited `0x40` reports and the driver's own events (`0x4F`: sample rate), kept
   in a ring of 256 with a read position per client process, so every client gets every report.
 - **`sl2s`:** the status (connected, streaming, rate, version, serial, thru and LINE/PHONO, frame counts,
-  boot mode, debug build, and the input health: the input safety offset in use and its setting, the early
-  read's judgement, input dropouts and USB hubs). Reading it has no side effects. Fields are only ever
+  boot mode, debug build, and the input health: the input safety offset in use, the early read's judgement,
+  input dropouts and USB hubs). Reading it has no side effects. Fields are only ever
   added at the end, so a client copies what it knows and older drivers read as zeros.
 - **`sl2i`:** the input safety offset setting, in microseconds, as a CFNumber. Writing it is refused while a
   stream runs (see Capture).
@@ -675,7 +675,7 @@ Each was removed from the tip in its own commit.
   captured" line.
 - `errpkts <n>`: treat the next n capture packets as errored.
 - `noearly 1|0`: switch the early capture read off (on), as on a Mac where it can't work: the next
-  stream judges it not working, and the driver falls back to 8 ms once the stream stops.
+  stream judges it not working.
 
 ## Still open
 
