@@ -1393,8 +1393,6 @@ static void cap_submit(int idx, uint32_t gen) {
         IOUSBHostIsochronousTransaction *tx = g_cap_xf[idx].tx;
         for (int k = 0; k < CAP_PKTS; k++)
             tx[k] = (IOUSBHostIsochronousTransaction){ .requestCount = PKT_MAX, .offset = (uint32_t)(k * PKT_MAX) };
-        atomic_store_explicit(&g_cap_idx_of[f & (CAP_MAP_N - 1)], idx, memory_order_relaxed);
-        atomic_store_explicit(&g_cap_tag[idx], f, memory_order_release);
 
         /* Queue it for frame f; its completion hands the packets to cap_complete. */
         NSError *e = nil;
@@ -1405,11 +1403,17 @@ static void cap_submit(int idx, uint32_t gen) {
             if (!stream_live(gen) || st == kIOReturnAborted || dp_gone(st)) return;
             cap_complete(idx, f, done, gen);
         }];
-        if (ok) return;
-        atomic_store_explicit(&g_cap_tag[idx], 0, memory_order_release);
+        if (ok) {
+            /* Queued: let the early reader find it (its completion, on this queue, can't run first). */
+            atomic_store_explicit(&g_cap_idx_of[f & (CAP_MAP_N - 1)], idx, memory_order_relaxed);
+            atomic_store_explicit(&g_cap_tag[idx], f, memory_order_release);
+            return;
+        }
         /* Refused (the frame passed while this ran): take the next one. */
         LOG("Capture enqueue refused for frame %llu (now ~%llu): %{public}@", f, now_f, e.localizedDescription);
-        g_cap_frame = now_f + DP_START_LEAD + attempt + 1;
+        /* Never backwards: frames after f may already be queued on other transfers. */
+        uint64_t next = now_f + DP_START_LEAD + attempt + 1;
+        if (next > g_cap_frame) g_cap_frame = next;
     }
     /* Still refused: try again shortly rather than losing this transfer for the rest of the stream. */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_MSEC), g_q, ^{ cap_submit(idx, gen); });
