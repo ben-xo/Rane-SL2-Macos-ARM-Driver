@@ -1162,7 +1162,8 @@ static _Atomic uint32_t g_early_state;            /* this connection's latest ju
 static _Atomic uint64_t g_er_placed;              /* frames placed early in this stream */
 static uint64_t g_er_differ;                      /* g_q: of those, frames the completion found different */
 static uint64_t g_er_xfers, g_er_xfers_differ;    /* g_q: transfers holding early-placed frames, and those with any different */
-static bool     g_er_judged;                      /* g_q: this stream has been judged */
+static _Atomic bool g_er_judged;                  /* this stream has been judged (set on g_q, read on the IO thread too):
+                                                     a release build stops counting for the judgement then */
 static _Atomic uint64_t g_rd_frames;              /* frames ReadInput asked for in this stream, after the first capture */
 static _Atomic uint64_t g_in_dropouts;            /* IO cycles since the box connected in which some input frame
                                                      wasn't captured in time (ReadInput returned silence) */
@@ -1339,7 +1340,7 @@ static uint64_t cap_frames_in(uint64_t uframes) {
 /* Judge whether the early read works on this connection (g_q; see g_early_state), and if it doesn't,
    say so, once per connection. */
 static void early_read_judge(void) {
-    g_er_judged = true;
+    atomic_store(&g_er_judged, true);
     uint64_t placed = atomic_load(&g_er_placed);
     bool works = placed > 0 && g_er_xfers > 0 && g_er_xfers_differ * 20 <= g_er_xfers;   /* under 5% */
     uint32_t was = atomic_exchange(&g_early_state, works ? EARLY_WORKING : EARLY_FAILED);
@@ -1392,6 +1393,7 @@ static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *
     uint64_t ring_pos = g_cap_base + before;   /* timeline position of the next frame to write */
     uint64_t early_head = atomic_load_explicit(&g_cap_early_head, memory_order_acquire);   /* placed early below it */
     bool xfer_early = false, xfer_differs = false;   /* this transfer held early-placed frames; any different */
+    bool check_early = SL2_DEBUG || !atomic_load(&g_er_judged);   /* the same-frame check, until judged */
     uint64_t got = 0;                          /* frames placed by this completion, fill included */
     uint64_t ts = 0;                           /* bus time of the first of them */
 
@@ -1434,7 +1436,7 @@ static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *
             /* A frame the early reader placed must be the same frame (early_read_judge counts those
                that aren't). */
             float was[NCH];
-            bool early = ring_pos + got < early_head;
+            bool early = check_early && ring_pos + got < early_head;
             if (early) memcpy(was, fr, sizeof was);
             cap_frame_to_float(p + s * FRAME_BYTES, fr);
             if (early) {
@@ -1468,7 +1470,7 @@ static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *
 
     /* After a second of capture, with ReadInput reading it: does the early read work here? (An app
        that only plays leaves ReadInput uncalled, and the early read unjudged.) */
-    if (!g_er_judged && before >= (uint64_t)g_sr && atomic_load(&g_rd_frames) >= (uint64_t)(g_sr / 2))
+    if (!atomic_load(&g_er_judged) && before >= (uint64_t)g_sr && atomic_load(&g_rd_frames) >= (uint64_t)(g_sr / 2))
         early_read_judge();
     cap_submit(idx, gen);
 }
@@ -1744,7 +1746,7 @@ static bool usb_open_all(void) {
     atomic_store(&g_rd_frames, 0);
     g_er_differ = 0;
     g_er_xfers = g_er_xfers_differ = 0;
-    g_er_judged = false;
+    atomic_store(&g_er_judged, false);
     cap_prog_publish(0, 0);
     atomic_store(&g_cap_prog_last_fc, 0);
     atomic_store(&g_cap_prog_last_pos, 0);
@@ -3041,7 +3043,8 @@ static OSStatus SL2_DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID oi
         /* After the first capture: count what ReadInput asked for, and the cycles it had to fill with
            silence because the frames weren't captured in time. */
         if (done_head) {
-            atomic_fetch_add_explicit(&g_rd_frames, frames, memory_order_relaxed);
+            if (SL2_DEBUG || !atomic_load_explicit(&g_er_judged, memory_order_relaxed))
+                atomic_fetch_add_explicit(&g_rd_frames, frames, memory_order_relaxed);
             if (pos + frames > head) atomic_fetch_add_explicit(&g_in_dropouts, 1, memory_order_relaxed);
         }
 #if SL2_DEBUG
