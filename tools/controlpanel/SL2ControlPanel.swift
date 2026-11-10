@@ -544,7 +544,7 @@ struct PanelView: View {
         } header: {
             Text("Audio")
         } footer: {
-            Text("Latency as the driver reports it, not counting each app's own buffer (in Serato DJ: USB Buffer Size). The input safety offset is how long the driver lets each input sample arrive before an app reads it: raise it if you hear gaps in the input. It can be changed only while no app is using the SL 2.")
+            Text("Latency as the driver reports it, not counting each app's own buffer (in Serato DJ: USB Buffer Size). Raise the input safety offset if you hear gaps in the input.")
                 .foregroundStyle(.secondary)
         }
         Section {
