@@ -259,6 +259,8 @@ func repeatingTimer(every interval: TimeInterval, _ body: @escaping @MainActor (
 final class PanelModel: ObservableObject {
     @Published var state: PanelState = .noBox
     @Published var driverVersion: String?
+    /// A short-lived message about something the user just tried (shown with the warnings).
+    @Published var notice: String?
     /// The level meters, which read the device this model finds (not published: they redraw alone).
     let meters = MeterModel()
     private var timer: Timer?
@@ -361,7 +363,13 @@ final class PanelModel: ObservableObject {
     /// SL 2 as gone for a moment).
     func setInputSafety(_ us: Int) {
         guard let dev = device else { return }
-        SL2Driver.setInputSafety(dev, us)
+        // Refused if an app started using the SL 2 since the window last looked: say so, for a while.
+        if !SL2Driver.setInputSafety(dev, us) {
+            notice = "The input safety offset wasn't changed: an app is using the SL 2."
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.notice = nil }
+            refresh()
+            return
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { self.refresh() }
     }
 
@@ -601,7 +609,7 @@ struct PanelView: View {
     /// The right column: any warnings, the input and output levels, and the output volume.
     @ViewBuilder
     private func levelSections(_ box: BoxState) -> some View {
-        let warnings = Self.warnings(box)
+        let warnings = (model.notice.map { [$0] } ?? []) + Self.warnings(box)
         if !warnings.isEmpty {
             Section {
                 ForEach(warnings, id: \.self) { text in
