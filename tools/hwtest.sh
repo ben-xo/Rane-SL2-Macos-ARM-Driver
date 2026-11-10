@@ -4,7 +4,7 @@
 #
 # The tests run in the order that needs the fewest physical steps:
 #   1. with the box attached, nothing else: driver status, SL2Api as Serato calls it (both slices),
-#      sample-rate switching;
+#      sample-rate switching, the input safety offset setting, and the early capture read working;
 #   2. with --loopback (a cable from Left Deck Out L to Left Deck In L; the tests play clicks and a
 #      loud tone into that output, so pass it only when the cable is in): restarts, a glitch test,
 #      48 kHz, the output volume and mute, the level meters, and in a debug build (installed with
@@ -160,13 +160,38 @@ for r in 48000 44100; do
 done
 "$B/setrate" "$DEV" "$orig" >/dev/null
 [ $ok = 1 ] && record PASS "sample rate 44.1 -> 48 -> 44.1 kHz" || record FAIL "sample rate 44.1 -> 48 -> 44.1 kHz"
+
+# The input safety offset setting: set 2 ms with nothing streaming, and the driver must set the device
+# up again with it (the status reports what CoreAudio is using); then put the setting back.
+orig_us=$("$PANEL" safety | grep -oE '[0-9]+\.[0-9]' | head -1)
+if [ -z "$orig_us" ]; then
+    record FAIL "input safety offset setting" "sl2panel safety: no setting"
+else
+    ok=1
+    "$PANEL" safety 2 >/dev/null || ok=0
+    WAIT_S=5 wait_until "the driver to use 2.0 ms" sh -c "'$PANEL' status | grep -q 'Input Safety  : 2.0 ms'" || ok=0
+    "$PANEL" safety "$orig_us" >/dev/null || ok=0
+    WAIT_S=5 wait_until "the driver to use $orig_us ms again" sh -c "'$PANEL' status | grep -q 'Input Safety  : $orig_us ms'" || ok=0
+    [ $ok = 1 ] && record PASS "input safety offset setting" "2.0 ms, then back to $orig_us ms" \
+                || record FAIL "input safety offset setting" "status: $(field 'Input Safety')"
+fi
+
+# The early capture read: after a few seconds of capture (any input, no cable needed), the driver
+# must judge it working, and no input must have dropped out.
+"$B/chrec" "$DEV" 3 "${TMPDIR:-/tmp}/sl2-hwtest-chrec.wav" >/dev/null 2>&1
+er=$(field 'Early Read'); drops=$(field 'Input Dropouts')
+if [ "$er" = "working" ] && [ "${drops:-x}" = 0 ]; then
+    record PASS "early capture read working" "USB hubs: $(field 'USB Hubs')"
+else
+    record FAIL "early capture read working" "early read '$er', input dropouts '$drops'"
+fi
 echo
 
 # ---------------------------------------------------------------------------- 2. loopback
 
 echo "== 2. loopback cable"
 if [ $LOOPBACK = 0 ]; then
-    for t in "restarts" "glitch test, 30 s" "glitch test idle + loaded (dptest)" "48 kHz" "output volume and mute" "level meters" "early capture read" "fault hook: USB stall" "fault hook: errored capture packets"; do
+    for t in "restarts" "glitch test, 30 s" "glitch test idle + loaded (dptest)" "48 kHz" "output volume and mute" "level meters" "early capture read" "early-read fallback" "fault hook: USB stall" "fault hook: errored capture packets"; do
         record SKIP "$t" "no --loopback"
     done
 else
@@ -282,6 +307,28 @@ else
         fi
     fi
 
+    # The early-read fallback (debug build): with the early reader switched off (as on a Mac where it
+    # can't work), a stream must judge it not working, and once the stream stops the driver must set
+    # the device up again with the 8 ms fallback, keeping the setting. Setting the setting again clears
+    # the fallback.
+    if [ $BUILD = debug ]; then
+        set_us=$("$PANEL" safety | grep -oE '[0-9]+\.[0-9]' | head -1)
+        "$B/sl2dbg" noearly 1 >/dev/null
+        "$B/sinetest" "$DEV" 1 1 3 64 >/dev/null 2>&1
+        # The driver sets the device up again once the stream stops (the device is out of the list
+        # for about half a second): wait for that before talking to it again.
+        WAIT_S=5 wait_until "the 8 ms fallback" sh -c "'$PANEL' status | grep -q 'Input Safety  : 8.0 ms'"; fell=$?
+        WAIT_S=5 wait_until "the early reader back on" "$B/sl2dbg" noearly 0
+        er=$(field 'Early Read')
+        "$PANEL" safety "$set_us" >/dev/null
+        WAIT_S=5 wait_until "the setting again" sh -c "'$PANEL' status | grep -q 'Input Safety  : $set_us ms'"; back=$?
+        if [ "${er#NOT WORKING}" != "$er" ] && [ $fell = 0 ] && [ $back = 0 ]; then
+            record PASS "early-read fallback" "judged not working, 8 ms, then $set_us ms again"
+        else
+            record FAIL "early-read fallback" "early read '$er', fallback $([ $fell = 0 ] && echo yes || echo no), restored $([ $back = 0 ] && echo yes || echo no)"
+        fi
+    fi
+
     # The fault hooks (debug build), each injected 3 s into a 10 s glitch test: a 100 ms stall in USB
     # completion delivery (the driver must fill the gap with silence and log it) and 20 errored
     # capture packets (the driver must take them, and playback must stay matched to capture: sent -
@@ -311,6 +358,7 @@ else
         done
     else
         record SKIP "early capture read" "release build (make install DEBUG=1)"
+        record SKIP "early-read fallback" "release build (make install DEBUG=1)"
         record SKIP "fault hook: USB stall" "release build (make install DEBUG=1)"
         record SKIP "fault hook: errored capture packets" "release build (make install DEBUG=1)"
     fi
