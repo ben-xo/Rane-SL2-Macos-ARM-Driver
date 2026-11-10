@@ -1150,16 +1150,31 @@ static void cap_prog_publish(uint64_t fc, uint64_t pos) {
     g_cap_prog_fc = fc; g_cap_prog_pos = pos;
     atomic_store_explicit(&g_cap_prog_seq, s + 2, memory_order_release);
 }
-/* ... read consistently (any thread; bounded, false if it couldn't). */
-static bool cap_prog_get(uint64_t *fc, uint64_t *pos) {
+/* ... read consistently (any thread). Bounded, as dp_ref_get: after 64 tries (a writer preempted
+   mid-publish) it uses the last copy any reader got, which is only a little behind. The early
+   reader carries on from there; the next completion's progress puts it right. */
+static _Atomic uint64_t g_cap_prog_last_fc, g_cap_prog_last_pos;
+static void cap_prog_get(uint64_t *fc, uint64_t *pos) {
     for (int i = 0; i < 64; i++) {
         uint32_t s1 = atomic_load_explicit(&g_cap_prog_seq, memory_order_acquire);
         uint64_t a = g_cap_prog_fc, b = g_cap_prog_pos;
         atomic_thread_fence(memory_order_acquire);
         uint32_t s2 = atomic_load_explicit(&g_cap_prog_seq, memory_order_relaxed);
-        if (!(s1 & 1) && s1 == s2) { *fc = a; *pos = b; return true; }
+        if (!(s1 & 1) && s1 == s2) {
+            *fc = a; *pos = b;
+            atomic_store_explicit(&g_cap_prog_last_fc, a, memory_order_relaxed);
+            atomic_store_explicit(&g_cap_prog_last_pos, b, memory_order_relaxed);
+            return;
+        }
     }
-    return false;
+    *fc = atomic_load_explicit(&g_cap_prog_last_fc, memory_order_relaxed);
+    *pos = atomic_load_explicit(&g_cap_prog_last_pos, memory_order_relaxed);
+}
+
+/* The completions' progress for the early reader; false before the stream's first completion. */
+static bool pfc_get(uint64_t *fc, uint64_t *pos) {
+    cap_prog_get(fc, pos);
+    return *fc != 0;
 }
 
 /* ReadInput (IO thread): place the packets that have arrived since the last completion (see "Early
@@ -1168,7 +1183,7 @@ static void cap_read_early(void) {
     if (atomic_exchange_explicit(&g_er_busy, true, memory_order_acquire)) return;   /* another IO thread is */
     uint32_t gen = atomic_load_explicit(&g_stream_gen, memory_order_acquire);
     uint64_t pfc, ppos;
-    if (!atomic_load_explicit(&g_io_running, memory_order_acquire) || !cap_prog_get(&pfc, &ppos) || !pfc) goto out;
+    if (!atomic_load_explicit(&g_io_running, memory_order_acquire) || !pfc_get(&pfc, &ppos)) goto out;
 
     /* Carry on from where we got to, if that agrees with the completions; otherwise start again
        from them (a new stream, the completions overtook us, or they placed frames differently). */
@@ -1623,6 +1638,8 @@ static bool usb_open_all(void) {
     atomic_store(&g_cap_head, 0);
     atomic_store(&g_cap_early_head, 0);
     cap_prog_publish(0, 0);
+    atomic_store(&g_cap_prog_last_fc, 0);
+    atomic_store(&g_cap_prog_last_pos, 0);
     for (int i = 0; i < CAP_MAP_N; i++) atomic_store(&g_cap_idx_of[i], -1);
     g_cap_next_fc = 0;
     g_cap_fill_frac = 0;
