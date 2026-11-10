@@ -11,6 +11,7 @@
 
 #define kSL2PropHIDCommand  'sl2h'
 #define kSL2PropStatus      'sl2s'
+#define kSL2PropInSafety    'sl2i'
 
 typedef struct {
     uint32_t connected;
@@ -27,6 +28,12 @@ typedef struct {
     uint64_t play_frames;
     uint32_t boot_mode;      /* 1 = box is in its USB bootloader with no firmware loaded */
     uint32_t debug_build;    /* 1 = the driver is a debug build; 0 also from a driver too old to say */
+    /* Input health (newer drivers; zero from an older one) */
+    uint32_t in_safety_us;          /* the input safety offset the HAL is using, in us */
+    uint32_t in_safety_setting_us;  /* the setting ('sl2i'); in_safety_us is larger while it has fallen back */
+    uint32_t early_read;            /* 0 = not judged yet on this connection, 1 = working, 2 = not working */
+    uint32_t hub_depth;             /* USB hubs between the box and the Mac: 0 = connected directly */
+    uint64_t in_dropouts;           /* IO cycles since the box connected in which input wasn't captured in time */
 } SL2StatusPacket;
 
 static AudioObjectID find_hal_device(void) {
@@ -126,6 +133,14 @@ static void print_status(AudioObjectID dev) {
     printf("  Deck 2 Input  : %s  |  Mode: %s\n", s.phono[1] ? "PHONO" : "LINE ", s.thru[1] ? "ANALOG THRU" : "USB AUDIO");
     printf("  Captured Frms : %llu\n", s.cap_frames);
     printf("  Playback Frms : %llu\n", s.play_frames);
+    if (s.in_safety_us) {
+        printf("  Input Safety  : %.1f ms", s.in_safety_us / 1000.0);
+        if (s.in_safety_us != s.in_safety_setting_us) printf(" (setting %.1f ms)", s.in_safety_setting_us / 1000.0);
+        printf("\n");
+        printf("  Early Read    : %s\n", s.early_read == 1 ? "working" : s.early_read == 2 ? "NOT WORKING (offset fallen back)" : "not judged yet");
+        printf("  Input Dropouts: %llu\n", s.in_dropouts);
+        printf("  USB Hubs      : %u%s\n", s.hub_depth, s.hub_depth ? " (directly to the Mac is best)" : " (connected directly)");
+    }
     printf("==================================================\n");
 }
 
@@ -164,9 +179,35 @@ int main(int argc, const char *argv[]) {
             };
             AudioObjectSetPropertyData(dev, &a, 0, NULL, sizeof(Float64), &sr);
             printf("Set Sample Rate to %.0f Hz.\n", sr);
+        } else if (strcmp(argv[1], "safety") == 0) {
+            /* "safety [ms]": the input safety offset setting. The driver takes it only with nothing
+               streaming, and sets the device up again with it (about half a second). */
+            AudioObjectPropertyAddress a = { kSL2PropInSafety, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+            if (argc >= 3) {
+                int us = (int)lround(atof(argv[2]) * 1000.0);
+                CFNumberRef n = CFNumberCreate(NULL, kCFNumberIntType, &us);
+                OSStatus e = AudioObjectSetPropertyData(dev, &a, 0, NULL, sizeof n, &n);
+                CFRelease(n);
+                if (e) {
+                    printf("Refused (error %d): the setting must be 0.5 to 20 ms, with nothing streaming.\n", (int)e);
+                    return 1;
+                }
+                printf("Input safety offset setting: %.1f ms.\n", us / 1000.0);
+            } else {
+                CFNumberRef n = NULL;
+                UInt32 sz = sizeof n;
+                int us = 0;
+                if (AudioObjectGetPropertyData(dev, &a, 0, NULL, &sz, &n) || !n) {
+                    printf("This driver has no input safety offset setting.\n");
+                    return 1;
+                }
+                CFNumberGetValue(n, kCFNumberIntType, &us);
+                CFRelease(n);
+                printf("Input safety offset setting: %.1f ms.\n", us / 1000.0);
+            }
         } else {
             /* LINE/PHONO is a physical switch on the box: reported in the status, not settable */
-            printf("Usage: sl2panel [status | usb | thru | sr 44100|48000]\n");
+            printf("Usage: sl2panel [status | usb | thru | sr 44100|48000 | safety [ms]]\n");
         }
     }
     return 0;

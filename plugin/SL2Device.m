@@ -58,6 +58,7 @@
 #define kSL2PropStatus      'sl2s'   /* CFDataRef (SL2StatusPacket out) */
 #define kSL2PropUnsolQueue  'sl2q'   /* CFDataRef (this client's queued 64B reports, oldest first) */
 #define kSL2PropMeters      'sl2m'   /* CFDataRef (8 Float32: peak level of inputs 1-4, then outputs 1-4) */
+#define kSL2PropInSafety    'sl2i'   /* CFNumberRef (int): the input safety offset setting in us; set with nothing streaming */
 
 /* The box's HID protocol (docs/SL2-COMMANDS.md). Every command and reply is one 64-byte report:
    [0] = command, [1..4] = tag (echoed in the reply), [5..] = arguments / results. */
@@ -98,6 +99,12 @@ typedef struct {
     uint64_t play_frames;
     uint32_t boot_mode;      /* 1 = the box is in its USB bootloader; no audio until firmware is loaded */
     uint32_t debug_build;    /* 1 = this driver was built with SL2_DEBUG (make plugin DEBUG=1) */
+    /* Input health (see "Early read" and the input safety offset) */
+    uint32_t in_safety_us;          /* the input safety offset the HAL is using, in us */
+    uint32_t in_safety_setting_us;  /* the setting ('sl2i'); in_safety_us is larger while it has fallen back */
+    uint32_t early_read;            /* 0 = not judged yet on this connection, 1 = working, 2 = not working */
+    uint32_t hub_depth;             /* USB hubs between the box and the Mac: 0 = connected directly */
+    uint64_t in_dropouts;           /* IO cycles since the box connected in which input wasn't captured in time */
 } SL2StatusPacket;
 
 enum {
@@ -147,6 +154,7 @@ static double   dbg_dp_err_max;
 /* Test hooks */
 static _Atomic uint32_t dbg_stall_ms;      /* 0xF3: hold the USB queue (g_q) this many ms, once */
 static _Atomic uint32_t dbg_err_pkts;      /* 0xF4: treat this many more capture packets as errored */
+static _Atomic bool     dbg_no_early;      /* 0xF5: the early reader places nothing, as where it can't work */
 
 static void dbg_er_reset(void);
 static void dbg_er_log(const char *what);
@@ -223,8 +231,48 @@ static uint64_t g_clk_last_fix = 0;  /* captured-frame count at the last clk_tra
 
 /* Input safety offset. It covers the early read (see "Early read"), not completion delivery: at
    1.5 ms, ReadInput found every frame it was asked for at least 0.6 ms early, idle and under load
-   (measured). Debug builds can set it with 'sl2h' 0xF2; the HAL only reads it at device setup. */
-static _Atomic int g_in_safety_us = 1500;
+   (measured).
+   - g_in_safety_set_us is the setting: 'sl2i', kept in the plug-in's storage so it survives restarts.
+   - Where the early read turns out not to work (early_read_judge), the offset falls back to
+     IN_SAFETY_FALLBACK_US until the box is connected again or the setting is changed (g_in_fallback).
+   - The HAL reads the offset only when it sets the device up, so g_in_safety_us, the value the
+     property reports, changes only just before the device is listed (in_safety_apply): it is always
+     the value the HAL is using. */
+#define IN_SAFETY_DEFAULT_US   1500
+#define IN_SAFETY_FALLBACK_US  8000
+#define IN_SAFETY_MIN_US       500
+#define IN_SAFETY_MAX_US       20000
+#define IN_SAFETY_STORAGE_KEY  CFSTR("input safety offset us")
+static _Atomic int  g_in_safety_set_us = IN_SAFETY_DEFAULT_US;
+static _Atomic bool g_in_fallback;
+static _Atomic int  g_in_safety_us = IN_SAFETY_DEFAULT_US;
+/* The offset the device should be set up with: the setting, or the fallback if that is larger. */
+static int in_safety_wanted_us(void) {
+    int us = atomic_load(&g_in_safety_set_us);
+    return (atomic_load(&g_in_fallback) && us < IN_SAFETY_FALLBACK_US) ? IN_SAFETY_FALLBACK_US : us;
+}
+/* Just before the device is listed, so the HAL reads it as it sets the device up. */
+static void in_safety_apply(void) {
+    atomic_store(&g_in_safety_us, in_safety_wanted_us());
+}
+/* The setting, from and to the plug-in's storage (the HAL keeps it for the plug-in). */
+static void in_safety_load(void) {
+    CFPropertyListRef v = NULL;
+    if (!g_host || g_host->CopyFromStorage(g_host, IN_SAFETY_STORAGE_KEY, &v) != 0 || !v) return;
+    int us = 0;
+    if (CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberGetValue((CFNumberRef)v, kCFNumberIntType, &us) &&
+        us >= IN_SAFETY_MIN_US && us <= IN_SAFETY_MAX_US)
+        atomic_store(&g_in_safety_set_us, us);
+    CFRelease(v);
+}
+static void in_safety_save(void) {
+    if (!g_host) return;
+    int us = atomic_load(&g_in_safety_set_us);
+    CFNumberRef n = CFNumberCreate(NULL, kCFNumberIntType, &us);
+    if (!n) return;
+    g_host->WriteToStorage(g_host, IN_SAFETY_STORAGE_KEY, n);
+    CFRelease(n);
+}
 static UInt32 in_safety_frames(void) {
     return (UInt32)(atomic_load(&g_in_safety_us) * g_sr / 1e6 + 0.5);
 }
@@ -1109,16 +1157,25 @@ static uint32_t g_er_gen;                         /* stream generation the state
 static uint64_t g_er_fc, g_er_pos;                /* next packet to read: USB frame, packet, position */
 static int      g_er_k;
 static uint64_t g_er_at_fc[CAP_MAP_N], g_er_at_pos[CAP_MAP_N];   /* position at each USB frame's start */
+/* Whether the early read works on this connection. Each stream judges it once there is a second of
+   capture and ReadInput has asked for half a second of it (early_read_judge): it works if it placed
+   frames and the completions found almost none of them different. If it doesn't, the input safety
+   offset falls back (g_in_fallback). Reported in the status, with the input dropouts. */
+enum { EARLY_UNKNOWN = 0, EARLY_WORKING = 1, EARLY_FAILED = 2 };
+static _Atomic uint32_t g_early_state;            /* this connection's latest judgement */
+static _Atomic uint64_t g_er_placed;              /* frames placed early in this stream */
+static uint64_t g_er_differ;                      /* g_q: of those, frames the completion found different */
+static bool     g_er_judged;                      /* g_q: this stream has been judged */
+static _Atomic uint64_t g_rd_frames;              /* frames ReadInput asked for in this stream, after the first capture */
+static _Atomic uint64_t g_in_dropouts;            /* IO cycles since the box connected in which some input frame
+                                                     wasn't captured in time (ReadInput returned silence) */
 #if SL2_DEBUG
-static _Atomic uint64_t dbg_er_frames;            /* frames placed early */
 static _Atomic uint32_t dbg_er_restarts, dbg_er_torn, dbg_er_cc_differs, dbg_er_errored;
-static uint64_t dbg_er_mismatch;                  /* g_q: frames the completion found different */
-static _Atomic uint64_t dbg_rd_frames, dbg_rd_early, dbg_rd_short;   /* ReadInput, after the first capture */
+static _Atomic uint64_t dbg_rd_early, dbg_rd_short;   /* ReadInput, after the first capture */
 static _Atomic int64_t  dbg_rd_margin_min;        /* frames between the read's end and the head, least */
 static void dbg_er_reset(void) {
-    dbg_er_frames = 0; dbg_er_restarts = dbg_er_torn = dbg_er_cc_differs = dbg_er_errored = 0;
-    dbg_er_mismatch = 0;
-    dbg_rd_frames = dbg_rd_early = dbg_rd_short = 0;
+    dbg_er_restarts = dbg_er_torn = dbg_er_cc_differs = dbg_er_errored = 0;
+    dbg_rd_early = dbg_rd_short = 0;
     dbg_rd_margin_min = INT64_MAX;
 }
 static void dbg_er_log(const char *what) {
@@ -1126,9 +1183,9 @@ static void dbg_er_log(const char *what) {
     DBG_LOG("DBG early read %{public}s: frames placed early %llu, restarts %u, torn %u, errored %u, count "
         "differs %u | completion found %llu different | ReadInput frames %llu: only there early %llu, "
         "SILENCE (not captured yet) %llu | least margin %.2f ms",
-        what, atomic_load(&dbg_er_frames), atomic_load(&dbg_er_restarts), atomic_load(&dbg_er_torn),
-        atomic_load(&dbg_er_errored), atomic_load(&dbg_er_cc_differs), dbg_er_mismatch,
-        atomic_load(&dbg_rd_frames), atomic_load(&dbg_rd_early), atomic_load(&dbg_rd_short),
+        what, atomic_load(&g_er_placed), atomic_load(&dbg_er_restarts), atomic_load(&dbg_er_torn),
+        atomic_load(&dbg_er_errored), atomic_load(&dbg_er_cc_differs), g_er_differ,
+        atomic_load(&g_rd_frames), atomic_load(&dbg_rd_early), atomic_load(&dbg_rd_short),
         m == INT64_MAX ? 0.0 : 1000.0 * (double)m / g_sr);
 }
 #endif
@@ -1188,6 +1245,9 @@ static bool pfc_get(uint64_t *fc, uint64_t *pos) {
 /* ReadInput (IO thread): place the packets that have arrived since the last completion (see "Early
    read"). No locks, no allocation, no IOKit calls. */
 static void cap_read_early(void) {
+#if SL2_DEBUG
+    if (atomic_load_explicit(&dbg_no_early, memory_order_relaxed)) return;   /* test hook 0xF5 */
+#endif
     if (atomic_exchange_explicit(&g_er_busy, true, memory_order_acquire)) return;   /* another IO thread is */
     uint32_t gen = atomic_load_explicit(&g_stream_gen, memory_order_acquire);
     uint64_t pfc, ppos;
@@ -1248,7 +1308,7 @@ static void cap_read_early(void) {
         for (int i = 0; i < n; i++)
             memcpy(&g_in_ring[((g_er_pos + i) & RING_MASK) * NCH], &tmp[i * NCH], NCH * sizeof(float));
         g_er_pos += n;
-        DBG_DO(atomic_fetch_add_explicit(&dbg_er_frames, n, memory_order_relaxed));
+        atomic_fetch_add_explicit(&g_er_placed, n, memory_order_relaxed);
         if (++g_er_k == CAP_PKTS) {
             g_er_k = 0; g_er_fc++;
             g_er_at_fc[g_er_fc & (CAP_MAP_N - 1)] = g_er_fc;
@@ -1277,6 +1337,20 @@ static uint64_t cap_frames_in(uint64_t uframes) {
     uint64_t n = (uint64_t)f;
     g_cap_fill_frac = f - (double)n;
     return n;
+}
+
+/* Judge whether the early read works on this connection (g_q; see g_early_state), and if it doesn't,
+   fall back to IN_SAFETY_FALLBACK_US from the next time no app is using the device (SL2_StopIO). */
+static void early_read_judge(void) {
+    g_er_judged = true;
+    uint64_t placed = atomic_load(&g_er_placed);
+    bool works = placed > 0 && g_er_differ * 100 <= placed;
+    atomic_store(&g_early_state, works ? EARLY_WORKING : EARLY_FAILED);
+    if (works) return;
+    if (!atomic_exchange(&g_in_fallback, true))
+        LOG("Capture can't be read early on this connection (%llu frames placed early, %llu of them differently "
+            "from their completion): input safety offset %.1f ms once no app is using the SL 2",
+            placed, g_er_differ, in_safety_wanted_us() / 1000.0);
 }
 
 static void cap_submit(int idx, uint32_t gen);
@@ -1320,9 +1394,7 @@ static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *
         g_cap_next_fc = fc;
     }
     uint64_t ring_pos = g_cap_base + before;   /* timeline position of the next frame to write */
-#if SL2_DEBUG
-    uint64_t early_head = atomic_load_explicit(&g_cap_early_head, memory_order_acquire);
-#endif
+    uint64_t early_head = atomic_load_explicit(&g_cap_early_head, memory_order_acquire);   /* placed early below it */
     uint64_t got = 0;                          /* frames placed by this completion, fill included */
     uint64_t ts = 0;                           /* bus time of the first of them */
 
@@ -1362,15 +1434,13 @@ static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *
         const uint8_t *p = b + k * PKT_MAX;
         for (int s = 0; s < n; s++) {
             float *fr = &g_in_ring[((ring_pos + got) & RING_MASK) * NCH];
-#if SL2_DEBUG   /* a frame the early reader placed must be the same frame */
+            /* A frame the early reader placed must be the same frame (early_read_judge counts those
+               that aren't). */
             float was[NCH];
             bool early = ring_pos + got < early_head;
             if (early) memcpy(was, fr, sizeof was);
-#endif
             cap_frame_to_float(p + s * FRAME_BYTES, fr);
-#if SL2_DEBUG
-            if (early && memcmp(was, fr, sizeof was)) dbg_er_mismatch++;
-#endif
+            if (early && memcmp(was, fr, sizeof was)) g_er_differ++;
             got++;
         }
     }
@@ -1394,6 +1464,11 @@ static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *
     /* Playback: start after a few ms of capture, then steer it by what the box clocked. */
     if (!g_dp_started && before >= (uint64_t)(8 * g_sr / 1000)) dp_start(gen);
     dp_track_capture(fc, (int)got);
+
+    /* After a second of capture, with ReadInput reading it: does the early read work here? (An app
+       that only plays leaves ReadInput uncalled, and the early read unjudged.) */
+    if (!g_er_judged && before >= (uint64_t)g_sr && atomic_load(&g_rd_frames) >= (uint64_t)(g_sr / 2))
+        early_read_judge();
     cap_submit(idx, gen);
 }
 
@@ -1461,6 +1536,22 @@ static int svc_bcd(io_service_t svc) {
 }
 
 /* The attached SL 2 running its firmware (the caller releases it), or IO_OBJECT_NULL. */
+/* USB hubs between the box and the Mac: the USB devices among the box's ancestors (each hub is one;
+   the Mac's own ports belong to its controller). Reported in the status. */
+static _Atomic uint32_t g_hub_depth;
+static uint32_t usb_hub_depth(io_service_t svc) {
+    uint32_t hubs = 0;
+    io_registry_entry_t e = svc, parent;
+    IOObjectRetain(e);
+    for (int i = 0; i < 32 && IORegistryEntryGetParentEntry(e, kIOServicePlane, &parent) == KERN_SUCCESS; i++) {
+        IOObjectRelease(e);
+        e = parent;
+        if (IOObjectConformsTo(e, "IOUSBHostDevice")) hubs++;
+    }
+    IOObjectRelease(e);
+    return hubs;
+}
+
 static io_service_t find_sl2_service(void) {
     /* Every USB device with the SL 2's vendor and product IDs. */
     CFMutableDictionaryRef m = IOServiceMatching(kIOUSBDeviceClassName);
@@ -1508,6 +1599,9 @@ static bool usb_ensure_hid(void) {
         io_service_t svc = find_sl2_service();
         if (!svc) return false;
         g_dev = [[IOUSBHostDevice alloc] initWithIOService:svc options:IOUSBHostObjectInitOptionsNone queue:g_q error:&e interestHandler:nil];
+        uint32_t hubs = usb_hub_depth(svc);
+        atomic_store(&g_hub_depth, hubs);
+        if (hubs) LOG("Rane SL 2 is connected through %u USB hub%s (directly to the Mac is best)", hubs, hubs > 1 ? "s" : "");
         IOObjectRelease(svc);
         if (!g_dev) { LOG("Failed to open IOUSBHostDevice: %{public}@", e); return false; }
     }
@@ -1645,6 +1739,10 @@ static bool usb_open_all(void) {
     memset(g_in_ring, 0, sizeof(g_in_ring));
     atomic_store(&g_cap_head, 0);
     atomic_store(&g_cap_early_head, 0);
+    atomic_store(&g_er_placed, 0);
+    atomic_store(&g_rd_frames, 0);
+    g_er_differ = 0;
+    g_er_judged = false;
     cap_prog_publish(0, 0);
     atomic_store(&g_cap_prog_last_fc, 0);
     atomic_store(&g_cap_prog_last_pos, 0);
@@ -1720,13 +1818,9 @@ static void usb_close_all(void) {
 /* The device is published (in the plug-in's device list, so it shows in the system's device
    lists) only while a box is attached. A box in its bootloader keeps it published so clients can
    read boot_mode from the 'sl2s' status. */
-#if SL2_DEBUG
-static _Atomic bool dbg_unlisted;   /* 0xF2: the device is briefly taken out of the list */
-#endif
+static _Atomic bool g_unlisted;   /* briefly out of the list, to be set up again (relist_device) */
 static bool device_published(void) {
-#if SL2_DEBUG
-    if (atomic_load(&dbg_unlisted)) return false;
-#endif
+    if (atomic_load(&g_unlisted)) return false;
     return atomic_load(&g_box_present) || atomic_load(&g_boot_mode);
 }
 
@@ -1783,6 +1877,29 @@ static void note_bootloader_device(void) {
 
 static dispatch_queue_t g_hotplug_q;
 
+/* Have the HAL set the device up again, so it reads a changed input safety offset (it reads safety
+   offsets only at device setup; a configuration change doesn't refresh them): take the device out of
+   the device list and put it back half a second later. Only with nothing streaming; on the hot-plug
+   queue. */
+static void relist_device(void) {
+    if (atomic_load(&g_io_running) || !device_published()) return;
+    if (atomic_exchange(&g_unlisted, true)) return;   /* already being set up again */
+    notify_device_list_changed();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), g_hotplug_q, ^{
+        in_safety_apply();
+        atomic_store(&g_unlisted, false);
+        notify_device_list_changed();
+        LOG("Device set up again: input safety offset %.1f ms", atomic_load(&g_in_safety_us) / 1000.0);
+    });
+}
+/* ... if the offset the device should have differs from the one it was set up with. */
+static void relist_if_safety_changed(void) {
+    if (!g_hotplug_q) return;
+    dispatch_async(g_hotplug_q, ^{
+        if (atomic_load(&g_in_safety_us) != in_safety_wanted_us()) relist_device();
+    });
+}
+
 /* Open a newly attached box and, with no stream running, put its decks on analogue thru (the box
    powers up with thru on or off depending on a board input), as at stream stop, so turntables
    reach the mixer until an app streams. The first open can be refused ("exclusive open of usb
@@ -1827,6 +1944,10 @@ static void on_usb_added(void *refcon, io_iterator_t iter) {
 
     /* A box with firmware: open it. */
     if (audio) {
+        /* A new connection: its early read is judged afresh, without a fallback. */
+        atomic_store(&g_in_fallback, false);
+        atomic_store(&g_early_state, EARLY_UNKNOWN);
+        atomic_store(&g_in_dropouts, 0);
         atomic_store(&g_boot_mode, false);
         atomic_store(&g_box_present, true);
         LOG("Rane SL 2 USB connected");
@@ -1837,8 +1958,11 @@ static void on_usb_added(void *refcon, io_iterator_t iter) {
         atomic_store(&g_boot_mode, true);
         note_bootloader_device();
     }
-    /* The device has just appeared in the HAL's list: tell the HAL. */
-    if (!was_published) notify_device_list_changed();
+    /* The device has just appeared in the HAL's list: tell the HAL, which sets it up. */
+    if (!was_published) {
+        in_safety_apply();
+        notify_device_list_changed();
+    }
 }
 
 /* Hot-plug: SL 2 USB devices went away (on the hot-plug queue). */
@@ -1929,6 +2053,8 @@ static ULONG SL2_Release(void *inDriver) { return g_ref_count > 0 ? --g_ref_coun
 static OSStatus SL2_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHost) {
     g_log = os_log_create("com.rane.sl2", "HAL");
     g_host = inHost;
+    in_safety_load();
+    in_safety_apply();
     mach_timebase_info(&g_tb);
     clk_reset();
     start_hotplug_monitor();
@@ -2245,6 +2371,7 @@ static Boolean SL2_HasProperty(AudioServerPlugInDriverRef d, AudioObjectID oid, 
             case kSL2PropStatus:
             case kSL2PropUnsolQueue:
             case kSL2PropMeters:
+            case kSL2PropInSafety:
             case kAudioObjectPropertyCustomPropertyInfoList:
                 return true;
         }
@@ -2279,7 +2406,8 @@ static Boolean SL2_HasProperty(AudioServerPlugInDriverRef d, AudioObjectID oid, 
 
 static OSStatus SL2_IsPropertySettable(AudioServerPlugInDriverRef d, AudioObjectID oid, pid_t pid, const AudioObjectPropertyAddress *addr, Boolean *outSettable) {
     *outSettable = false;
-    if (oid == kObjDevice && (addr->mSelector == kAudioDevicePropertyNominalSampleRate || addr->mSelector == kSL2PropHIDCommand)) {
+    if (oid == kObjDevice && (addr->mSelector == kAudioDevicePropertyNominalSampleRate || addr->mSelector == kSL2PropHIDCommand ||
+                              addr->mSelector == kSL2PropInSafety)) {
         *outSettable = true;
     } else if ((oid == kObjStreamIn || oid == kObjStreamOut) &&
                (addr->mSelector == kAudioStreamPropertyVirtualFormat || addr->mSelector == kAudioStreamPropertyPhysicalFormat)) {
@@ -2398,7 +2526,8 @@ static OSStatus SL2_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjec
             case kSL2PropStatus:
             case kSL2PropUnsolQueue:
             case kSL2PropMeters: *outSize = sizeof(CFDataRef); return 0;
-            case kAudioObjectPropertyCustomPropertyInfoList: *outSize = 4 * sizeof(AudioServerPlugInCustomPropertyInfo); return 0;
+            case kSL2PropInSafety: *outSize = sizeof(CFNumberRef); return 0;
+            case kAudioObjectPropertyCustomPropertyInfoList: *outSize = 5 * sizeof(AudioServerPlugInCustomPropertyInfo); return 0;
         }
     }
     /* The input and output streams */
@@ -2552,14 +2681,15 @@ static OSStatus get_property_data(AudioServerPlugInDriverRef d, AudioObjectID oi
             case kAudioObjectPropertyCustomPropertyInfoList: {
                 /* Declares the custom properties so the HAL marshals them to clients
                    (SL2Api.framework, sl2panel). Without this, clients get 'who?'. */
-                static const AudioServerPlugInCustomPropertyInfo all[4] = {
+                static const AudioServerPlugInCustomPropertyInfo all[5] = {
                     { kSL2PropHIDCommand, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
                     { kSL2PropStatus,     kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
                     { kSL2PropUnsolQueue, kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
                     { kSL2PropMeters,     kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
+                    { kSL2PropInSafety,   kAudioServerPlugInCustomPropertyDataTypeCFPropertyList, kAudioServerPlugInCustomPropertyDataTypeNone },
                 };
                 UInt32 n = inSize / sizeof(AudioServerPlugInCustomPropertyInfo);
-                if (n > 4) n = 4;
+                if (n > 5) n = 5;
                 memcpy(outData, all, n * sizeof(AudioServerPlugInCustomPropertyInfo));
                 *outSize = n * sizeof(AudioServerPlugInCustomPropertyInfo);
                 return 0;
@@ -2591,9 +2721,21 @@ static OSStatus get_property_data(AudioServerPlugInDriverRef d, AudioObjectID oi
                 g_st.play_frames = atomic_load(&g_total_play_frames);
                 g_st.boot_mode = atomic_load(&g_boot_mode) ? 1 : 0;
                 g_st.debug_build = SL2_DEBUG ? 1 : 0;
+                g_st.in_safety_us = (uint32_t)atomic_load(&g_in_safety_us);
+                g_st.in_safety_setting_us = (uint32_t)atomic_load(&g_in_safety_set_us);
+                g_st.early_read = atomic_load(&g_early_state);
+                g_st.hub_depth = atomic_load(&g_hub_depth);
+                g_st.in_dropouts = atomic_load(&g_in_dropouts);
                 pthread_mutex_unlock(&g_mutex);
                 *(CFDataRef*)outData = CFDataCreate(kCFAllocatorDefault, (const UInt8*)&g_st, sizeof(g_st));
                 *outSize = sizeof(CFDataRef);
+                return 0;
+            }
+            case kSL2PropInSafety: {
+                /* The input safety offset setting, in us (the status says what the HAL is using). */
+                int us = atomic_load(&g_in_safety_set_us);
+                *(CFNumberRef*)outData = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &us);
+                *outSize = sizeof(CFNumberRef);
                 return 0;
             }
             case kSL2PropMeters: {
@@ -2711,39 +2853,13 @@ static OSStatus SL2_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
 
 #if SL2_DEBUG
 /* 'sl2h' debug commands. Each takes its argument from byte [5] onwards:
-     0xF2 <hi> <lo>    input safety offset, in tenths of a ms; refused while streaming. The HAL
-                       reads it only at device setup, so the device is taken out of the device list
-                       and put back half a second later, which sets it up again
      0xF3 <ms hi> <lo> hold the USB queue this long, once, as a completion stall would
-     0xF4 <n>          treat the next n capture packets as errored */
+     0xF4 <n>          treat the next n capture packets as errored
+     0xF5 <0|1>        1: the early reader places nothing, as on a Mac where it can't work */
 static OSStatus dbg_command(const uint8_t *c, CFIndex len) {
     /* Every command needs at least its first argument byte, [5]. */
     if (len < 6) return kAudioHardwareBadPropertySizeError;
     switch (c[0]) {
-        case 0xF2: {
-            if (len < 7) return kAudioHardwareBadPropertySizeError;
-            /* Not while streaming: the running IO keeps the offset it was set up with, and the
-               property would report a value it isn't using. */
-            if (atomic_load(&g_io_running)) {
-                DBG_LOG("DBG input safety offset not changed: stop streaming first");
-                return kAudioHardwareIllegalOperationError;
-            }
-            int tenths = ((int)c[5] << 8) | c[6];
-            if (tenths < 1) tenths = 1;
-            atomic_store(&g_in_safety_us, tenths * 100);
-            DBG_LOG("DBG input safety offset set to %.1f ms (%u frames)", tenths / 10.0, in_safety_frames());
-            /* Have the HAL set the device up again, so it reads the new value. */
-            if (device_published() && g_hotplug_q) {
-                atomic_store(&dbg_unlisted, true);
-                notify_device_list_changed();
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), g_hotplug_q, ^{
-                    atomic_store(&dbg_unlisted, false);
-                    notify_device_list_changed();
-                    DBG_LOG("DBG device listed again (input safety offset %.1f ms)", atomic_load(&g_in_safety_us) / 1000.0);
-                });
-            }
-            return 0;
-        }
         case 0xF3:
             if (len < 7) return kAudioHardwareBadPropertySizeError;
             atomic_store(&dbg_stall_ms, ((uint32_t)c[5] << 8) | c[6]);
@@ -2753,12 +2869,35 @@ static OSStatus dbg_command(const uint8_t *c, CFIndex len) {
             atomic_store(&dbg_err_pkts, c[5]);
             DBG_LOG("DBG next %u capture packets treated as errored", c[5]);
             return 0;
+        case 0xF5:
+            atomic_store(&dbg_no_early, c[5] != 0);
+            DBG_LOG("DBG early capture read %{public}s", c[5] ? "off" : "on");
+            return 0;
     }
     return kAudioHardwareIllegalOperationError;
 }
 #endif
 
 static OSStatus SL2_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID oid, pid_t pid, const AudioObjectPropertyAddress *addr, UInt32 qsz, const void *qd, UInt32 inSize, const void *inData) {
+    /* 'sl2i': the input safety offset setting, in us (IN_SAFETY_MIN_US to IN_SAFETY_MAX_US). The HAL
+       reads safety offsets only when it sets the device up, so it changes only with nothing
+       streaming: refused otherwise. The setting is kept, and the device set up again with it. Setting
+       it also clears a fallback (see early_read_judge): the next stream judges the early read afresh. */
+    if (oid == kObjDevice && addr->mSelector == kSL2PropInSafety) {
+        if (inSize != sizeof(CFNumberRef) || !inData) return kAudioHardwareBadPropertySizeError;
+        CFNumberRef n = *(CFNumberRef*)inData;
+        int us = 0;
+        if (!n || CFGetTypeID(n) != CFNumberGetTypeID() || !CFNumberGetValue(n, kCFNumberIntType, &us) ||
+            us < IN_SAFETY_MIN_US || us > IN_SAFETY_MAX_US) return kAudioHardwareIllegalOperationError;
+        if (atomic_load(&g_io_running)) return kAudioHardwareIllegalOperationError;
+        atomic_store(&g_in_safety_set_us, us);
+        atomic_store(&g_in_fallback, false);
+        atomic_store(&g_early_state, EARLY_UNKNOWN);
+        in_safety_save();
+        LOG("Input safety offset setting: %.1f ms", us / 1000.0);
+        relist_if_safety_changed();
+        return 0;
+    }
     /* 'sl2h': a client's HID command for the box (a CFData report); its reply is kept for the
        client's next read of 'sl2h'. */
     if (oid == kObjDevice && addr->mSelector == kSL2PropHIDCommand) {
@@ -2857,7 +2996,11 @@ static OSStatus SL2_StopIO(AudioServerPlugInDriverRef d, AudioObjectID oid, UInt
     } else {
         LOG("StopIO with no client running (the box was unplugged while it streamed)");
     }
+    bool idle = g_io_clients == 0;
     pthread_mutex_unlock(&g_mutex);
+    /* Nothing streams now: if the early read was found not to work, set the device up again with the
+       fallback offset. */
+    if (idle) relist_if_safety_changed();
     return 0;
 }
 
@@ -2900,9 +3043,14 @@ static OSStatus SL2_DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID oi
         uint64_t done_head = atomic_load_explicit(&g_cap_head, memory_order_acquire);
         uint64_t early_head = atomic_load_explicit(&g_cap_early_head, memory_order_acquire);
         uint64_t head = early_head > done_head ? early_head : done_head;
+        /* After the first capture: count what ReadInput asked for, and the cycles it had to fill with
+           silence because the frames weren't captured in time. */
+        if (done_head) {
+            atomic_fetch_add_explicit(&g_rd_frames, frames, memory_order_relaxed);
+            if (pos + frames > head) atomic_fetch_add_explicit(&g_in_dropouts, 1, memory_order_relaxed);
+        }
 #if SL2_DEBUG
-        if (done_head) {   /* after the first capture: how much the early read gave, and the margin */
-            atomic_fetch_add_explicit(&dbg_rd_frames, frames, memory_order_relaxed);
+        if (done_head) {   /* how much the early read gave, and the margin */
             uint64_t end = pos + frames;
             if (end > done_head) {
                 uint64_t from = pos > done_head ? pos : done_head;
