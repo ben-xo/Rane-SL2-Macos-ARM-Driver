@@ -139,7 +139,7 @@ static void print_status(AudioObjectID dev) {
         printf("\n");
         printf("  Early Read    : %s\n", s.early_read == 1 ? "working" : s.early_read == 2 ? "NOT WORKING (offset fallen back)" : "not judged yet");
         printf("  Input Dropouts: %llu\n", s.in_dropouts);
-        printf("  USB Hubs      : %u%s\n", s.hub_depth, s.hub_depth ? " (directly to the Mac is best)" : " (connected directly)");
+        printf("  USB Hubs      : %u%s\n", s.hub_depth, s.hub_depth ? "" : " (connected directly)");
     }
     printf("==================================================\n");
 }

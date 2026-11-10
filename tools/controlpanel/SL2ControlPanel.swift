@@ -511,21 +511,15 @@ struct PanelView: View {
     /// The left column: the box, its audio settings and the decks.
     @ViewBuilder
     private func boxSections(_ box: BoxState) -> some View {
-        let warnings = Self.warnings(box)
-        if !warnings.isEmpty {
-            Section {
-                ForEach(warnings, id: \.self) { text in
-                    Label(text, systemImage: "exclamationmark.triangle.fill")
-                        .symbolRenderingMode(.multicolor)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-        }
         Section("Rane SL 2") {
             LabeledContent("Status", value: box.streaming ? "Connected, streaming audio" : "Connected")
             LabeledContent("Firmware", value: box.firmware)
             LabeledContent("Serial number", value: box.serial)
             LabeledContent("Driver", value: model.driverVersion ?? "—")
+            if let input = box.input {
+                LabeledContent("USB", value: input.hubs == 0 ? "Connected directly" :
+                                             input.hubs == 1 ? "Through 1 hub" : "Through \(input.hubs) hubs")
+            }
         }
         Section {
             Picker("Sample rate", selection: Binding(get: { box.sampleRate },
@@ -573,23 +567,18 @@ struct PanelView: View {
         us % 1000 == 0 ? "\(us / 1000) ms" : String(format: "%.1f ms", Double(us) / 1000)
     }
 
-    /// What the panel warns about: input the driver couldn't read early, input dropouts, and hubs.
+    /// What the panel warns about: input the driver couldn't read early, and input dropouts.
     static func warnings(_ box: BoxState) -> [String] {
         guard let input = box.input else { return [] }
         var w: [String] = []
         if input.earlyRead == 2 {
-            w.append("Input can't be read early on this Mac, so the input safety offset is \(ms(input.safetyUs)) until the SL 2 is connected again or the setting is changed (it is \(ms(input.settingUs))). Connecting it directly to the Mac may help.")
+            w.append("Input can't be read early on this Mac, so the input safety offset is \(ms(input.safetyUs)) until the SL 2 is connected again or the setting is changed (it is \(ms(input.settingUs))).")
         } else if input.safetyUs != input.settingUs {
             w.append("The input safety offset is \(ms(input.safetyUs)) until the SL 2 is connected again or the setting is changed (it is \(ms(input.settingUs))).")
         }
         if input.dropouts > 0 {
             let times = input.dropouts == 1 ? "once" : "\(input.dropouts) times"
             w.append("Input dropped out \(times) since the SL 2 was connected. If you hear gaps in the input, raise the input safety offset.")
-        }
-        if input.hubs > 1 {
-            w.append("The SL 2 is connected through \(input.hubs) USB hubs, one inside another. Connect it directly to the Mac, or through a single hub: nested hubs add latency and can make USB audio unreliable.")
-        } else if input.hubs == 1 {
-            w.append("The SL 2 is connected through a USB hub. For the lowest latency, connect it directly to the Mac.")
         }
         return w
     }
@@ -604,9 +593,19 @@ struct PanelView: View {
         return text
     }
 
-    /// The right column: the input and output levels, and the output volume.
+    /// The right column: any warnings, the input and output levels, and the output volume.
     @ViewBuilder
     private func levelSections(_ box: BoxState) -> some View {
+        let warnings = Self.warnings(box)
+        if !warnings.isEmpty {
+            Section {
+                ForEach(warnings, id: \.self) { text in
+                    Label(text, systemImage: "exclamationmark.triangle.fill")
+                        .symbolRenderingMode(.multicolor)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
         Section {
             DeckMeterRow(meters: model.meters, name: Self.deckNames[0], left: 0, right: 1)
             DeckMeterRow(meters: model.meters, name: Self.deckNames[1], left: 2, right: 3)

@@ -165,7 +165,9 @@ At a 64-frame IO buffer, the round trip breaks down as:
 - **Input health is reported.** The status (`sl2s`) carries the offset in use and the setting, the early
   read's judgement, the IO cycles since connecting in which input wasn't captured in time (ReadInput
   returned silence), and how many USB hubs the box is behind (its ancestors in the I/O Registry that are USB
-  devices). The SL 2 Control Panel warns about each.
+  devices). The SL 2 Control Panel warns about the first three and shows the hub count. A high-speed hub
+  adds no latency that matters here (it forwards packets within microseconds, inside the 125 us
+  microframe schedule); every figure in this document was measured through two.
 
 ### 3. Playback: deep schedule with late writes (`dp_*`)
 
