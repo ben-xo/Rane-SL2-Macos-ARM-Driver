@@ -1134,7 +1134,15 @@ static void dbg_er_log(const char *what) {
 #endif
 
 /* One captured frame: each 32-bit sample holds 24-bit audio in its top bytes; scale to float. */
-static inline void cap_frame_to_float(const volatile uint8_t *q, float *fr) {
+static inline void cap_frame_to_float(const uint8_t *q, float *fr) {
+    for (int c = 0; c < NCH; c++) {
+        int32_t raw32;
+        memcpy(&raw32, q + c * 4, 4);
+        fr[c] = (float)(raw32 >> 8) * (1.0f / 8388608.0f);
+    }
+}
+/* The same, from a buffer the controller may still be writing (the early reader). */
+static inline void cap_frame_to_float_live(const volatile uint8_t *q, float *fr) {
     for (int c = 0; c < NCH; c++) {
         uint32_t u = (uint32_t)q[c * 4] | (uint32_t)q[c * 4 + 1] << 8 | (uint32_t)q[c * 4 + 2] << 16 |
                      (uint32_t)q[c * 4 + 3] << 24;
@@ -1229,7 +1237,7 @@ static void cap_read_early(void) {
             DBG_DO(atomic_fetch_add_explicit(&dbg_er_cc_differs, 1, memory_order_relaxed));
             break;
         }
-        for (int i = 0; i < n; i++) cap_frame_to_float(p + i * FRAME_BYTES, &tmp[i * NCH]);
+        for (int i = 0; i < n; i++) cap_frame_to_float_live(p + i * FRAME_BYTES, &tmp[i * NCH]);
         /* Still frame f's buffer, not refilled while we read it? */
         atomic_thread_fence(memory_order_acquire);
         if (atomic_load_explicit(&g_cap_tag[idx], memory_order_relaxed) != f) {
