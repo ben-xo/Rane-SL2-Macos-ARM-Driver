@@ -103,7 +103,8 @@ typedef struct {
     uint32_t in_safety_us;          /* the input safety offset the HAL is using, in us */
     uint32_t early_read;            /* 0 = not judged yet on this connection, 1 = working, 2 = not working */
     uint32_t hub_depth;             /* USB hubs between the box and the Mac: 0 = connected directly */
-    uint64_t in_dropouts;           /* IO cycles since the box connected in which input wasn't captured in time */
+    uint64_t in_dropouts;           /* IO cycles in which input wasn't captured in time, since the device was
+                                       set up (the box connected, or the input safety offset changed) */
 } SL2StatusPacket;
 
 enum {
@@ -1165,8 +1166,10 @@ static uint64_t g_er_xfers, g_er_xfers_differ;    /* g_q: transfers holding earl
 static _Atomic bool g_er_judged;                  /* this stream has been judged (set on g_q, read on the IO thread too):
                                                      a release build stops counting for the judgement then */
 static _Atomic uint64_t g_rd_frames;              /* frames ReadInput asked for in this stream, after the first capture */
-static _Atomic uint64_t g_in_dropouts;            /* IO cycles since the box connected in which some input frame
-                                                     wasn't captured in time (ReadInput returned silence) */
+static _Atomic uint64_t g_in_dropouts;            /* IO cycles in which some input frame wasn't captured in time
+                                                     (ReadInput returned silence), since the device was set up: the
+                                                     box connected, or the input safety offset changed (dropouts at
+                                                     another offset say nothing about this one) */
 #if SL2_DEBUG
 static _Atomic uint32_t dbg_er_restarts, dbg_er_torn, dbg_er_cc_differs, dbg_er_errored;
 static _Atomic uint64_t dbg_rd_early, dbg_rd_short;   /* ReadInput, after the first capture */
@@ -1893,6 +1896,7 @@ static void relist_device(void) {
     notify_device_list_changed();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), g_hotplug_q, ^{
         in_safety_apply();
+        atomic_store(&g_in_dropouts, 0);
         atomic_store(&g_unlisted, false);
         notify_device_list_changed();
         LOG("Device set up again: input safety offset %.1f ms", atomic_load(&g_in_safety_us) / 1000.0);

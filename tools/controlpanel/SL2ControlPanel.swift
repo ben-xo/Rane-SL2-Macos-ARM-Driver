@@ -235,7 +235,8 @@ struct BoxState: Equatable {
         let safetyUs: Int        // the input safety offset (the setting, as CoreAudio is using it)
         let earlyRead: UInt32    // 0 not judged yet, 1 working, 2 not working
         let hubs: Int            // USB hubs between the box and the Mac
-        let dropouts: UInt64     // IO cycles since connecting in which input wasn't captured in time
+        let dropouts: UInt64     // IO cycles in which input wasn't captured in time, since the box connected
+                                 // or the input safety offset changed
     }
 }
 
@@ -591,7 +592,7 @@ struct PanelView: View {
         }
         if input.dropouts > 0 {
             let times = input.dropouts == 1 ? "once" : "\(input.dropouts) times"
-            w.append("Input dropped out \(times) since the SL 2 was connected. If you hear gaps in the input, raise the input safety offset.")
+            w.append("Input dropped out \(times) since the SL 2 was connected or the input safety offset changed. If you hear gaps in the input, raise the input safety offset.")
         }
         return w
     }
