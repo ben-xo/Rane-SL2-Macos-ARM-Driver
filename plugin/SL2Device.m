@@ -1153,12 +1153,15 @@ static int      g_er_k;
 static uint64_t g_er_at_fc[CAP_MAP_N], g_er_at_pos[CAP_MAP_N];   /* position at each USB frame's start */
 /* Whether the early read works on this connection. Each stream judges it once there is a second of
    capture and ReadInput has asked for half a second of it (early_read_judge): it works if it placed
-   frames and the completions found almost none of them different. If it doesn't, the log and the
+   frames and the completions found few of the transfers it read from placed differently. (Counted by
+   transfer, not frame: an errored packet the early reader had placed shifts every frame after it, so
+   one packet can make hundreds of frames differ, but only the few transfers they lie in.) If it doesn't, the log and the
    status say so, with the input dropouts. */
 enum { EARLY_UNKNOWN = 0, EARLY_WORKING = 1, EARLY_FAILED = 2 };
 static _Atomic uint32_t g_early_state;            /* this connection's latest judgement */
 static _Atomic uint64_t g_er_placed;              /* frames placed early in this stream */
 static uint64_t g_er_differ;                      /* g_q: of those, frames the completion found different */
+static uint64_t g_er_xfers, g_er_xfers_differ;    /* g_q: transfers holding early-placed frames, and those with any different */
 static bool     g_er_judged;                      /* g_q: this stream has been judged */
 static _Atomic uint64_t g_rd_frames;              /* frames ReadInput asked for in this stream, after the first capture */
 static _Atomic uint64_t g_in_dropouts;            /* IO cycles since the box connected in which some input frame
@@ -1338,12 +1341,12 @@ static uint64_t cap_frames_in(uint64_t uframes) {
 static void early_read_judge(void) {
     g_er_judged = true;
     uint64_t placed = atomic_load(&g_er_placed);
-    bool works = placed > 0 && g_er_differ * 100 <= placed;
+    bool works = placed > 0 && g_er_xfers > 0 && g_er_xfers_differ * 20 <= g_er_xfers;   /* under 5% */
     uint32_t was = atomic_exchange(&g_early_state, works ? EARLY_WORKING : EARLY_FAILED);
     if (!works && was != EARLY_FAILED)
-        LOG("Capture can't be read early on this connection (%llu frames placed early, %llu of them differently "
-            "from their completion): input can drop out below an input safety offset of %d ms",
-            placed, g_er_differ, IN_SAFETY_SAFE_US / 1000);
+        LOG("Capture can't be read early on this connection (%llu frames placed early; %llu of %llu transfers "
+            "placed differently from their completion): input can drop out below an input safety offset of %d ms",
+            placed, g_er_xfers_differ, g_er_xfers, IN_SAFETY_SAFE_US / 1000);
 }
 
 static void cap_submit(int idx, uint32_t gen);
@@ -1388,6 +1391,7 @@ static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *
     }
     uint64_t ring_pos = g_cap_base + before;   /* timeline position of the next frame to write */
     uint64_t early_head = atomic_load_explicit(&g_cap_early_head, memory_order_acquire);   /* placed early below it */
+    bool xfer_early = false, xfer_differs = false;   /* this transfer held early-placed frames; any different */
     uint64_t got = 0;                          /* frames placed by this completion, fill included */
     uint64_t ts = 0;                           /* bus time of the first of them */
 
@@ -1433,10 +1437,14 @@ static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *
             bool early = ring_pos + got < early_head;
             if (early) memcpy(was, fr, sizeof was);
             cap_frame_to_float(p + s * FRAME_BYTES, fr);
-            if (early && memcmp(was, fr, sizeof was)) g_er_differ++;
+            if (early) {
+                xfer_early = true;
+                if (memcmp(was, fr, sizeof was)) { g_er_differ++; xfer_differs = true; }
+            }
             got++;
         }
     }
+    if (xfer_early) { g_er_xfers++; if (xfer_differs) g_er_xfers_differ++; }
 
     /* The input meters, if shown: the frames just placed (the ring may wrap within them). After a
        long gap the silence fill can be many times the ring, so take at most the newest ring's worth. */
@@ -1735,6 +1743,7 @@ static bool usb_open_all(void) {
     atomic_store(&g_er_placed, 0);
     atomic_store(&g_rd_frames, 0);
     g_er_differ = 0;
+    g_er_xfers = g_er_xfers_differ = 0;
     g_er_judged = false;
     cap_prog_publish(0, 0);
     atomic_store(&g_cap_prog_last_fc, 0);
