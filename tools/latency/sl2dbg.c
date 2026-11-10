@@ -1,9 +1,8 @@
 // sl2dbg — send a debug command to the SL 2 driver (debug build only: make plugin DEBUG=1).
 // The driver handles these itself and never sends them to the box; a release build refuses them.
-//   sl2dbg insafe <ms>        input safety offset, to 0.1 ms (e.g. 1.5). With nothing streaming,
-//                             the driver briefly takes the device out of the device list so the HAL
-//                             sets it up again and reads it; while streaming it applies only once the
-//                             device is set up again (e.g. after restarting coreaudiod)
+//   sl2dbg insafe <ms>        input safety offset, to 0.1 ms (e.g. 1.5), with nothing streaming
+//                             (refused otherwise). The driver briefly takes the device out of the
+//                             device list so the HAL sets it up again and reads it
 //   sl2dbg stall <ms>         hold the driver's USB queue this long, once, as a stall in USB
 //                             completion delivery would
 //   sl2dbg errpkts <n>        treat the next n capture packets as errored
@@ -48,7 +47,8 @@ int main(int argc, char **argv) {
     OSStatus e = AudioObjectSetPropertyData(dev, &a, 0, NULL, sizeof(CFDataRef), &d);
     CFRelease(d);
     if (e) {
-        fprintf(stderr, "refused (error %d): is the driver a debug build (make plugin DEBUG=1)?\n", (int)e);
+        fprintf(stderr, "refused (error %d): is the driver a debug build (make plugin DEBUG=1)%s?\n", (int)e,
+                cmd[0] == 0xF2 ? ", and is nothing streaming" : "");
         return 1;
     }
     printf("%s %s: done\n", argv[1], argv[2]);

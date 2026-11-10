@@ -56,7 +56,7 @@ need the debug build's counters and hooks; run it again with a debug build to co
 | `bin/sinetest <device> <out-ch> <in-ch> <seconds> [buffer]` | Glitch test. Plays a continuous 997 Hz sine and checks every captured sample against the sine recurrence: any dropout, repeat, skip or click breaks it. Analysis starts after the first second | "0 glitches, 0 level drops" |
 | `dptest.sh <seconds>` | `sinetest` idle, then with every core busy, plus the driver's counters from its log (debug build) | prints PASS |
 | `restartcheck.sh` | Three streams in a row: each must start cleanly and find all its clicks | prints PASS |
-| `bin/sl2dbg insafe <ms> \| stall <ms> \| errpkts <n>` | Debug build only: the input safety offset, to 0.1 ms (the HAL reads it only at device setup, so with nothing streaming the driver briefly takes the device out of the device list to have it set up again), and test hooks that stall the driver's USB queue or error capture packets on demand | — |
+| `bin/sl2dbg insafe <ms> \| stall <ms> \| errpkts <n>` | Debug build only: the input safety offset, to 0.1 ms, with nothing streaming (the HAL reads it only at device setup, so the driver briefly takes the device out of the device list to have it set up again), and test hooks that stall the driver's USB queue or error capture packets on demand | — |
 | `bin/chtone <device> <seconds> <ch...>` | A 440 Hz tone on chosen output channels, the way Audio MIDI Setup's test tone plays it | heard on each channel |
 | `bin/chrec <device> <seconds> <out.wav>` | Starts IO from cold and records the input, reporting when signal first appears and any dropouts | no dropouts |
 | `envelope.py <wav>` | Peak level of a `chrec` recording in 100 ms windows | — |

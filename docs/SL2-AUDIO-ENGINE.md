@@ -643,9 +643,9 @@ Each was removed from the tip in its own commit.
   above 0.5 ms (at the 1.5 ms input safety offset).
 
 **Debug commands** (`tools/latency/bin/sl2dbg`, handled by the driver, never sent to the box):
-- `insafe <ms>`: the input safety offset, to 0.1 ms. The HAL reads safety offsets only at device setup:
-  with nothing streaming, the driver takes the device out of the device list for half a second, which
-  sets it up again; while streaming it applies once the device is next set up.
+- `insafe <ms>`: the input safety offset, to 0.1 ms, with nothing streaming (refused while a stream
+  runs). The HAL reads safety offsets only at device setup, so the driver takes the device out of the
+  device list for half a second, which sets it up again.
 - `stall <ms>`: hold the USB queue once, as a completion-delivery stall would. A stall shorter than the
   capture queue (about 50 ms) is covered by the early read; a longer one leaves a gap and a "not
   captured" line.

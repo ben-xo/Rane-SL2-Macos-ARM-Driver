@@ -2711,8 +2711,8 @@ static OSStatus SL2_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
 
 #if SL2_DEBUG
 /* 'sl2h' debug commands. Each takes its argument from byte [5] onwards:
-     0xF2 <hi> <lo>    input safety offset, in tenths of a ms. The HAL reads it only at device
-                       setup, so with nothing streaming the device is taken out of the device list
+     0xF2 <hi> <lo>    input safety offset, in tenths of a ms; refused while streaming. The HAL
+                       reads it only at device setup, so the device is taken out of the device list
                        and put back half a second later, which sets it up again
      0xF3 <ms hi> <lo> hold the USB queue this long, once, as a completion stall would
      0xF4 <n>          treat the next n capture packets as errored */
@@ -2722,14 +2722,18 @@ static OSStatus dbg_command(const uint8_t *c, CFIndex len) {
     switch (c[0]) {
         case 0xF2: {
             if (len < 7) return kAudioHardwareBadPropertySizeError;
+            /* Not while streaming: the running IO keeps the offset it was set up with, and the
+               property would report a value it isn't using. */
+            if (atomic_load(&g_io_running)) {
+                DBG_LOG("DBG input safety offset not changed: stop streaming first");
+                return kAudioHardwareIllegalOperationError;
+            }
             int tenths = ((int)c[5] << 8) | c[6];
             if (tenths < 1) tenths = 1;
             atomic_store(&g_in_safety_us, tenths * 100);
             DBG_LOG("DBG input safety offset set to %.1f ms (%u frames)", tenths / 10.0, in_safety_frames());
             /* Have the HAL set the device up again, so it reads the new value. */
-            if (atomic_load(&g_io_running)) {
-                DBG_LOG("DBG streaming: the new input safety offset applies once the device is set up again");
-            } else if (device_published() && g_hotplug_q) {
+            if (device_published() && g_hotplug_q) {
                 atomic_store(&dbg_unlisted, true);
                 notify_device_list_changed();
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), g_hotplug_q, ^{
