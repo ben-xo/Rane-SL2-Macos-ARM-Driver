@@ -50,7 +50,7 @@ At a 64-frame IO buffer, the round trip breaks down as:
 | Part | Time |
 |---|---|
 | 2 × IO buffer | 2.9 ms |
-| input safety offset | 1.5 ms (was 8 ms, before the early capture read) |
+| input safety offset | 1.5 ms |
 | output safety offset | 2 ms |
 | output latency | 1.5 ms |
 | the box (FIFO, converters) | ~1.3 ms |
@@ -121,11 +121,11 @@ At a 64-frame IO buffer, the round trip breaks down as:
   arrives (logged as "Capture: N ms not captured").
 - **ReadInput doesn't wait for completions (the early read).**
   - Completions are delivered late: capture handlers ran at most 1.5 ms after their frame's bus start
-    99.99% of the time, but up to 7.6 ms idle, and 12–18 ms with the Mac swapping. Waiting for them
-    needed an 8 ms input safety offset, and a longer stall still left a gap.
+    99.99% of the time, but up to 7.6 ms idle, and 12–18 ms with the Mac swapping. An input that
+    waited for them would need a safety offset that long, and a longer stall would still leave a gap.
   - The data itself is on time. The controller writes each packet into the transfer's buffer during the
-    packet's own microframe: in a probe (`e221a03`) every packet was in memory before its microframe
-    ended, with heap and `ioDataWithCapacity:` buffers alike.
+    packet's own microframe: measured, every packet was in memory before its microframe ended, with
+    heap and `ioDataWithCapacity:` buffers alike.
   - So ReadInput, on the HAL's real-time IO thread, reads the packets that have arrived since the last
     completion out of the queued buffers and places them in the ring itself (`cap_read_early`), once
     their microframe has been over for one more microframe (a packet can be caught part-written during
@@ -261,7 +261,7 @@ deck and not the other.
 Measured through the loopback cable (44.1 kHz, 128-frame buffer): clicks drop by exactly the volume
 (−20.0 dB at −20 dB), whether set on the channel or with the volume keys (which set the master and
 leave the channels' own levels), a level set on another channel leaves them alone, and they are gone
-when muted. The DVS round trip at 0 dB was 18.6 ms (before the early capture read), the
+when muted. The volume control doesn't change the DVS round trip: at 0 dB it measures the
 same as without the volume control. `rtlat` reads quieter clicks one to three frames later, but a click at half
 amplitude reads the same with no volume applied: its fixed detection threshold is crossed by the
 converters' pre-ringing, which is smaller on a quieter click. It is not latency.

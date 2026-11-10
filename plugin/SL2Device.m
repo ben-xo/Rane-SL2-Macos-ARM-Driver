@@ -221,10 +221,9 @@ static uint64_t g_rate_anchor = 0;
 static uint64_t g_cap_base = 0;
 static uint64_t g_clk_last_fix = 0;  /* captured-frame count at the last clk_track correction */
 
-/* Input safety offset. With the early read (see "Early read"), ReadInput found every frame it was
-   asked for at least 0.6 ms early at 1.5 ms, idle and under load (measured); without it, this would
-   have to cover completion delivery (8 ms). Debug builds can set it with 'sl2h' 0xF2; the HAL only
-   reads it at device setup. */
+/* Input safety offset. It covers the early read (see "Early read"), not completion delivery: at
+   1.5 ms, ReadInput found every frame it was asked for at least 0.6 ms early, idle and under load
+   (measured). Debug builds can set it with 'sl2h' 0xF2; the HAL only reads it at device setup. */
 static _Atomic int g_in_safety_us = 1500;
 static UInt32 in_safety_frames(void) {
     return (UInt32)(atomic_load(&g_in_safety_us) * g_sr / 1e6 + 0.5);
