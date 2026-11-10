@@ -148,7 +148,10 @@ static double   dbg_dp_err_max;
 static _Atomic uint32_t dbg_stall_ms;      /* 0xF3: hold the USB queue (g_q) this many ms, once */
 static _Atomic uint32_t dbg_err_pkts;      /* 0xF4: treat this many more capture packets as errored */
 
+static void dbg_er_reset(void);
+static void dbg_er_log(const char *what);
 static void dbg_reset(void) {
+    dbg_er_reset();
     memset(dbg_capdelay_hist, 0, sizeof dbg_capdelay_hist);
     dbg_capdelay_min = dbg_capstamp_min = 1e9; dbg_capdelay_max = dbg_capstamp_max = -1e9;
     dbg_cap_pkt_err = 0;
@@ -218,9 +221,9 @@ static uint64_t g_rate_anchor = 0;
 static uint64_t g_cap_base = 0;
 static uint64_t g_clk_last_fix = 0;  /* captured-frame count at the last clk_track correction */
 
-static _Atomic int g_in_safety_ms = 8;    /* DEBUG: settable via 'sl2h' 0xF2 (the HAL only reads it at device setup) */
+static _Atomic int g_in_safety_us = 8000;   /* DEBUG: settable via 'sl2h' 0xF2 (the HAL only reads it at device setup) */
 static UInt32 in_safety_frames(void) {
-    return (UInt32)(atomic_load(&g_in_safety_ms) * g_sr / 1000.0 + 0.5);
+    return (UInt32)(atomic_load(&g_in_safety_us) * g_sr / 1e6 + 0.5);
 }
 /* Output timing, reported to the HAL (see "Deep-schedule playback" below): every sample plays
    DP_OUT_LATENCY_MS after its timeline position, and the HAL writes DP_OUT_SAFETY_MS ahead. */
@@ -879,6 +882,7 @@ static void dp_track_capture(uint64_t fc, int frames) {
             atomic_load(&dbg_dp_unscheduled), dbg_dp_enq_fail, dbg_dp_retry_later, dbg_dp_resync,
             atomic_load(&dbg_wm_thread_switches), atomic_load(&dbg_wm_concurrent), atomic_load(&dbg_wm_rewritten),
             dbg_cap_pkt_err);
+    if (dbg_dp_n % 2000 == 0) dbg_er_log("so far");
 #endif
 }
 
@@ -1057,6 +1061,176 @@ static double   g_cap_fill_frac;        /* fraction of a frame carried between s
 static _Atomic uint64_t g_cap_head;     /* timeline position just past the last frame written to the ring */
 #define CAP_VALID_SPAN (RING_FRAMES / 2)   /* ReadInput trusts positions this far behind the head */
 
+/* ----------------------------------------------------------------------------
+ * Early read
+ *
+ * A capture completion can be delivered up to ~8 ms after its frame, but the controller writes
+ * each packet straight into the transfer's buffer during the packet's own microframe. So ReadInput
+ * (the HAL's IO thread) reads packets out of the queued buffers itself, shortly after their
+ * microframe, and the input safety offset only has to cover that, not the completion delay.
+ *
+ * - How many frames a packet carried is only reported with its completion. So every buffer is
+ *   filled with CAP_MARK before it is queued: the low byte of a real sample is always 0 (24-bit
+ *   audio, left-justified in 32 bits), so the frames whose first byte reads 0 are the ones that
+ *   arrived.
+ * - A packet is read only once its microframe has been over for CAP_SETTLE_UF microframes (one can
+ *   be caught part-written during its microframe), and not if the kernel has already marked it
+ *   errored in the transaction list.
+ * - The early reader starts where the completions have got to (g_cap_prog_*: the next USB frame to
+ *   complete, and the timeline position its first frame goes at), and walks forward packet by
+ *   packet, placing each frame at the position the completion will. It stops at the first packet
+ *   it can't read yet, a packet with no frames (missing or errored: the completion fills it with
+ *   silence), or a USB frame with no transfer queued.
+ * - The completion stays in charge. It writes every frame again (the same values), and keeps the
+ *   clock tracking, the playback steering, the meters and the silence fills. If it places frames
+ *   differently (an errored packet that still carried data), the early reader's position for the
+ *   next USB frame doesn't match the completion's, and it starts again from the completion's.
+ * - A buffer is tagged with its USB frame while queued (g_cap_tag), and 0 while it is refilled for
+ *   its next frame. The early reader checks the tag before and after reading a packet, converting
+ *   into a scratch buffer in between, so it never puts a refilled buffer's contents in the ring.
+ * ---------------------------------------------------------------------------- */
+#define CAP_MARK       0xFF
+#define CAP_SETTLE_UF  1           /* microframes after a packet's own before it is read early */
+#define CAP_MAP_N      128         /* USB frame -> transfer map entries: power of two, >= 2 x CAP_NXF */
+static uint8_t *g_cap_bytes[CAP_NXF];             /* the capture buffers' bytes, for the IO thread */
+static _Atomic uint64_t g_cap_tag[CAP_NXF];       /* USB frame the buffer holds, 0 while refilled */
+static _Atomic int      g_cap_idx_of[CAP_MAP_N];  /* the transfer queued for USB frame f, at [f % CAP_MAP_N] */
+/* The completions' progress (g_q writes, the IO thread reads; seqlock): the next USB frame to
+   complete and the timeline position of its first frame. fc 0 = no completion yet. */
+static _Atomic uint32_t g_cap_prog_seq;
+static uint64_t g_cap_prog_fc, g_cap_prog_pos;
+static _Atomic uint64_t g_cap_early_head;         /* timeline position just past the early reader's last frame */
+/* The early reader's own state: IO thread, one at a time (g_er_busy). */
+static _Atomic bool g_er_busy;
+static uint32_t g_er_gen;                         /* stream generation the state belongs to */
+static uint64_t g_er_fc, g_er_pos;                /* next packet to read: USB frame, packet, position */
+static int      g_er_k;
+static uint64_t g_er_at_fc[CAP_MAP_N], g_er_at_pos[CAP_MAP_N];   /* position at each USB frame's start */
+#if SL2_DEBUG
+static _Atomic uint64_t dbg_er_frames;            /* frames placed early */
+static _Atomic uint32_t dbg_er_restarts, dbg_er_torn, dbg_er_cc_differs, dbg_er_errored;
+static uint64_t dbg_er_mismatch;                  /* g_q: frames the completion found different */
+static _Atomic uint64_t dbg_rd_frames, dbg_rd_early, dbg_rd_short;   /* ReadInput, after the first capture */
+static _Atomic int64_t  dbg_rd_margin_min;        /* frames between the read's end and the head, least */
+static void dbg_er_reset(void) {
+    dbg_er_frames = 0; dbg_er_restarts = dbg_er_torn = dbg_er_cc_differs = dbg_er_errored = 0;
+    dbg_er_mismatch = 0;
+    dbg_rd_frames = dbg_rd_early = dbg_rd_short = 0;
+    dbg_rd_margin_min = INT64_MAX;
+}
+static void dbg_er_log(const char *what) {
+    int64_t m = atomic_load(&dbg_rd_margin_min);
+    DBG_LOG("DBG early read %{public}s: frames placed early %llu, restarts %u, torn %u, errored %u, count "
+        "differs %u | completion found %llu different | ReadInput frames %llu: only there early %llu, "
+        "SILENCE (not captured yet) %llu | least margin %.2f ms",
+        what, atomic_load(&dbg_er_frames), atomic_load(&dbg_er_restarts), atomic_load(&dbg_er_torn),
+        atomic_load(&dbg_er_errored), atomic_load(&dbg_er_cc_differs), dbg_er_mismatch,
+        atomic_load(&dbg_rd_frames), atomic_load(&dbg_rd_early), atomic_load(&dbg_rd_short),
+        m == INT64_MAX ? 0.0 : 1000.0 * (double)m / g_sr);
+}
+#endif
+
+/* One captured frame: each 32-bit sample holds 24-bit audio in its top bytes; scale to float. */
+static inline void cap_frame_to_float(const volatile uint8_t *q, float *fr) {
+    for (int c = 0; c < NCH; c++) {
+        uint32_t u = (uint32_t)q[c * 4] | (uint32_t)q[c * 4 + 1] << 8 | (uint32_t)q[c * 4 + 2] << 16 |
+                     (uint32_t)q[c * 4 + 3] << 24;
+        fr[c] = (float)((int32_t)u >> 8) * (1.0f / 8388608.0f);
+    }
+}
+
+/* The completions' progress (g_q). */
+static void cap_prog_publish(uint64_t fc, uint64_t pos) {
+    uint32_t s = atomic_load_explicit(&g_cap_prog_seq, memory_order_relaxed);
+    atomic_store_explicit(&g_cap_prog_seq, s + 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
+    g_cap_prog_fc = fc; g_cap_prog_pos = pos;
+    atomic_store_explicit(&g_cap_prog_seq, s + 2, memory_order_release);
+}
+/* ... read consistently (any thread; bounded, false if it couldn't). */
+static bool cap_prog_get(uint64_t *fc, uint64_t *pos) {
+    for (int i = 0; i < 64; i++) {
+        uint32_t s1 = atomic_load_explicit(&g_cap_prog_seq, memory_order_acquire);
+        uint64_t a = g_cap_prog_fc, b = g_cap_prog_pos;
+        atomic_thread_fence(memory_order_acquire);
+        uint32_t s2 = atomic_load_explicit(&g_cap_prog_seq, memory_order_relaxed);
+        if (!(s1 & 1) && s1 == s2) { *fc = a; *pos = b; return true; }
+    }
+    return false;
+}
+
+/* ReadInput (IO thread): place the packets that have arrived since the last completion (see "Early
+   read"). No locks, no allocation, no IOKit calls. */
+static void cap_read_early(void) {
+    if (atomic_exchange_explicit(&g_er_busy, true, memory_order_acquire)) return;   /* another IO thread is */
+    uint32_t gen = atomic_load_explicit(&g_stream_gen, memory_order_acquire);
+    uint64_t pfc, ppos;
+    if (!atomic_load_explicit(&g_io_running, memory_order_acquire) || !cap_prog_get(&pfc, &ppos) || !pfc) goto out;
+
+    /* Carry on from where we got to, if that agrees with the completions; otherwise start again
+       from them (a new stream, the completions overtook us, or they placed frames differently). */
+    uint64_t at = pfc & (CAP_MAP_N - 1);
+    if (g_er_gen != gen || g_er_fc < pfc || g_er_at_fc[at] != pfc || g_er_at_pos[at] != ppos) {
+#if SL2_DEBUG
+        if (g_er_gen == gen && g_er_fc > pfc) atomic_fetch_add_explicit(&dbg_er_restarts, 1, memory_order_relaxed);
+#endif
+        g_er_gen = gen; g_er_fc = pfc; g_er_k = 0; g_er_pos = ppos;
+        g_er_at_fc[at] = pfc; g_er_at_pos[at] = ppos;
+    }
+
+    /* The USB frame clock, to tell which packets' microframes are over. */
+    uint64_t now = mach_absolute_time(), uf, ut;
+    dp_ref_get(&uf, &ut);
+    double tpu = ticks_per_ms() / 8.0;   /* host ticks per microframe */
+    float tmp[(PKT_MAX / FRAME_BYTES) * NCH];
+    for (int budget = CAP_NXF * CAP_PKTS; budget > 0; budget--) {
+        uint64_t f = g_er_fc;
+        int k = g_er_k;
+        /* Not until its microframe (8f + k) has been over for CAP_SETTLE_UF more. */
+        double ready = (double)ut + ((double)(8 * f + k + 1 + CAP_SETTLE_UF) - (double)uf) * tpu;
+        if ((double)now < ready) break;
+        /* The transfer queued for frame f, if one is. */
+        int idx = atomic_load_explicit(&g_cap_idx_of[f & (CAP_MAP_N - 1)], memory_order_relaxed);
+        if (idx < 0 || idx >= CAP_NXF || atomic_load_explicit(&g_cap_tag[idx], memory_order_acquire) != f) break;
+        /* Already reported errored by the kernel: leave it to the completion. */
+        const volatile IOUSBHostIsochronousTransaction *t = &g_cap_xf[idx].tx[k];
+        uint32_t cc = t->completeCount;
+        if (cc && (t->status != kIOReturnSuccess || cc > PKT_MAX)) {
+            DBG_DO(atomic_fetch_add_explicit(&dbg_er_errored, 1, memory_order_relaxed));
+            break;
+        }
+        /* Count the frames that arrived by their marks; none means missing or errored. */
+        const volatile uint8_t *p = g_cap_bytes[idx] + k * PKT_MAX;
+        int n = 0;
+        while (n < PKT_MAX / FRAME_BYTES && p[n * FRAME_BYTES] == 0x00) n++;
+        if (n == 0) break;
+        if (cc && (int)(cc / FRAME_BYTES) != n) {   /* the kernel's count disagrees: let the completion decide */
+            DBG_DO(atomic_fetch_add_explicit(&dbg_er_cc_differs, 1, memory_order_relaxed));
+            break;
+        }
+        for (int i = 0; i < n; i++) cap_frame_to_float(p + i * FRAME_BYTES, &tmp[i * NCH]);
+        /* Still frame f's buffer, not refilled while we read it? */
+        atomic_thread_fence(memory_order_acquire);
+        if (atomic_load_explicit(&g_cap_tag[idx], memory_order_relaxed) != f) {
+            DBG_DO(atomic_fetch_add_explicit(&dbg_er_torn, 1, memory_order_relaxed));
+            break;
+        }
+        /* Into the ring, where the completion will put them too. */
+        for (int i = 0; i < n; i++)
+            memcpy(&g_in_ring[((g_er_pos + i) & RING_MASK) * NCH], &tmp[i * NCH], NCH * sizeof(float));
+        g_er_pos += n;
+        DBG_DO(atomic_fetch_add_explicit(&dbg_er_frames, n, memory_order_relaxed));
+        if (++g_er_k == CAP_PKTS) {
+            g_er_k = 0; g_er_fc++;
+            g_er_at_fc[g_er_fc & (CAP_MAP_N - 1)] = g_er_fc;
+            g_er_at_pos[g_er_fc & (CAP_MAP_N - 1)] = g_er_pos;
+        }
+    }
+    atomic_store_explicit(&g_cap_early_head, g_er_pos, memory_order_release);
+out:
+    atomic_store_explicit(&g_er_busy, false, memory_order_release);
+}
+
 /* Write n frames of silence into the ring from timeline position pos (at most the ring's size). */
 static void cap_fill_silence(uint64_t pos, uint64_t n) {
     if (n > RING_FRAMES) { pos += n - RING_FRAMES; n = RING_FRAMES; }
@@ -1117,6 +1291,9 @@ static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *
         g_cap_next_fc = fc;
     }
     uint64_t ring_pos = g_cap_base + before;   /* timeline position of the next frame to write */
+#if SL2_DEBUG
+    uint64_t early_head = atomic_load_explicit(&g_cap_early_head, memory_order_acquire);
+#endif
     uint64_t got = 0;                          /* frames placed by this completion, fill included */
     uint64_t ts = 0;                           /* bus time of the first of them */
 
@@ -1151,18 +1328,20 @@ static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *
             got += n;
             continue;
         }
-        /* A good packet: each 32-bit sample holds 24-bit audio in its top bytes; scale to float. */
+        /* A good packet: into the ring. */
         int n = done[k].completeCount / FRAME_BYTES;
         const uint8_t *p = b + k * PKT_MAX;
         for (int s = 0; s < n; s++) {
-            const uint8_t *q = p + s * FRAME_BYTES;
             float *fr = &g_in_ring[((ring_pos + got) & RING_MASK) * NCH];
-            for (int c = 0; c < NCH; c++) {
-                int32_t raw32 = 0;
-                memcpy(&raw32, q + c * 4, 4);
-                int32_t s24 = raw32 >> 8;
-                fr[c] = (float)s24 * (1.0f / 8388608.0f);
-            }
+#if SL2_DEBUG   /* a frame the early reader placed must be the same frame */
+            float was[NCH];
+            bool early = ring_pos + got < early_head;
+            if (early) memcpy(was, fr, sizeof was);
+#endif
+            cap_frame_to_float(p + s * FRAME_BYTES, fr);
+#if SL2_DEBUG
+            if (early && memcmp(was, fr, sizeof was)) dbg_er_mismatch++;
+#endif
             got++;
         }
     }
@@ -1180,6 +1359,7 @@ static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *
 
     /* Publish the ring's new head for ReadInput, then keep the timeline on the box's clock. */
     atomic_store_explicit(&g_cap_head, ring_pos + got, memory_order_release);
+    cap_prog_publish(g_cap_next_fc, ring_pos + got);   /* where the early reader starts from */
     clk_track(before, (int)got, ts);
 
     /* Playback: start after a few ms of capture, then steer it by what the box clocked. */
@@ -1202,10 +1382,16 @@ static void cap_submit(int idx, uint32_t gen) {
         uint64_t f = g_cap_frame++;
         g_cap_xf_frame[idx] = f;
 
-        /* One full-size packet per microframe. */
+        /* Untag the buffer while it is refilled for frame f (see "Early read"), mark every frame
+           as not arrived, and ask for one full-size packet per microframe. */
+        atomic_store_explicit(&g_cap_tag[idx], 0, memory_order_relaxed);
+        atomic_thread_fence(memory_order_release);
+        memset(g_cap_bytes[idx], CAP_MARK, CAP_PKTS * PKT_MAX);
         IOUSBHostIsochronousTransaction *tx = g_cap_xf[idx].tx;
         for (int k = 0; k < CAP_PKTS; k++)
             tx[k] = (IOUSBHostIsochronousTransaction){ .requestCount = PKT_MAX, .offset = (uint32_t)(k * PKT_MAX) };
+        atomic_store_explicit(&g_cap_idx_of[f & (CAP_MAP_N - 1)], idx, memory_order_relaxed);
+        atomic_store_explicit(&g_cap_tag[idx], f, memory_order_release);
 
         /* Queue it for frame f; its completion hands the packets to cap_complete. */
         NSError *e = nil;
@@ -1217,6 +1403,7 @@ static void cap_submit(int idx, uint32_t gen) {
             cap_complete(idx, f, done, gen);
         }];
         if (ok) return;
+        atomic_store_explicit(&g_cap_tag[idx], 0, memory_order_release);
         /* Refused (the frame passed while this ran): take the next one. */
         LOG("Capture enqueue refused for frame %llu (now ~%llu): %{public}@", f, now_f, e.localizedDescription);
         g_cap_frame = now_f + DP_START_LEAD + attempt + 1;
@@ -1414,6 +1601,8 @@ static bool usb_open_all(void) {
     for (int i = 0; i < CAP_NXF; i++) {
         if (!g_cap_xf[i].buf) g_cap_xf[i].buf = [NSMutableData dataWithLength:CAP_PKTS * PKT_MAX];
         if (!g_cap_xf[i].tx)  g_cap_xf[i].tx  = calloc(CAP_PKTS, sizeof(IOUSBHostIsochronousTransaction));
+        g_cap_bytes[i] = g_cap_xf[i].buf.mutableBytes;
+        atomic_store(&g_cap_tag[i], 0);
     }
 
     /* Decks to USB audio. */
@@ -1422,6 +1611,9 @@ static bool usb_open_all(void) {
     /* A new timeline and an empty capture ring. */
     memset(g_in_ring, 0, sizeof(g_in_ring));
     atomic_store(&g_cap_head, 0);
+    atomic_store(&g_cap_early_head, 0);
+    cap_prog_publish(0, 0);
+    for (int i = 0; i < CAP_MAP_N; i++) atomic_store(&g_cap_idx_of[i], -1);
     g_cap_next_fc = 0;
     g_cap_fill_frac = 0;
     clk_reset();
@@ -1460,6 +1652,7 @@ static void usb_stop_streaming(bool box_attached) {
             "min %.2f max %.2f | stack stamp min %.2f max %.2f",
             hb, dbg_capdelay_min, dbg_capdelay_max, dbg_capstamp_min, dbg_capstamp_max);
     }
+    dbg_er_log("result");
 #endif
     /* Release the audio interfaces, then put the decks back on analogue thru if the box is here. */
     usb_release_audio();
@@ -1492,7 +1685,13 @@ static void usb_close_all(void) {
 /* The device is published (in the plug-in's device list, so it shows in the system's device
    lists) only while a box is attached. A box in its bootloader keeps it published so clients can
    read boot_mode from the 'sl2s' status. */
+#if SL2_DEBUG
+static _Atomic bool dbg_unlisted;   /* 0xF2: the device is briefly taken out of the list */
+#endif
 static bool device_published(void) {
+#if SL2_DEBUG
+    if (atomic_load(&dbg_unlisted)) return false;
+#endif
     return atomic_load(&g_box_present) || atomic_load(&g_boot_mode);
 }
 
@@ -2477,8 +2676,9 @@ static OSStatus SL2_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
 
 #if SL2_DEBUG
 /* 'sl2h' debug commands. Each takes its argument from byte [5] onwards:
-     0xF2 <ms>         input safety offset (the HAL reads it only at device setup, so it applies to
-                       a device set up again, not to the running one)
+     0xF2 <hi> <lo>    input safety offset, in tenths of a ms. The HAL reads it only at device
+                       setup, so with nothing streaming the device is taken out of the device list
+                       and put back half a second later, which sets it up again
      0xF3 <ms hi> <lo> hold the USB queue this long, once, as a completion stall would
      0xF4 <n>          treat the next n capture packets as errored */
 static OSStatus dbg_command(const uint8_t *c, CFIndex len) {
@@ -2486,9 +2686,23 @@ static OSStatus dbg_command(const uint8_t *c, CFIndex len) {
     if (len < 6) return kAudioHardwareBadPropertySizeError;
     switch (c[0]) {
         case 0xF2: {
-            int ms = c[5] < 1 ? 1 : c[5];
-            atomic_store(&g_in_safety_ms, ms);
-            DBG_LOG("DBG input safety offset set to %d ms (%u frames)", ms, in_safety_frames());
+            if (len < 7) return kAudioHardwareBadPropertySizeError;
+            int tenths = ((int)c[5] << 8) | c[6];
+            if (tenths < 1) tenths = 1;
+            atomic_store(&g_in_safety_us, tenths * 100);
+            DBG_LOG("DBG input safety offset set to %.1f ms (%u frames)", tenths / 10.0, in_safety_frames());
+            /* Have the HAL set the device up again, so it reads the new value. */
+            if (atomic_load(&g_io_running)) {
+                DBG_LOG("DBG streaming: the new input safety offset applies once the device is set up again");
+            } else if (device_published() && g_hotplug_q) {
+                atomic_store(&dbg_unlisted, true);
+                notify_device_list_changed();
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), g_hotplug_q, ^{
+                    atomic_store(&dbg_unlisted, false);
+                    notify_device_list_changed();
+                    DBG_LOG("DBG device listed again (input safety offset %.1f ms)", atomic_load(&g_in_safety_us) / 1000.0);
+                });
+            }
             return 0;
         }
         case 0xF3:
@@ -2642,7 +2856,26 @@ static OSStatus SL2_DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID oi
         /* Copy each frame from the capture ring, or silence where capture has not written yet (it
            is later than the input safety offset, or the box is gone) or wrote too long ago. */
         uint64_t pos = (uint64_t)ci->mInputTime.mSampleTime;
-        uint64_t head = atomic_load_explicit(&g_cap_head, memory_order_acquire);
+        /* First the packets that have arrived since the last completion (see "Early read"). */
+        cap_read_early();
+        uint64_t done_head = atomic_load_explicit(&g_cap_head, memory_order_acquire);
+        uint64_t early_head = atomic_load_explicit(&g_cap_early_head, memory_order_acquire);
+        uint64_t head = early_head > done_head ? early_head : done_head;
+#if SL2_DEBUG
+        if (done_head) {   /* after the first capture: how much the early read gave, and the margin */
+            atomic_fetch_add_explicit(&dbg_rd_frames, frames, memory_order_relaxed);
+            uint64_t end = pos + frames;
+            if (end > done_head) {
+                uint64_t from = pos > done_head ? pos : done_head;
+                uint64_t upto = end < head ? end : head;
+                if (upto > from) atomic_fetch_add_explicit(&dbg_rd_early, upto - from, memory_order_relaxed);
+            }
+            if (end > head) atomic_fetch_add_explicit(&dbg_rd_short, end - (pos > head ? pos : head), memory_order_relaxed);
+            int64_t margin = (int64_t)head - (int64_t)end;
+            if (margin < atomic_load_explicit(&dbg_rd_margin_min, memory_order_relaxed))
+                atomic_store_explicit(&dbg_rd_margin_min, margin, memory_order_relaxed);
+        }
+#endif
         for (UInt32 f = 0; f < frames; f++) {
             uint64_t p = pos + f;
             if (p >= head || head - p > CAP_VALID_SPAN) {
