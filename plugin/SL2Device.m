@@ -1202,10 +1202,13 @@ static void cap_read_early(void) {
             DBG_DO(atomic_fetch_add_explicit(&dbg_er_errored, 1, memory_order_relaxed));
             break;
         }
-        /* Count the frames that arrived by their marks; none means missing or errored. */
+        /* Count the frames that arrived by their marks; none means missing or errored. A frame counts
+           only once the pad bytes of its first and last samples both read 0, so one caught part-way
+           through being written is not taken. */
         const volatile uint8_t *p = g_cap_bytes[idx] + k * PKT_MAX;
         int n = 0;
-        while (n < PKT_MAX / FRAME_BYTES && p[n * FRAME_BYTES] == 0x00) n++;
+        while (n < PKT_MAX / FRAME_BYTES && p[n * FRAME_BYTES] == 0x00 &&
+               p[n * FRAME_BYTES + (NCH - 1) * 4] == 0x00) n++;
         if (n == 0) break;
         if (cc && (int)(cc / FRAME_BYTES) != n) {   /* the kernel's count disagrees: let the completion decide */
             DBG_DO(atomic_fetch_add_explicit(&dbg_er_cc_differs, 1, memory_order_relaxed));
