@@ -36,10 +36,18 @@ unless noted.
 | Shallow queue, aligned timeline, 3 transfers | 128 frames | 4.2 ms | ~32 ms | dropouts about once a minute |
 | Deep schedule with late writes, capture from completions | 128 frames | 2.8 ms | 18.6 ms | none in 10 min, idle and all cores loaded |
 | Deep schedule, 48 kHz, release build | 128 frames | 2.7 ms | 18.0 ms | none in a 10 s check, idle |
-| Deep schedule, Serato "USB buffer size" 1 ms | ~1 ms | — | ≈15 ms (calculated) | none heard; driver counters clean |
+| Deep schedule, Serato "USB buffer size" 1 ms | 45 frames (1 ms) | — | ≈15 ms (calculated) | none heard; driver counters clean |
 | **Deep schedule + early capture read** (this design), measured | 128 frames | 2.9 ms | **12.2 ms** | none in 10 min, idle and all cores loaded |
 | **Deep schedule + early capture read**, measured | **64 frames** | 2.9 ms | **9.3 ms** | none in 150 s with six x264 encodes running |
 | Deep schedule + early capture read, 48 kHz, release build | 64 / 128 frames | 2.8 ms | **8.9 / 11.6 ms** | none in a 30 s check, idle |
+| Deep schedule + early capture read, release build: Serato's 1 ms | **45 frames** | 2.8 ms | **8.3 ms** | none in 60 s idle and 150 s with six x264 encodes; no input dropouts |
+
+**Serato's "USB buffer size" is the CoreAudio IO buffer size.** Serato DJ Pro (2.5.5, from its code) turns
+the setting into frames (1 ms is 45 frames at 44.1 kHz, after rounding to the device's alignment) and sets
+`kAudioDevicePropertyBufferFrameSize` through PortAudio, restarting its stream. It tells neither SL2Api
+nor the box. The HAL owns that property; the plug-in only sees IO cycles of that size. So it is the
+"IO buffer" in the tables here, which counts twice in the round trip, and the input safety offset (counted
+once) is separate from it.
 
 **Blind test.** Serato DJ was run with real decks and timecode, with USB buffer size at 1 ms. The two builds,
 `0672a0e` and the deep-schedule build, were assigned to "A" and "B" at random. The tester judged A "much
@@ -582,7 +590,8 @@ build; *(hook)* uses `tools/latency/bin/sl2dbg`.
 32. **SL2Api's exported functions didn't match Rane's: Serato's hardware check and thru control broken.**
     - Cause: `SL2_driver_timer` and `SL2_send_hidimsg` had the wrong signatures (and most other exports had
       wrong signatures or return codes), written without Rane's framework to compare against.
-    - Fix: every export matches Rane's; the control panel's disconnect event; the latency slider.
+    - Fix: every export matches Rane's; the control panel's disconnect event; the latency slider of Rane's
+      control panel (`RH_set_buffer_millisecs`; Serato doesn't use it, see Results).
     - Test: `sl2apitest` (the seven functions Serato imports, called as Serato does); Rane's control panel;
       Serato DJ Pro 2.5.5 with turntables (the hardware check passes, Rel/Abs unlock, per-deck thru).
     - `014a0b2`.

@@ -99,7 +99,7 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;   /* one command at a
 static uint32_t g_seq = 1;
 static int g_handle = 0x52414E32;    /* the one handle RH_open gives out */
 static int g_open_count = 0;         /* RH_open calls not yet closed (under g_lock) */
-static int g_buffer_ms = 5;          /* the latency slider's value; see RH_set_buffer_millisecs */
+static int g_buffer_ms = 5;          /* Rane's control panel's latency slider value; see RH_set_buffer_millisecs */
 
 /* Callbacks, set by the client, called on g_poll_q */
 static void (* _Atomic g_hidi_cb)(RH_hidimsg_data_t *) = NULL;
@@ -402,10 +402,14 @@ EXPORT int RH_get_driver_version(void *h, uint32_t v[4]) {
     return RET(RH_OK);
 }
 
-/* The control panel's latency slider. Rane's kernel extension used it as the USB buffer size; the
-   HAL plug-in's playback latency is fixed (it does not depend on a buffer size), so a value is
-   validated (1-50 ms) and kept, and reading it back gives the plug-in's real output latency plus
-   safety offset, rounded up. */
+/* The latency slider in Rane's "SL 2 Audio Control Panel". Rane's kernel extension used it as the
+   USB buffer size; the HAL plug-in's playback latency is fixed (it does not depend on a buffer size),
+   so a value is validated (1-50 ms) and kept, and reading it back gives the plug-in's real output
+   latency plus safety offset, rounded up.
+   Serato DJ Pro 2.5.5 doesn't call these (it doesn't import them): its own "USB buffer size" sets the
+   CoreAudio IO buffer size (kAudioDevicePropertyBufferFrameSize, through PortAudio), which the HAL
+   owns, and tells neither SL2Api nor the box. So nothing should take g_buffer_ms as Serato's setting:
+   that is the device's IO buffer size. */
 EXPORT int RH_set_buffer_millisecs(void *h, int ms) {
     if (!handle_ok(h) || ms < 1 || ms > 50) return RET(RH_ERR_BAD_ARG);
     if (!is_usb_present()) return RET(RH_ERR_NOT_CONNECTED);
