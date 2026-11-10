@@ -484,6 +484,9 @@ struct PanelView: View {
                 connected(box)
             }
         }
+        // Every piece of text can be selected and copied (a serial number, a warning to paste into a
+        // report); controls' own labels stay controls.
+        .textSelection(.enabled)
     }
 
     /// One column of the connected view: a grouped form sized to its sections, so it never scrolls.
