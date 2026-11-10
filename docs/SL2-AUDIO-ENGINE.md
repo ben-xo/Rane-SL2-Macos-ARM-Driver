@@ -39,6 +39,7 @@ unless noted.
 | Deep schedule, Serato "USB buffer size" 1 ms | ~1 ms | — | ≈15 ms (calculated) | none heard; driver counters clean |
 | **Deep schedule + early capture read** (this design), measured | 128 frames | 2.9 ms | **12.2 ms** | none in 10 min, idle and all cores loaded |
 | **Deep schedule + early capture read**, measured | **64 frames** | 2.9 ms | **9.3 ms** | none in 150 s with six x264 encodes running |
+| Deep schedule + early capture read, 48 kHz, release build | 64 / 128 frames | 2.8 ms | **8.9 / 11.6 ms** | none in a 30 s check, idle |
 
 **Blind test.** Serato DJ was run with real decks and timecode, with USB buffer size at 1 ms. The two builds,
 `0672a0e` and the deep-schedule build, were assigned to "A" and "B" at random. The tester judged A "much
