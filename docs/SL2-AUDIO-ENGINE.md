@@ -446,7 +446,7 @@ Entries refer to the [bug catalogue](#bug-catalogue).
 
 | Applies | Entries |
 |---|---|
-| **Directly**: shared code or a shared HAL/USB pattern | 1 sample-rate handshake; 2 fixed timeline anchor; 4 clock tracking; 5, 31 reporting real latency (measure with `rtlat`); 15 bus time; 19, 20 capture gaps filled with silence; 21 ReadInput's write head; 22, 23 teardown on the USB queue and stream generations; 24, 25 failed opens and unplug while streaming; 26 opening at connect; 27 property buffer sizes; 28 the `sl2h` passthrough; 30 the zero-timestamp period; 39 the status frame count; 35 device listed only while attached; 38 retry a refused first open; 45 a stale version; 47 `%{public}s` in the log; 49 the rate kept across restarts; 50 the settle check after connect and wake; 53 the routing kept across a replug mid-stream; 57 interfaces not offered to other drivers, and the EP1 toggles reset (check whether the command interface is HID-class); 59 one fallback per replug; 60 reset only for a held interface; 61 close the device that went; 62 the settle check keeps a client's routing |
+| **Directly**: shared code or a shared HAL/USB pattern | 1 sample-rate handshake; 2 fixed timeline anchor; 4 clock tracking; 5, 31 reporting real latency (measure with `rtlat`); 15 bus time; 19, 20 capture gaps filled with silence; 21 ReadInput's write head; 22, 23 teardown on the USB queue and stream generations; 24, 25 failed opens and unplug while streaming; 26 opening at connect; 27 property buffer sizes; 28 the `sl2h` passthrough; 30 the zero-timestamp period; 39 the status frame count; 35 device listed only while attached; 38 retry a refused first open; 45 a stale version; 47 `%{public}s` in the log; 49 the rate kept across restarts; 50 the settle check after connect and wake; 53 the routing kept across a replug mid-stream; 57 interfaces not offered to other drivers, and the EP1 toggles reset (check whether the command interface is HID-class); 59 one fallback per replug; 60 reset only for a held interface; 61 close the device that went; 62 the settle check keeps a client's routing; 64 `dp_stop` before `dp_release`; 66 HID read retries; 67 the reply hand-off under a lock; 68 the status under a lock; 69 clients counted by ID; 71 one status header |
 | **With the deep schedule** (late writes into queued transfers) | 7, 9, 10, 11, 12, 13, 14, 16, 17, 18 |
 | **Check the device first** (the early capture read relies on the low byte of each sample being 0) | 44 |
 | **SL 2 only, or check on the SL 3/SL 4 first** | 8 input safety value (measure); 29 the heartbeat (check the SL 3/SL 4 firmware); 36 LINE/PHONO report (note `0x61`); 37 thru at connect (board input PC7); 46 Rane's bootstrap (each box's bootstrap answers its own version); 54, 55, 63 `sl2flash` (downgrades, `--backup-only`, the wait after `0x16`); 48 the link speed (`0x0a`); 32–34, 40–43 SL2Api, `sl2panel` and the test tools (each device's API has its own signatures; the SL 3 uses `0x10` for its version) |
@@ -773,6 +773,29 @@ build; *(hook)* uses `tools/latency/bin/sl2dbg`.
     - Test: `sl2panel usb` with nothing streaming, sleep and wake the Mac: the deck stays on USB.
 63. **`sl2flash --dry-run --backup-only` loaded the bootstrap into a box in its bootloader.**
     - Fix: the two options are refused together. Found in review. `deb7a50`.
+64. **Playback could be let back in after a stop, and its buffers freed under WriteMix.**
+    - Cause: `dp_start` (on g_q) checks the stream generation and only later sets `g_dp_active`; a stop
+      between the two had its `dp_stop` undone, and `dp_release` freed the schedule under a WriteMix.
+    - Fix: `dp_stop` again inside `usb_release_audio`'s block on g_q, before `dp_release`. `2a7e594`.
+65. **A rate change while streaming sent the rate twice.** Fix: only the case with nothing streaming
+    sends it separately. `eb2d573`.
+66. **One refused HID read stopped every command until a replug; an erroring one spun on g_q.**
+    - Fix: a refused enqueue is retried after 100 ms; after an errored read the halt is cleared and the
+      next read queued 10 ms later; each error logged once. `0d52ca9`.
+67. **A reply arriving as its command timed out could be taken by the next command.**
+    - Fix: the match, copy and signal in `hid_read`, and `hid_cmd`'s wait set-up and timeout, under one
+      mutex; a reply handed over as the wait ends is taken. `2aa1876`.
+68. **The `sl2s` status could be read torn.** Fix: every write to it and the copy returned under one
+    lock, never held across a HID command. `2a179d7`.
+69. **A StopIO from before an unplug could stop the stream started after the replug.**
+    - Fix: clients are counted by ID; a StopIO from one not counted is ignored. `ec45ccd`.
+70. **SL2Api waited 2 s per call with a box in its bootloader attached.** Fix: the wait also stops when
+    the status says `boot_mode`. `a9f5f18`.
+71. **The status struct was written out four times.** Fix: one definition, `plugin/SL2Status.h`.
+    `e205f4d`.
+
+Entries 64-71 came from the code review of the SL 3 port, which shares this code; none was seen on the
+hardware. Test: `make hwtest` (every one is on the paths it runs).
 ## Testing
 
 `make hwtest` runs the hardware tests in one go, in the order that needs the fewest physical steps, and
