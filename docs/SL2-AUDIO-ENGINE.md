@@ -755,9 +755,13 @@ build; *(hook)* uses `tools/latency/bin/sl2dbg`.
 59. **A second unplug before the stream restarted could put the decks on thru a second after the replug.**
     - Cause: the replug fallbacks were told apart only by a number bumped at a mid-stream unplug, so the
       first replug's fallback was still current after a second unplug and replug.
-    - Fix: each replug that restores the routing takes a new number. Found in review. `4e04600`.
-    - Test: unplug mid-stream, replug, unplug again within 2 s and replug: one "No stream restarted" line,
-      5 s after the second replug.
+    - Fix: each replug that restores the routing takes a new number, and every unplug moves it on, so a
+      fallback still waiting when the box goes again does nothing (the hardware test found that case: the
+      first fix alone let it fire with the box away, and the next replug went to thru). Found in review.
+      `4e04600`, `c69b7db`.
+    - Test (done on an SL 2): unplug mid-stream, replug, unplug again within 5 s, replug within 30 s of the
+      first unplug: "Decks routed as before the unplug" after each replug, and one "No stream restarted"
+      line, 5 s after the last.
 60. **Any failure to open the HID interface reset the box's configuration.**
     - Cause: the open's error was thrown away, so every failure was taken for another driver holding it.
     - Fix: the configuration is reset only when the interface has a holder (`UsbExclusiveOwner`); the log
