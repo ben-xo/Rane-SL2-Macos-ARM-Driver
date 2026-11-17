@@ -18,7 +18,10 @@
  *   - Bootloader detection: a box whose EEPROM firmware is missing/corrupt enumerates in the
  *     USB bootloader (bcdDevice 0x0000, "Unnamed Device") and passes no audio. The driver
  *     detects this and reports it — in the log and via a boot_mode flag in the 'sl2s' status —
- *     so a client can tell the box needs its firmware restored.
+ *     so a client can tell the box needs its firmware restored. Rane's bootstrap (the EEPROM
+ *     writer loaded into a box in its bootloader) enumerates like the firmware and is known by
+ *     its version (1.02): it is reported the same way, and the driver neither streams from it nor
+ *     sends it anything at connect beyond reading its status.
  */
 
 #import <Foundation/Foundation.h>
@@ -38,6 +41,7 @@
 #define VID          0x1cc5
 #define PID          0x0013
 #define BCD_LOADER   0x0000  /* USB bootloader: EEPROM has no bootable firmware ("Unnamed Device") */
+#define SL2_BOOTSTRAP_VERSION 0x0102  /* 0x01's reply from Rane's RAM-loaded EEPROM writer (1.02): no audio */
 #define BCD_AUDIO    0x0100  /* running firmware: the 4-interface audio device */
 #define IF_PLAY      1
 #define IF_CAP       2
@@ -198,7 +202,8 @@ static bool stream_live(uint32_t gen) {
     return atomic_load(&g_io_running) && atomic_load(&g_stream_gen) == gen;
 }
 static _Atomic bool g_hw_connected = false;
-static _Atomic bool g_boot_mode = false;     /* a bootloader-mode box (no firmware) is attached */
+static _Atomic bool g_boot_mode = false;     /* a box in its bootloader, or running Rane's EEPROM writer:
+                                                no firmware, no audio */
 static _Atomic bool g_box_present = false;   /* a box with running firmware is attached */
 static uint32_t g_ref_count = 0;
 
@@ -542,6 +547,15 @@ static void refresh_hw_status(void) {
             break;
         }
     }
+    /* Rane's bootstrap (the RAM-loaded EEPROM writer that sl2flash and Rane's updater load into a box
+       in its bootloader) enumerates exactly like the running firmware, bcdDevice 0x0100 included, and
+       answers 01 02: that box has no audio. */
+    bool loader = (g_st.version_maj << 8 | g_st.version_min) == SL2_BOOTSTRAP_VERSION;
+    if (loader) {
+        atomic_store(&g_boot_mode, true);
+        LOG("Rane SL 2 is running Rane's firmware loader (1.02), not its firmware: no audio until the "
+            "firmware is written and the box restarted.");
+    }
     /* USB speed (0x0a: 1 = full speed, 2 = high speed). At full speed the box offers only its HID
        interface, so there is no audio: say so, as the only other sign is a failed stream start. */
     if (hid_cmd(SL2_CMD_PORT_SPEED, NULL, 0, r, NULL) && r[5] == 1)
@@ -562,7 +576,9 @@ static void refresh_hw_status(void) {
     }
     /* Switch and thru state arrive as unsolicited 0x40 reports (parsed in hid_read), which the box
        sends only once 0x36 has enabled them. Then ask for a state dump (0x41 SysEx F0 17 04 F7),
-       so the LINE/PHONO switch is known before it is first moved. */
+       so the LINE/PHONO switch is known before it is first moved. The bootstrap has no switches to
+       report and no 0x41. */
+    if (loader) return;
     uint8_t enable[1] = { 1 };
     hid_cmd(SL2_CMD_REPORTS, enable, 1, NULL, NULL);
     uint8_t dump[5] = { 4, 0xF0, 0x17, 0x04, 0xF7 };
@@ -1647,9 +1663,9 @@ static bool usb_ensure_hid(void) {
     g_hbuf_in   = [NSMutableData dataWithLength:64];
     hid_read();
     refresh_hw_status();
-    /* Connected, and running firmware (only such a box is opened: find_sl2_service). */
+    /* Connected. (Only a box with bcdDevice 0x0100 is opened, find_sl2_service; refresh_hw_status has
+       set boot mode if it is running Rane's bootstrap.) */
     atomic_store(&g_hw_connected, true);
-    atomic_store(&g_boot_mode, false);
     return true;
 }
 
@@ -1691,6 +1707,11 @@ static void usb_release_audio(void) {
    failure, everything opened so far is released again. */
 static bool usb_open_all(void) {
     if (!usb_ensure_hid()) return false;
+    /* Rane's bootstrap has no audio to stream. */
+    if (atomic_load(&g_boot_mode)) {
+        LOG("Not streaming: the SL 2 is running Rane's firmware loader, not its firmware");
+        return false;
+    }
     NSError *e = nil;
 
     /* Playback stays off until the capture handler starts it; clear the debug counters. */
@@ -1927,7 +1948,8 @@ static void connect_box(int attempt) {
     /* Open it; unless a stream is already running, set thru and the current rate. */
     pthread_mutex_lock(&g_mutex);
     bool ok = usb_ensure_hid();
-    if (ok && !atomic_load(&g_io_running)) {
+    /* (Not on Rane's bootstrap: it has no audio, and the firmware tools are using it.) */
+    if (ok && !atomic_load(&g_io_running) && !atomic_load(&g_boot_mode)) {
         set_usb_switches(false);
         send_hw_samplerate((int)g_sr);   /* the box powers up at 44.1 kHz */
     }
@@ -2003,8 +2025,11 @@ static void on_usb_removed(void *refcon, io_iterator_t iter) {
         g_io_clients = 0;
         pthread_mutex_unlock(&g_mutex);
     }
-    /* Bootloader mode follows what is still attached; tell the HAL if the device left its list. */
-    atomic_store(&g_boot_mode, bootloader);
+    /* Boot mode follows what is still attached (a box in its bootloader, or Rane's bootstrap, known
+       by its version); tell the HAL if the device left its list. */
+    bool loader = atomic_load(&g_box_present) &&
+                  (g_st.version_maj << 8 | g_st.version_min) == SL2_BOOTSTRAP_VERSION;
+    atomic_store(&g_boot_mode, bootloader || loader);
     if (was_published != device_published()) notify_device_list_changed();
 }
 
