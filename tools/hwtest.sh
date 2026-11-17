@@ -58,6 +58,7 @@ wait_until() {   # <description> <command...>: poll every half second, up to WAI
     done
 }
 not() { ! "$@"; }
+running() { echo "      ... $1"; }   # before a test that takes a while, so the script never looks stuck
 
 driver_log_since() {   # <start time> <grep pattern>: the driver's log lines since then
     sleep 1
@@ -201,10 +202,13 @@ if [ $LOOPBACK = 0 ]; then
         record SKIP "$t" "no --loopback"
     done
 else
-    # The line-level loopback signal clips the phono preamp: wait for the switch to be on LINE.
+    # The line-level loopback signal clips the phono preamp: wait for the switch to be on LINE, and to
+    # stay there for 2 s (the box doesn't debounce the switch, so it can flicker while it moves).
+    line_steady() { input_is LINE && sleep 2 && input_is LINE; }
     if ! input_is LINE; then
-        echo "   >>> Set the LINE/PHONO switch on the box to LINE."
-        wait_until "the switch on LINE" input_is LINE
+        echo "   >>> Set the LINE/PHONO switch on the box to LINE, then leave it alone until the loopback"
+        echo "       tests have finished."
+        wait_until "the switch steady on LINE" line_steady
     fi
 
     # Every test here plays at full level: the user's output volume and mute are saved, set to 0 dB
@@ -215,15 +219,18 @@ else
     fi
 
     # Three streams in a row, each starting cleanly and finding all its clicks.
+    running "restarts (about 15 s)"
     if "$ROOT/tools/latency/restartcheck.sh" > /dev/null 2>&1; then record PASS "restarts"
     else record FAIL "restarts" "run tools/latency/restartcheck.sh"; fi
 
     # A 30 s glitch test with the Mac idle.
+    running "glitch test (30 s)"
     out=$("$B/sinetest" "$DEV" 1 1 30 128 | grep RESULT)
     echo "$out" | grep -q 'RESULT: 0 glitches, 0 level drops' && record PASS "glitch test, 30 s" || record FAIL "glitch test, 30 s" "$out"
 
     # Idle and with every core loaded, with the driver's counters: a debug build only.
     if [ $BUILD = debug ]; then
+        running "glitch test idle and with every core busy (about 70 s)"
         if "$ROOT/tools/latency/dptest.sh" 30 > /dev/null 2>&1; then record PASS "glitch test idle + loaded (dptest)"
         else record FAIL "glitch test idle + loaded (dptest)" "run tools/latency/dptest.sh 30"; fi
     else
@@ -231,6 +238,7 @@ else
     fi
 
     # 48 kHz: every click found, and a clean 10 s glitch test.
+    running "48 kHz (about 20 s)"
     "$B/setrate" "$DEV" 48000 >/dev/null; sleep 1
     lat=$("$B/rtlat" "$DEV" 1 1 4 128 | grep -E 'mean|not found' | head -1)
     sine=$("$B/sinetest" "$DEV" 1 1 10 128 | grep RESULT)
@@ -243,6 +251,7 @@ else
 
     # IO buffer sizes, at both rates: every click found at each, and the round trip measured (45 is
     # 1 ms at 44.1 kHz). Records what each size gives.
+    running "IO buffer sizes, 7 sizes at 2 rates (about 2 min)"
     ok=1; detail=""
     for r in 44100 48000; do
         "$B/setrate" "$DEV" $r >/dev/null; sleep 1
@@ -265,6 +274,7 @@ else
     # crosses sooner on a loud click. So only levels are checked here; the restart test above covers
     # the round trip.)
     if [ $have_volume = 1 ]; then
+        running "output volume and mute (about 30 s)"
         peak() { grep -oE 'peak [0-9.]+' | tail -1 | grep -oE '[0-9.]+$'; }
         db() { awk -v r="$1" -v a="$2" 'BEGIN { if (r > 0 && a > 0) printf "%.1f", 20 * log(a / r) / log(10); else print "none" }'; }
         full=$("$B/rtlat" "$DEV" 1 1 3 128); ref=$(echo "$full" | peak)
@@ -313,6 +323,7 @@ else
     # must be the ones expected: 5 and 6 at 44.1 kHz (5.5125 on average); 6 at 48 kHz, allowing the odd
     # 5 or 7 where the box corrects its clock (seen on an SL 3: about 0.5%), up to 1% of them.
     if [ $BUILD = debug ]; then
+        running "capture packet sizes at 2 rates (about 10 s)"
         ok=1; detail=""
         for r in 44100 48000; do
             "$B/setrate" "$DEV" $r >/dev/null; sleep 1
@@ -338,6 +349,7 @@ else
     # buffers, not from the late completions), and the driver's early-read counters must show no frame
     # placed differently from the completion and none missing when ReadInput asked for it.
     if [ $BUILD = debug ]; then
+        running "early capture read under a 20 ms stall (about 12 s)"
         start=$(now)
         ( sleep 3; "$B/sl2dbg" stall 20 >/dev/null ) &
         sine=$("$B/sinetest" "$DEV" 1 1 10 64 | grep RESULT); wait
@@ -376,6 +388,7 @@ else
     # capture packets (the driver must take them, and playback must stay matched to capture: sent -
     # captured within +-2 frames at the end). Either way the stream runs to the end, never restarted.
     if [ $BUILD = debug ]; then
+        running "fault hooks: a USB stall, errored capture packets (about 25 s)"
         for hook in "stall 100" "errpkts 20"; do
             start=$(now)
             ( sleep 3; "$B/sl2dbg" $hook >/dev/null ) &
