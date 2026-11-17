@@ -37,6 +37,7 @@ the installer zip.
 ```
 make flash dump
 ./sl2flash --dry-run                # check the images and the box; change nothing
+./sl2flash --backup-only            # save the EEPROM to sl2-eeprom-backup-<date>.bin; change nothing
 ./sl2flash                          # write the firmware if the EEPROM doesn't already hold it
 ./sl2dump --verify eeprom-image-24lc512.bin   # independent check of a running box's EEPROM
 ```
@@ -45,7 +46,8 @@ make flash dump
 `sl2-firmware-install.sh` puts them), or from `--firmware DIR`. It needs no root. Before it
 writes anything it saves the whole EEPROM to `sl2-eeprom-backup-<date>.bin` in the current
 directory (and stops if it can't); that file holds Rane's firmware, so keep it out of any
-repository. Stop any
+repository. It doesn't write firmware older than the box is running (Rane's 2.0.1f2 driver
+carries 2.00, the Scratch Live driver 1.10) unless given `--force`. Stop any
 audio on the SL 2 and quit sl2panel and Serato first: they talk to the box through the same
 driver channel.
 
