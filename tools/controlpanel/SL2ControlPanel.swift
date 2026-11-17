@@ -174,6 +174,9 @@ enum SL2Driver {
         AudioObjectSetPropertyData(dev, &addr, 0, nil, UInt32(MemoryLayout<UInt32>.size), &value)
     }
 
+    /// System Settings' Sound pane, where the SL 2 can be chosen as the input device.
+    static let soundSettings = URL(string: "x-apple.systempreferences:com.apple.Sound-Settings.extension")
+
     /// Audio MIDI Setup, where each output channel's volume is set.
     static let audioMIDISetup = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.audio.AudioMIDISetup")
 
@@ -628,6 +631,16 @@ struct PanelView: View {
         return text
     }
 
+    /// Over the input meters while no app is using the SL 2: there is nothing to measure then (the decks are
+    /// on thru and the box sends no audio), so say how to make them move, with "Sound Settings" a link to it.
+    private var inputsIdleNote: AttributedString {
+        var text = AttributedString("Choose the SL 2 as your input device in ")
+        var pane = AttributedString("Sound Settings")
+        if let url = SL2Driver.soundSettings { pane.link = url }
+        text.append(pane)
+        return text
+    }
+
     /// The right column: any warnings, the input and output levels, and the output volume.
     @ViewBuilder
     private func levelSections(_ box: BoxState) -> some View {
@@ -642,12 +655,28 @@ struct PanelView: View {
             }
         }
         Section {
-            DeckMeterRow(meters: model.meters, name: Self.deckNames[0], left: 0, right: 1)
-            DeckMeterRow(meters: model.meters, name: Self.deckNames[1], left: 2, right: 3)
+            // The meters as one block (a VStack, or the overlay would collapse the rows into one),
+            // greyed out with a note over them while nothing streams.
+            VStack(spacing: 12) {
+                DeckMeterRow(meters: model.meters, name: Self.deckNames[0], left: 0, right: 1)
+                DeckMeterRow(meters: model.meters, name: Self.deckNames[1], left: 2, right: 3)
+            }
+            .padding(.vertical, 4)
+            .opacity(box.streaming ? 1 : 0.3)
+            .overlay {
+                if !box.streaming {
+                    Text(inputsIdleNote)
+                        .font(.callout)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 12)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                }
+            }
         } header: {
             Text("Inputs")
         } footer: {
-            Text("The level of each deck's input, left and right, while an app is using the SL 2. With nothing using it the decks are on thru, and the box sends the computer no audio.")
+            Text("The level of each deck's input, left and right, while an app is using the SL 2 (as its input or output device). With nothing using it the decks are on thru, and the box sends the computer no audio.")
                 .foregroundStyle(.secondary)
         }
         Section {
