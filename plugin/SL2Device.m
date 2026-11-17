@@ -533,6 +533,8 @@ static void refresh_hw_status(void) {
        reply[7..10]); c.f. the SL3, which uses 0x10. bcdDevice is only a mode marker
        (0x0100 = running firmware, 0x0000 = bootloader), not the version. */
     uint8_t r[64];
+    g_st.version_maj = g_st.version_min = 0;   /* not the previous box's, if this one doesn't answer */
+    g_st.port_a = g_st.port_b = 0;
     for (int attempt = 0; attempt < 2; attempt++) {   /* the box may still be loading its FPGA */
         if (hid_cmd(SL2_CMD_VERSION, NULL, 0, r, NULL)) {
             g_st.version_maj = r[5];
