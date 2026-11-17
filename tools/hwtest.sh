@@ -505,7 +505,9 @@ else
     [ $have_volume = 1 ] && restore_volume
 
     # Unplug while a stream runs (a silent, input-only one) and replug: coreaudiod survives, the
-    # driver ends the stream cleanly, and a new stream starts after the replug.
+    # driver ends the stream cleanly, routes the decks as they were during the stream (USB audio) while
+    # it waits for the client to come back, puts them back on thru when none does within 5 s, and a new
+    # stream starts after the replug.
     caud=$(pgrep -x coreaudiod)
     start=$(now)
     "$B/chrec" "$DEV" 60 "${TMPDIR:-/tmp}/sl2-hwtest-chrec.wav" >/dev/null 2>&1 &
@@ -521,10 +523,13 @@ else
         "$B/chrec" "$DEV" 2 "${TMPDIR:-/tmp}/sl2-hwtest-chrec.wav" >/dev/null 2>&1
         ended=$(driver_log_since "$start" 'Streaming stopped \(box disconnected\)' | head -1)
         started=$(driver_log_since "$start" 'Streaming started' | wc -l | tr -d ' ')
-        if [ $back = 0 ] && [ "$(pgrep -x coreaudiod)" = "$caud" ] && [ -n "$ended" ] && [ "$started" -ge 2 ]; then
-            record PASS "unplug and replug, mid-stream"
+        kept=$(driver_log_since "$start" 'Decks routed as before the unplug' | head -1)
+        fell=$(driver_log_since "$start" 'No stream restarted within' | head -1)
+        if [ $back = 0 ] && [ "$(pgrep -x coreaudiod)" = "$caud" ] && [ -n "$ended" ] && [ "$started" -ge 2 ] &&
+           [ -n "$kept" ] && [ -n "$fell" ]; then
+            record PASS "unplug and replug, mid-stream" "routing kept, then thru with no client back"
         else
-            record FAIL "unplug and replug, mid-stream" "returned $([ $back = 0 ] && echo yes || echo no), coreaudiod pid $caud -> $(pgrep -x coreaudiod), stream end logged: ${ended:-no}, streams started $started"
+            record FAIL "unplug and replug, mid-stream" "returned $([ $back = 0 ] && echo yes || echo no), coreaudiod pid $caud -> $(pgrep -x coreaudiod), stream end logged: ${ended:-no}, streams started $started, routing kept: ${kept:+yes}, thru after 5 s: ${fell:+yes}"
         fi
     else
         kill $rec 2>/dev/null; wait $rec 2>/dev/null

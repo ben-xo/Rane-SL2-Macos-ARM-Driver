@@ -628,15 +628,37 @@ static void send_hw_samplerate(int sr) {
     push_sr_unsol(sr);
 }
 
-/* Switch both decks to USB audio (Note Off) or analogue thru (Note On), notes 0x5C / 0x5D through
+/* Switch each deck to USB audio (Note Off) or analogue thru (Note On), notes 0x5C / 0x5D through
    0x41. The box confirms each change with its own 0x40 report, which reaches clients. */
-static void set_usb_switches(bool usb_mode) {
-    uint8_t status_byte = usb_mode ? 0x80 : 0x90;
+static void set_thru(const uint8_t thru[2]) {
     for (int i = 0; i < 2; i++) {
-        uint8_t pl[4] = { 0x03, status_byte, (uint8_t)(SL2_NOTE_THRU_DECK1 + i), 0x00 };
+        uint8_t pl[4] = { 0x03, thru[i] ? 0x90 : 0x80, (uint8_t)(SL2_NOTE_THRU_DECK1 + i), 0x00 };
         hid_cmd(SL2_CMD_HIDI, pl, 4, NULL, NULL);
-        g_st.thru[i] = usb_mode ? 0 : 1;
+        g_st.thru[i] = thru[i] ? 1 : 0;
     }
+}
+static void set_usb_switches(bool usb_mode) {
+    uint8_t thru[2] = { !usb_mode, !usb_mode };
+    set_thru(thru);
+}
+
+/* The decks' routing across an unplug while a client streams. The client restarts its stream after
+   the replug (Serato DJ Pro does, by itself) and takes each deck's thru state from the box's reports to
+   decide its own deck modes: putting both decks on thru at connect would put them in THRU there, and
+   send the turntables' timecode straight to the mixer. So the routing at the unplug is remembered and
+   restored at connect and at the next stream start; if no stream starts within RESUME_WAIT_MS (the app
+   was quit meanwhile), the decks go back on thru. Only for a box back within RESUME_MAX_GAP_S of the
+   unplug (a replug, not a box plugged in again later). All under g_mutex. */
+#define RESUME_WAIT_MS   5000
+#define RESUME_MAX_GAP_S 30
+static uint64_t g_resume_since;        /* host time of the unplug */
+static bool     g_resume_pending;
+static uint8_t  g_resume_thru[2];      /* each deck's thru state at the unplug: 1 = analogue thru */
+static uint32_t g_resume_window;       /* which window a fallback belongs to */
+/* The routing with nothing streaming: the remembered one while a client is expected back, else thru. */
+static void set_idle_routing(void) {
+    if (g_resume_pending) set_thru(g_resume_thru);
+    else set_usb_switches(false);
 }
 
 static IOUSBHostPipe *copy_isoch_pipe(IOUSBHostInterface *intf, uint8_t dir, uint8_t fallback1, uint8_t fallback2) {
@@ -1804,8 +1826,14 @@ static bool usb_open_all(void) {
         atomic_store(&g_cap_tag[i], 0);
     }
 
-    /* Decks to USB audio. */
-    set_usb_switches(true);
+    /* Decks to USB audio, or as they were if this is the stream restarting after a replug. */
+    if (g_resume_pending) {
+        g_resume_pending = false;
+        set_thru(g_resume_thru);
+        LOG("Stream restarted after the replug: decks routed as before it");
+    } else {
+        set_usb_switches(true);
+    }
 
     /* A new timeline and an empty capture ring. */
     memset(g_in_ring, 0, sizeof(g_in_ring));
@@ -1982,8 +2010,9 @@ static void relist_if_safety_changed(void) {
 
 /* Thru and the rate can be lost after connect_box has set them: the box finishes starting up (it loads
    its FPGA) after it is configured, and it is suspended and resumed when the Mac sleeps. A while after
-   connecting, and after the Mac wakes, the driver checks: with nothing streaming, both decks on thru
-   (read from a state dump); and the rate the driver's (0x30). Each correction is logged. */
+   connecting, and after the Mac wakes, the driver checks: with nothing streaming, the decks' routing
+   (read from a state dump: thru, or as before a replug while the client is expected back, see
+   g_resume_pending); and the rate the driver's (0x30). Each correction is logged. */
 #define SETTLE_CHECK_MS  2000
 #define SETTLE_DUMP_MS   200     /* time for a state dump's reports to arrive */
 static void settle_check(const char *why) {
@@ -2006,14 +2035,17 @@ static void settle_check(const char *why) {
     }
     pthread_mutex_unlock(&g_mutex);
     if (!idle) return;
-    /* Once the dump has reported both decks: back to thru if either is on USB audio, still idle. */
+    /* Once the dump has reported both decks, still idle: put the routing right if it has changed. */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, SETTLE_DUMP_MS * NSEC_PER_MSEC), g_hotplug_q, ^{
         if (!atomic_load(&g_box_present)) return;
         pthread_mutex_lock(&g_mutex);
-        if (atomic_load(&g_thru_reports) - seen >= 2 && !atomic_load(&g_io_running) &&
-            (!g_st.thru[0] || !g_st.thru[1])) {
-            LOG("%{public}s: a deck was on USB audio with nothing streaming: back to thru", why);
-            set_usb_switches(false);
+        bool wrong = false;
+        for (int d = 0; d < 2; d++)
+            if ((g_st.thru[d] != 0) != (g_resume_pending ? g_resume_thru[d] != 0 : true)) wrong = true;
+        if (atomic_load(&g_thru_reports) - seen >= 2 && !atomic_load(&g_io_running) && wrong) {
+            LOG("%{public}s: the decks' routing had changed with nothing streaming: %{public}s", why,
+                g_resume_pending ? "routed as before the replug" : "back to thru");
+            set_idle_routing();
         }
         pthread_mutex_unlock(&g_mutex);
     });
@@ -2021,7 +2053,7 @@ static void settle_check(const char *why) {
 
 /* Open a newly attached box and, with no stream running, put its decks on analogue thru (the box
    powers up with thru on or off depending on a board input), as at stream stop, so turntables
-   reach the mixer until an app streams. The first open can be refused ("exclusive open of usb
+   reach the mixer until an app streams; after a replug mid-stream, as they were (g_resume_pending). The first open can be refused ("exclusive open of usb
    object failed") while macOS is still setting the box up, about 1 connect in 30: retry for
    about a second. */
 #define CONNECT_TRIES    10
@@ -2031,12 +2063,30 @@ static void connect_box(int attempt) {
     /* Open it; unless a stream is already running, set thru and the current rate. */
     pthread_mutex_lock(&g_mutex);
     bool ok = usb_ensure_hid();
+    bool resuming = false;
+    uint32_t window = g_resume_window;
+    if (g_resume_pending && (double)(mach_absolute_time() - g_resume_since) > RESUME_MAX_GAP_S * 1000.0 * ticks_per_ms())
+        g_resume_pending = false;   /* back long after the unplug: not the same session */
     /* (Not on Rane's bootstrap: it has no audio, and the firmware tools are using it.) */
     if (ok && !atomic_load(&g_io_running) && !atomic_load(&g_boot_mode)) {
-        set_usb_switches(false);
+        set_idle_routing();   /* thru, or as before the unplug if a client was streaming */
+        resuming = g_resume_pending;
         send_hw_samplerate((int)g_sr);   /* the box powers up at 44.1 kHz */
     }
     pthread_mutex_unlock(&g_mutex);
+    /* Expecting a client back: if no stream has started after RESUME_WAIT_MS, thru after all. */
+    if (resuming) {
+        LOG("Decks routed as before the unplug; waiting %d s for the stream to restart", RESUME_WAIT_MS / 1000);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, RESUME_WAIT_MS * NSEC_PER_MSEC), g_hotplug_q, ^{
+            pthread_mutex_lock(&g_mutex);
+            if (g_resume_pending && g_resume_window == window && !atomic_load(&g_io_running)) {
+                g_resume_pending = false;
+                if (atomic_load(&g_box_present) && usb_ensure_hid()) set_usb_switches(false);
+                LOG("No stream restarted within %d s of the replug: decks back on thru", RESUME_WAIT_MS / 1000);
+            }
+            pthread_mutex_unlock(&g_mutex);
+        });
+    }
     if (ok) {
         if (attempt > 0) LOG("Rane SL 2 opened on attempt %d", attempt + 1);
         /* Check again once the box has surely finished starting up (see settle_check). */
@@ -2104,6 +2154,13 @@ static void on_usb_removed(void *refcon, io_iterator_t iter) {
         LOG("Rane SL 2 USB disconnected");
         atomic_store(&g_box_present, false);
         pthread_mutex_lock(&g_mutex);
+        /* A client streaming: remember the decks' routing, to restore after a replug (g_resume_pending). */
+        if (g_io_clients > 0 && atomic_load(&g_io_running)) {
+            for (int d = 0; d < 2; d++) g_resume_thru[d] = g_st.thru[d] ? 1 : 0;
+            g_resume_pending = true;
+            g_resume_window++;
+            g_resume_since = mach_absolute_time();
+        }
         usb_close_all();
         /* The device leaves the HAL's list with the box, and a client using it again after a
            replug sends a new StartIO: start counting clients from zero. */
