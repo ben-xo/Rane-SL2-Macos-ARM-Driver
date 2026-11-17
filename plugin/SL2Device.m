@@ -216,6 +216,7 @@ static _Atomic bool g_hw_connected = false;
 static _Atomic bool g_boot_mode = false;     /* a box in its bootloader, or running Rane's EEPROM writer:
                                                 no firmware, no audio */
 static _Atomic bool g_box_present = false;   /* a box with running firmware is attached */
+static _Atomic bool g_bootstrap_open = false;   /* the box the driver has open is running Rane's bootstrap */
 static uint32_t g_ref_count = 0;
 
 /* Capture ring buffer (Float32 interleaved, NCH channels), indexed by timeline position */
@@ -591,6 +592,7 @@ static void refresh_hw_status(void) {
        in its bootloader) enumerates exactly like the running firmware, bcdDevice 0x0100 included, and
        answers 01 02: that box has no audio. */
     bool loader = (g_st.version_maj << 8 | g_st.version_min) == SL2_BOOTSTRAP_VERSION;
+    atomic_store(&g_bootstrap_open, loader);
     if (loader) {
         atomic_store(&g_boot_mode, true);
         LOG("Rane SL 2 is running Rane's firmware loader (1.02), not its firmware: no audio until the "
@@ -1955,6 +1957,7 @@ static void usb_close_all(void) {
     if (g_hid)  { [g_hid destroy]; g_hid = nil; }
     if (g_dev)  { [g_dev destroy]; g_dev = nil; }
     atomic_store(&g_hw_connected, false);
+    atomic_store(&g_bootstrap_open, false);
 }
 
 /* The device is published (in the plug-in's device list, so it shows in the system's device
@@ -2177,20 +2180,31 @@ static void on_usb_added(void *refcon, io_iterator_t iter) {
 
 /* Hot-plug: SL 2 USB devices went away (on the hot-plug queue). */
 static void on_usb_removed(void *refcon, io_iterator_t iter) {
-    /* Drain the iterator (which re-arms it); stop if nothing was actually removed. */
+    /* Drain the iterator (which re-arms it), noting whether the device the driver has open went; stop if
+       nothing was actually removed. */
+    pthread_mutex_lock(&g_mutex);
+    io_service_t open_svc = g_dev ? g_dev.ioService : IO_OBJECT_NULL;
+    if (open_svc) IOObjectRetain(open_svc);
+    pthread_mutex_unlock(&g_mutex);
     io_service_t s;
-    bool removed = false;
-    while ((s = IOIteratorNext(iter))) { IOObjectRelease(s); removed = true; }
+    bool removed = false, ours = false;
+    while ((s = IOIteratorNext(iter))) {
+        if (open_svc && IOObjectIsEqualTo(s, open_svc)) ours = true;
+        IOObjectRelease(s);
+        removed = true;
+    }
+    if (open_svc) IOObjectRelease(open_svc);
     if (!removed) return;
     /* The removed service can no longer be asked what it was: see what is still attached. */
     bool audio, bootloader;
     scan_attached(&audio, &bootloader);
     bool was_published = device_published();
 
-    /* The box with firmware is gone: close everything that was open on it. */
-    if (!audio && atomic_load(&g_box_present)) {
+    /* The box with firmware is gone, or the device the driver has open is (a box that restarted, whose
+       new device arrived first): close everything that was open on it. */
+    if ((!audio || ours) && atomic_load(&g_box_present)) {
         LOG("Rane SL 2 USB disconnected");
-        atomic_store(&g_box_present, false);
+        if (!audio) atomic_store(&g_box_present, false);
         pthread_mutex_lock(&g_mutex);
         /* A client streaming: remember the decks' routing, to restore after a replug (g_resume_pending). */
         if (g_io_clients > 0 && atomic_load(&g_io_running)) {
@@ -2205,11 +2219,12 @@ static void on_usb_removed(void *refcon, io_iterator_t iter) {
         g_io_clients = 0;
         pthread_mutex_unlock(&g_mutex);
     }
-    /* Boot mode follows what is still attached (a box in its bootloader, or Rane's bootstrap, known
-       by its version); tell the HAL if the device left its list. */
-    bool loader = atomic_load(&g_box_present) &&
-                  (g_st.version_maj << 8 | g_st.version_min) == SL2_BOOTSTRAP_VERSION;
-    atomic_store(&g_boot_mode, bootloader || loader);
+    /* A box with firmware is still attached: open it (its arrival was handled while the old device was
+       still open). */
+    if (ours && audio) connect_box(0);
+    /* Boot mode follows what is still attached (a box in its bootloader, or the open box running Rane's
+       bootstrap); tell the HAL if the device left its list. */
+    atomic_store(&g_boot_mode, bootloader || (atomic_load(&g_box_present) && atomic_load(&g_bootstrap_open)));
     if (was_published != device_published()) notify_device_list_changed();
 }
 
