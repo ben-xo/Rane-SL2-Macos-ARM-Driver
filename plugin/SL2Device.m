@@ -205,6 +205,10 @@ static pthread_mutex_t g_unsol_mtx = PTHREAD_MUTEX_INITIALIZER;
 #define RATE_STORAGE_KEY CFSTR("sample rate")
 static Float64  g_sr = 44100.0;
 static UInt32   g_io_clients = 0;
+#define IO_CLIENTS_MAX 64
+static UInt32   g_io_cids[IO_CLIENTS_MAX];   /* the client IDs counted in g_io_clients (g_mutex); cleared with
+                                                it at an unplug, so a StopIO for a session from before the
+                                                unplug is told from one for a client started since */
 static _Atomic bool g_io_running = false;
 /* Stream generation: bumped when a stream starts and when it stops. Every USB completion and
    retry carries the generation it was queued in and does nothing once it has moved on, so work
@@ -3293,6 +3297,11 @@ static OSStatus SL2_StartIO(AudioServerPlugInDriverRef d, AudioObjectID oid, UIn
     /* The first client starts the stream; if the box can't be opened, the client gets an error
        rather than silence on a timeline with no box behind it. */
     pthread_mutex_lock(&g_mutex);
+    if (g_io_clients >= IO_CLIENTS_MAX) {
+        pthread_mutex_unlock(&g_mutex);
+        LOG("StartIO refused: %d clients already running", IO_CLIENTS_MAX);
+        return kAudioHardwareUnspecifiedError;
+    }
     /* No IO is running yet, so a new stream starts at the current gain rather than ramping from
        the level the last one ended at. */
     if (g_io_clients == 0) vol_snap();
@@ -3301,21 +3310,24 @@ static OSStatus SL2_StartIO(AudioServerPlugInDriverRef d, AudioObjectID oid, UIn
         LOG("StartIO failed: the SL 2 could not be opened");
         return kAudioHardwareNotRunningError;
     }
-    /* Count the client; StopIO stops the stream when the last one leaves. */
-    g_io_clients++;
+    /* Count the client, by its ID; StopIO stops the stream when the last one leaves. */
+    g_io_cids[g_io_clients++] = cid;
     pthread_mutex_unlock(&g_mutex);
     return 0;
 }
 
 static OSStatus SL2_StopIO(AudioServerPlugInDriverRef d, AudioObjectID oid, UInt32 cid) {
-    /* The last client stops the stream and puts the decks back on analogue thru. The count is
-       already zero if the box was unplugged while streaming (on_usb_removed resets it). */
+    /* The last client stops the stream and puts the decks back on analogue thru. A client not
+       counted is one whose session ended with an unplug (on_usb_removed clears the clients): its
+       StopIO, however late, mustn't stop a stream started since the replug. */
     pthread_mutex_lock(&g_mutex);
-    if (g_io_clients > 0) {
-        g_io_clients--;
+    int at = -1;
+    for (UInt32 i = 0; i < g_io_clients; i++) if (g_io_cids[i] == cid) { at = (int)i; break; }
+    if (at >= 0) {
+        g_io_cids[at] = g_io_cids[--g_io_clients];
         if (g_io_clients == 0) usb_stop_streaming(true);
     } else {
-        LOG("StopIO with no client running (the box was unplugged while it streamed)");
+        LOG("StopIO from a client not running (its session ended when the box was unplugged)");
     }
     pthread_mutex_unlock(&g_mutex);
     return 0;
