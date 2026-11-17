@@ -37,6 +37,7 @@ typedef struct {
     uint32_t hub_depth;             /* USB hubs between the box and the Mac: 0 = connected directly */
     uint64_t in_dropouts;           /* IO cycles in which input wasn't captured in time, since the device was
                                        set up (the box connected, or the input safety offset changed) */
+    uint32_t usb_link;              /* the box's USB link: 2 = high speed, 1 = full speed (no audio), 0 = not known */
 } SL2StatusPacket;
 
 static AudioObjectID find_hal_device(void) {
@@ -135,6 +136,7 @@ static void print_status(AudioObjectID dev) {
     printf("  Streaming I/O : %s\n", s.streaming ? "ACTIVE" : "IDLE");
     printf("  Sample Rate   : %u Hz\n", s.sample_rate);
     printf("  Firmware Ver  : %u.%02u\n", s.version_maj, s.version_min);
+    if (s.usb_link) printf("  USB Link      : %s\n", s.usb_link == 2 ? "high speed" : "FULL SPEED (no audio: use a USB 2.0 port)");
     printf("  Serial Number : %s\n", s.serial[0] ? (const char *)s.serial : "N/A");
     printf("  Deck 1 Input  : %s  |  Mode: %s\n", s.phono[0] ? "PHONO" : "LINE ", s.thru[0] ? "ANALOG THRU" : "USB AUDIO");
     printf("  Deck 2 Input  : %s  |  Mode: %s\n", s.phono[1] ? "PHONO" : "LINE ", s.thru[1] ? "ANALOG THRU" : "USB AUDIO");

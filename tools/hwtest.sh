@@ -134,12 +134,14 @@ echo
 
 echo "== 1. box attached, nothing else"
 
-# The status: connected, a firmware version and serial number, not in bootloader mode.
-fw=$(field 'Firmware Ver'); serial=$(field 'Serial Number')
-if [ -n "$fw" ] && [ "$fw" != "0.00" ] && [ -n "$serial" ] && [ "$serial" != "N/A" ]; then
-    record PASS "status" "firmware $fw, serial $serial"
+# The status: connected, the running firmware's version (not Rane's firmware loader's 1.02) and serial
+# number, not in bootloader mode, on a high-speed link.
+fw=$(field 'Firmware Ver'); serial=$(field 'Serial Number'); link=$(field 'USB Link')
+if [ -n "$fw" ] && [ "$fw" != "0.00" ] && [ "$fw" != "1.02" ] && [ -n "$serial" ] && [ "$serial" != "N/A" ] &&
+   [ "$link" = "high speed" ]; then
+    record PASS "status" "firmware $fw, serial $serial, $link"
 else
-    record FAIL "status" "firmware '$fw', serial '$serial'"
+    record FAIL "status" "firmware '$fw', serial '$serial', link '$link'"
 fi
 
 # SL2Api the way Serato DJ Pro 2.5.5 calls it: natively, and the x86_64 slice Serato loads.

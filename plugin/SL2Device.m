@@ -112,6 +112,8 @@ typedef struct {
     uint32_t hub_depth;             /* USB hubs between the box and the Mac: 0 = connected directly */
     uint64_t in_dropouts;           /* IO cycles in which input wasn't captured in time, since the device was
                                        set up (the box connected, or the input safety offset changed) */
+    uint32_t usb_link;              /* the box's USB link (0x0a): 2 = high speed, 1 = full speed (no audio),
+                                       0 = not known */
 } SL2StatusPacket;
 
 enum {
@@ -560,8 +562,12 @@ static void refresh_hw_status(void) {
     }
     /* USB speed (0x0a: 1 = full speed, 2 = high speed). At full speed the box offers only its HID
        interface, so there is no audio: say so, as the only other sign is a failed stream start. */
-    if (hid_cmd(SL2_CMD_PORT_SPEED, NULL, 0, r, NULL) && r[5] == 1)
-        LOG("The SL 2 is on a full-speed (USB 1.1) link: no audio. Connect it to a USB 2.0 high-speed port.");
+    g_st.usb_link = 0;
+    if (hid_cmd(SL2_CMD_PORT_SPEED, NULL, 0, r, NULL)) {
+        g_st.usb_link = r[5];
+        if (r[5] == 1)
+            LOG("The SL 2 is on a full-speed (USB 1.1) link: no audio. Connect it to a USB 2.0 high-speed port.");
+    }
     /* Serial from the USB iSerialNumber string ("SL2.01.00"), a fixed device serial independent
        of the firmware version; c.f. the SL3, which queries it over HID 0x04. */
     CFTypeRef ser = IORegistryEntryCreateCFProperty(g_dev.ioService, CFSTR("USB Serial Number"), kCFAllocatorDefault, 0);

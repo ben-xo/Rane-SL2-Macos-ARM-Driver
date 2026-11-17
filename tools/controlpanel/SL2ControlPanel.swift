@@ -222,6 +222,7 @@ struct BoxState: Equatable {
     var serial: String
     var phono: Bool
     var thru: [Bool]
+    var fullSpeed: Bool      // connected at USB full speed, which carries no audio
     var outputLatencyMs: Double
     var inputLatencyMs: Double
     var volume: Volume?      // the main output volume; nil if none
@@ -329,6 +330,7 @@ final class PanelModel: ObservableObject {
             serial: serial.isEmpty ? "—" : serial,
             phono: s.phono.0 != 0,
             thru: [s.thru.0 != 0, s.thru.1 != 0],
+            fullSpeed: s.usb_link == 1,
             outputLatencyMs: Double(SL2Driver.latencyFrames(dev, kAudioObjectPropertyScopeOutput)) * 1000 / rate,
             inputLatencyMs: Double(SL2Driver.latencyFrames(dev, kAudioObjectPropertyScopeInput)) * 1000 / rate,
             volume: volume.map { BoxState.Volume(scalar: $0.scalar, db: $0.db) },
@@ -582,10 +584,15 @@ struct PanelView: View {
         us % 1000 == 0 ? "\(us / 1000) ms" : String(format: "%.1f ms", Double(us) / 1000)
     }
 
-    /// What the panel warns about: input the driver couldn't read early, and input dropouts.
+    /// What the panel warns about: a full-speed USB connection, input the driver couldn't read early,
+    /// and input dropouts.
     static func warnings(_ box: BoxState) -> [String] {
-        guard let input = box.input else { return [] }
         var w: [String] = []
+        // At full speed the box enumerates without its audio interfaces.
+        if box.fullSpeed {
+            w.append("The SL 2 is connected at USB full speed, which carries no audio. Connect it to a USB 2.0 (high-speed) port.")
+        }
+        guard let input = box.input else { return w }
         // Where the early read doesn't work, input can drop out below 8 ms (completion delivery).
         if input.earlyRead == 2 && input.safetyUs < 8000 {
             w.append("Input can't be read early on this Mac, so it can drop out at \(ms(input.safetyUs)). Set the input safety offset to 8 ms.")

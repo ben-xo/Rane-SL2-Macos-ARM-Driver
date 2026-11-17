@@ -73,6 +73,7 @@ typedef struct {
     uint32_t early_read;
     uint32_t hub_depth;
     uint64_t in_dropouts;
+    uint32_t usb_link;
 } SL2StatusPacket;
 
 /* Rane's API types */
