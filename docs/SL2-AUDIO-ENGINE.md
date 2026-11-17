@@ -446,10 +446,10 @@ Entries refer to the [bug catalogue](#bug-catalogue).
 
 | Applies | Entries |
 |---|---|
-| **Directly**: shared code or a shared HAL/USB pattern | 1 sample-rate handshake; 2 fixed timeline anchor; 4 clock tracking; 5, 31 reporting real latency (measure with `rtlat`); 15 bus time; 19, 20 capture gaps filled with silence; 21 ReadInput's write head; 22, 23 teardown on the USB queue and stream generations; 24, 25 failed opens and unplug while streaming; 26 opening at connect; 27 property buffer sizes; 28 the `sl2h` passthrough; 30 the zero-timestamp period; 39 the status frame count; 35 device listed only while attached; 38 retry a refused first open; 45 a stale version; 47 `%{public}s` in the log; 49 the rate kept across restarts; 50 the settle check after connect and wake; 53 the routing kept across a replug mid-stream; 57 interfaces not offered to other drivers, and the EP1 toggles reset (check whether the command interface is HID-class) |
+| **Directly**: shared code or a shared HAL/USB pattern | 1 sample-rate handshake; 2 fixed timeline anchor; 4 clock tracking; 5, 31 reporting real latency (measure with `rtlat`); 15 bus time; 19, 20 capture gaps filled with silence; 21 ReadInput's write head; 22, 23 teardown on the USB queue and stream generations; 24, 25 failed opens and unplug while streaming; 26 opening at connect; 27 property buffer sizes; 28 the `sl2h` passthrough; 30 the zero-timestamp period; 39 the status frame count; 35 device listed only while attached; 38 retry a refused first open; 45 a stale version; 47 `%{public}s` in the log; 49 the rate kept across restarts; 50 the settle check after connect and wake; 53 the routing kept across a replug mid-stream; 57 interfaces not offered to other drivers, and the EP1 toggles reset (check whether the command interface is HID-class); 59 one fallback per replug; 60 reset only for a held interface; 61 close the device that went; 62 the settle check keeps a client's routing |
 | **With the deep schedule** (late writes into queued transfers) | 7, 9, 10, 11, 12, 13, 14, 16, 17, 18 |
 | **Check the device first** (the early capture read relies on the low byte of each sample being 0) | 44 |
-| **SL 2 only, or check on the SL 3/SL 4 first** | 8 input safety value (measure); 29 the heartbeat (check the SL 3/SL 4 firmware); 36 LINE/PHONO report (note `0x61`); 37 thru at connect (board input PC7); 46 Rane's bootstrap (each box's bootstrap answers its own version); 54, 55 `sl2flash` (downgrades, `--backup-only`, the wait after `0x16`); 48 the link speed (`0x0a`); 32–34, 40–43 SL2Api, `sl2panel` and the test tools (each device's API has its own signatures; the SL 3 uses `0x10` for its version) |
+| **SL 2 only, or check on the SL 3/SL 4 first** | 8 input safety value (measure); 29 the heartbeat (check the SL 3/SL 4 firmware); 36 LINE/PHONO report (note `0x61`); 37 thru at connect (board input PC7); 46 Rane's bootstrap (each box's bootstrap answers its own version); 54, 55, 63 `sl2flash` (downgrades, `--backup-only`, the wait after `0x16`); 48 the link speed (`0x0a`); 32–34, 40–43 SL2Api, `sl2panel` and the test tools (each device's API has its own signatures; the SL 3 uses `0x10` for its version) |
 
 ## Bug catalogue
 
@@ -752,6 +752,27 @@ build; *(hook)* uses `tools/latency/bin/sl2dbg`.
     - Cause: it looked for an 8 s jump in the wall clock, and the Mac woke into a DarkWake 8 s after
       sleeping, where processes run again.
     - Fix: the sleep and the full wake are read from `pmset -g log`. `1850b62`.
+59. **A second unplug before the stream restarted could put the decks on thru a second after the replug.**
+    - Cause: the replug fallbacks were told apart only by a number bumped at a mid-stream unplug, so the
+      first replug's fallback was still current after a second unplug and replug.
+    - Fix: each replug that restores the routing takes a new number. Found in review. `4e04600`.
+    - Test: unplug mid-stream, replug, unplug again within 2 s and replug: one "No stream restarted" line,
+      5 s after the second replug.
+60. **Any failure to open the HID interface reset the box's configuration.**
+    - Cause: the open's error was thrown away, so every failure was taken for another driver holding it.
+    - Fix: the configuration is reset only when the interface has a holder (`UsbExclusiveOwner`); the log
+      names it and the error. Found in review. `843eb13`.
+61. **A restarting box whose new device arrived first kept the driver on the old device.**
+    - Cause: the removal closed the open box only if no SL 2 was left attached, and took boot mode from the
+      status's version, refreshed only at an open.
+    - Fix: the removal closes the device the driver has open if it went, and opens the one attached; boot
+      mode from a flag set when the open box answers 1.02. Found in review; not observed. `8b899c6`.
+62. **The settle check put a deck back on thru that a client had put on USB on purpose.**
+    - Fix: it compares the state dump with the routing the driver last knew, which a client's change
+      reaches as a report. Found in review. `88aa514`.
+    - Test: `sl2panel usb` with nothing streaming, sleep and wake the Mac: the deck stays on USB.
+63. **`sl2flash --dry-run --backup-only` loaded the bootstrap into a box in its bootloader.**
+    - Fix: the two options are refused together. Found in review. `deb7a50`.
 ## Testing
 
 `make hwtest` runs the hardware tests in one go, in the order that needs the fewest physical steps, and
