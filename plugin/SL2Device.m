@@ -1801,8 +1801,11 @@ static void usb_release_audio(void) {
     /* Abort the pipes: their queued transfers complete with kIOReturnAborted. */
     if (g_cpipe) [g_cpipe abortWithError:nil];
     if (g_ppipe) [g_ppipe abortWithError:nil];
-    /* Release buffers and pipes on g_q, behind any completion handler already queued there. */
+    /* Release buffers and pipes on g_q, behind any completion handler already queued there. Switch
+       the schedule off again first: a dp_start that passed its generation check before the stream
+       was stopped (it runs on g_q) can have let WriteMix back in after the caller's dp_stop. */
     if (g_q) dispatch_sync(g_q, ^{
+        dp_stop();
         dp_release();
         g_cpipe = nil; g_ppipe = nil;
     });
