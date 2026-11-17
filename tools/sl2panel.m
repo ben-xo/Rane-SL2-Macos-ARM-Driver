@@ -126,7 +126,7 @@ static void print_status(AudioObjectID dev) {
     printf("  Driver Build  : %s\n", s.debug_build ? "DEBUG" : "release");
     if (s.boot_mode) {
         /* In its bootloader, or running Rane's bootstrap (the EEPROM writer, which answers 1.02). */
-        if (s.version_maj == 1 && s.version_min == 2)
+        if (sl2_is_bootstrap(s.version_maj, s.version_min))
             printf("  Firmware      : NOT RUNNING — box is running Rane's firmware loader (1.02)\n");
         else
             printf("  Firmware      : NOT LOADED — box is in USB bootloader mode\n");

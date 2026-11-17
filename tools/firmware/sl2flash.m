@@ -433,7 +433,7 @@ int main(int argc, char **argv) {
 
     /* Not over newer firmware: a running box (not the bootstrap, 1.02) on a later version than the
        image is left alone. */
-    bool bootstrap = maj == 1 && min == 2;
+    bool bootstrap = sl2_is_bootstrap(maj, min);
     if (running && !bootstrap && !same && !force && (hdr[0x27] << 8 | hdr[0x28]) < (maj << 8 | min)) {
         printf("the box runs firmware %u.%02u, newer than the image's %u.%02u: not writing it (--force writes it anyway)\n",
                maj, min, hdr[0x27], hdr[0x28]);

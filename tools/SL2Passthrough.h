@@ -30,9 +30,13 @@ AudioObjectID sl2h_find_device(void);
    answer in time, so a timeout reads as false too. */
 bool sl2h_command(AudioObjectID dev, uint8_t req[SL2_REPORT], uint8_t reply[SL2_REPORT]);
 
-/* Command 0x01: the firmware version (reply bytes 01 02 from the bootstrap, 01 0a = 1.10 from
-   the running firmware). */
+/* Command 0x01: the firmware version (reply bytes 01 02 from the bootstrap, 01 0a = 1.10 or 02 00 =
+   2.00 from the running firmware). */
 bool sl2h_version(AudioObjectID dev, uint8_t *major, uint8_t *minor);
+
+/* True if a version is the one Rane's bootstrap (the RAM-loaded EEPROM writer) reports, 1.02: that box
+   has no audio. (The driver's SL2_BOOTSTRAP_VERSION.) */
+static inline bool sl2_is_bootstrap(unsigned major, unsigned minor) { return major == 1 && minor == 2; }
 
 /* Command 0x03: read 32 EEPROM bytes at 'addr'. */
 bool sl2h_eeprom_read(AudioObjectID dev, uint16_t addr, uint8_t out[SL2_EEPROM_BLOCK]);
