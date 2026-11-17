@@ -24,8 +24,9 @@ extracted images out of the repo.
 
   Tested on hardware: rewriting a running box, and recovering a box from bootloader mode both
   by re-marking an intact EEPROM bootable and by a full rewrite. Not tested: a box with a
-  blank EEPROM (the Cypress default device, `04b4:8613`), which `sl2flash` accepts but which
-  can't be produced over USB to test it.
+  blank EEPROM (the Cypress default device, `04b4:8613`), which `sl2flash` accepts only with
+  `--blank-fx2` (any other device built on a blank FX2 shows up the same) and which can't be
+  produced over USB to test it.
 
 `Installer/Firmware-SL2.command` wraps the over-USB flow (download → extract → install →
 check → flash, asking before it writes). It runs from a checkout of this repository, not from
