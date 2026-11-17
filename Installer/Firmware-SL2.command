@@ -19,8 +19,10 @@
 # Nothing else from either download is installed or kept, and a download found in ~/Downloads is
 # left untouched. Desinstalar-Rane-SL2.command removes the installed firmware with the driver.
 #
-# Run it from a checkout of this repository, with the SL 2 audio driver installed
-# (Instalar-Rane-SL2.command) and sl2flash built (`make flash`); see tools/firmware/README.md.
+# It needs the SL 2 audio driver installed (Instalar-Rane-SL2.command). It runs from the installer
+# folder or a checkout of this repository (tools from tools/firmware), or from the control panel
+# app, which carries it with those tools ("Update Firmware…"). It uses the sl2flash next to the
+# repository (`make flash`) if there is one, else the one the driver package installs.
 set -e
 # Rane's zip as the Internet Archive captured it in 2017 ("id_": the file exactly as served).
 RANE_URL="https://web.archive.org/web/20170722091911id_/http://dj.rane.com/files/product-downloads/SL2-2.0.1f2.zip"
@@ -29,10 +31,12 @@ SL_URL="https://serato.com/scratchlive/downloads/mac"
 DL="$HOME/Downloads"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-FW="$ROOT/tools/firmware"
+# The tools: beside this script in the control panel app, else in the repository.
+if [ -f "$HERE/extract-sl2-firmware.py" ]; then FW="$HERE"; else FW="$ROOT/tools/firmware"; fi
 EXTRACT="$FW/extract-sl2-firmware.py"
 INSTALL="$FW/sl2-firmware-install.sh"
 FLASH="$ROOT/sl2flash"
+[ -x "$FLASH" ] || FLASH=/usr/local/bin/sl2flash
 DRIVER="/Library/Audio/Plug-Ins/HAL/SL2Device.driver"
 
 command -v python3 >/dev/null || { echo "python3 is required (install the Xcode Command Line Tools)."; exit 1; }
@@ -107,7 +111,8 @@ sudo "$INSTALL" "$BOOT" "$FINAL"
 
 echo
 if [ ! -x "$FLASH" ]; then
-    echo "(build the flasher with 'make flash', then run ./sl2flash, to write the firmware over USB)"
+    echo "sl2flash, which writes the firmware over USB, is missing: install the driver package, or"
+    echo "build it with 'make flash', and run this again."
     exit 0
 fi
 echo "Checking the SL 2 ..."
@@ -115,7 +120,8 @@ rc=0; "$FLASH" --dry-run || rc=$?
 case $rc in
     0)  ;;   # already holds this firmware
     3)  echo
-        echo "Stop any audio on the SL 2 and quit Serato and sl2panel before continuing."
+        echo "Stop any audio on the SL 2 and quit Serato and sl2panel before continuing. The SL 2"
+        echo "Control Panel can stay open; change nothing in it until this has finished."
         read -r -p "Write the firmware to the SL 2 now? [y/N] " answer
         if [[ "$answer" =~ ^[Yy] ]]; then "$FLASH"; else echo "Nothing written."; fi ;;
     *)  echo "sl2flash could not check the box (see above); connect it and run this again."; exit 1 ;;

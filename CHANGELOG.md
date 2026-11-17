@@ -7,6 +7,9 @@ All notable changes to the Rane SL 2 macOS ARM Driver project are documented in 
 ### Changed
 - `Firmware-SL2.command` installs firmware 2.00, the newest: it downloads Rane's SL 2 driver 2.0.1f2 from the Internet Archive (Rane no longer hosts it) and checks it against the original's SHA-256. The Scratch Live download (firmware 1.10) is the fallback when that fails, as before.
 
+### Added
+- The SL 2 Control Panel offers "Update Firmware…" beside firmware older than 2.00, and "Restore Firmware…" for a box in bootloader mode. Both run `Firmware-SL2.command`, which the app now carries, in Terminal; it no longer needs a checkout or `make flash`.
+
 ## [1.4.1] — 2026-11-17
 
 ### Changed

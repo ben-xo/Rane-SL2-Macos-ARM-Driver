@@ -38,8 +38,11 @@ extracted images out of the repo:
 
 `Installer/Firmware-SL2.command` wraps the over-USB flow (download → extract → install →
 check → flash, asking before it writes). It downloads Rane's 2.0.1f2 zip from the Internet
-Archive, and falls back to a Scratch Live download in `~/Downloads` when it can't. It runs from a checkout of this repository, not from
-the installer zip.
+Archive, and falls back to a Scratch Live download in `~/Downloads` when it can't. The SL 2
+Control Panel app carries it and runs it in Terminal from its "Update Firmware…" button (shown
+when the box's firmware is older than 2.00) and "Restore Firmware…" (a box in bootloader mode).
+It also runs from the installer folder or a checkout, with the `sl2flash` the driver package
+installs, or `./sl2flash` if built.
 
 ## Usage
 

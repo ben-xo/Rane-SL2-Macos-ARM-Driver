@@ -30,5 +30,9 @@ cp "$HERE/Info.plist" "$APP/Contents/Info.plist"
 plutil -replace CFBundleShortVersionString -string "$VERSION" "$APP/Contents/Info.plist"
 plutil -replace CFBundleVersion -string "$VERSION" "$APP/Contents/Info.plist"
 cp "$TMP/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+# The firmware update the app offers: the installer's script and the tools it runs.
+mkdir -p "$APP/Contents/Resources/Firmware"
+cp "$ROOT/Installer/Firmware-SL2.command" "$ROOT/tools/firmware/extract-sl2-firmware.py" \
+    "$ROOT/tools/firmware/sl2-firmware-install.sh" "$APP/Contents/Resources/Firmware/"
 codesign --force --sign - "$APP"
 echo "built $APP"

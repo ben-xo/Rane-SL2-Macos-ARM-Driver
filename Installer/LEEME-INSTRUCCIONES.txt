@@ -46,8 +46,9 @@
                                   recupera una SL2 que ha quedado en modo
                                   bootloader (sin firmware). Descarga el
                                   driver 2.0.1f2 de Rane desde el Internet
-                                  Archive. Necesita una copia del codigo fuente
-                                  (ver tools/firmware/README.md).
+                                  Archive. La app SL 2 Control Panel lo
+                                  ofrece con el boton "Update Firmware..."
+                                  cuando el firmware no es el ultimo.
 
 
 3. COMO INSTALARLO EN CUALQUIER MAC
