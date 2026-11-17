@@ -4,7 +4,8 @@
 //                             completion delivery would
 //   sl2dbg errpkts <n>        treat the next n capture packets as errored
 //   sl2dbg noearly 1|0        1: the early capture read places nothing, as on a Mac where it can't
-//                             work (the driver then falls back to an 8 ms input safety offset)
+//                             work (the next stream judges it not working, and the status and
+//                             log say so)
 #include <CoreAudio/CoreAudio.h>
 #include <stdio.h>
 #include <stdlib.h>
