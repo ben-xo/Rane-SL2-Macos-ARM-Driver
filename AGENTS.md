@@ -123,7 +123,7 @@ the design:
 - Finish a branch locally (code, comments, build, diff review) before pushing. Once a branch is pushed,
   add follow-up commits rather than force-pushing.
 - Keep PRs focused. README restructures go in their own PR. Don't rebuild the committed `.pkg`/`.zip`
-  installers in a PR; the maintainer does that.
+  installers or change the version in a PR; the maintainer does that in a release (`docs/RELEASING.md`).
 - A PR description says what was tested on hardware, on what, and what was **not** tested.
 
 ## Testing
