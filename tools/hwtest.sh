@@ -7,7 +7,7 @@
 #      sample-rate switching, the input safety offset setting, and the early capture read working;
 #   2. with --loopback (a cable from Left Deck Out L to Left Deck In L; the tests play clicks and a
 #      loud tone into that output, so pass it only when the cable is in): restarts, a glitch test,
-#      48 kHz, the output volume and mute, the level meters, and in a debug build (installed with
+#      48 kHz, IO buffer sizes, the output volume and mute, the level meters, and in a debug build (installed with
 #      make install DEBUG=1) the glitch test under load, the early capture read and the fault hooks;
 #   3. unless --no-physical: steps for a person at the box (flip the LINE/PHONO switch, unplug and
 #      replug while idle and while a stream runs). The script prints what to do and waits until it
@@ -195,7 +195,7 @@ echo
 
 echo "== 2. loopback cable"
 if [ $LOOPBACK = 0 ]; then
-    for t in "restarts" "glitch test, 30 s" "glitch test idle + loaded (dptest)" "48 kHz" "output volume and mute" "level meters" "capture packet sizes" "early capture read" "early read reported not working" "fault hook: USB stall" "fault hook: errored capture packets"; do
+    for t in "restarts" "glitch test, 30 s" "glitch test idle + loaded (dptest)" "48 kHz" "IO buffer sizes" "output volume and mute" "level meters" "capture packet sizes" "early capture read" "early read reported not working" "fault hook: USB stall" "fault hook: errored capture packets"; do
         record SKIP "$t" "no --loopback"
     done
 else
@@ -238,6 +238,21 @@ else
     else
         record FAIL "48 kHz" "$lat / $sine"
     fi
+
+    # IO buffer sizes, at both rates: every click found at each, and the round trip measured (45 is
+    # 1 ms at 44.1 kHz). Records what each size gives.
+    ok=1; detail=""
+    for r in 44100 48000; do
+        "$B/setrate" "$DEV" $r >/dev/null; sleep 1
+        for buf in 32 45 48 64 128 256 512; do
+            lat=$("$B/rtlat" "$DEV" 1 1 4 $buf | grep -E 'mean|not found' | head -1)
+            rt=$(echo "$lat" | grep -oE 'DVS round trip est\. [0-9.]+' | grep -oE '[0-9.]+$')
+            echo "$lat" | grep -q '(4/4 clicks)' || { ok=0; rt="FAIL"; }
+            detail="$detail $((r / 1000))k/$buf:${rt:-?}"
+        done
+    done
+    "$B/setrate" "$DEV" "$orig" >/dev/null
+    [ $ok = 1 ] && record PASS "IO buffer sizes" "round trip ms:$detail" || record FAIL "IO buffer sizes" "round trip ms:$detail"
 
     # Output volume. With everything at 0 dB every click is found at full level; channel 1 at -20 dB
     # brings them down 20 dB; channel 2 at -20 dB leaves channel 1 alone; the virtual main volume (the
