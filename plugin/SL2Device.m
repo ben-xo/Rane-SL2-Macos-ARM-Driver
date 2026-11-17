@@ -1674,6 +1674,33 @@ static dispatch_queue_t usb_queue_create(void) {
     return dispatch_queue_create("com.rane.sl2.usb", qa);
 }
 
+/* Open the HID interface (bInterfaceNumber IF_HID) if it is there and nobody else holds it; *there
+   says whether it is there at all. */
+static bool g_hid_reconfigured;   /* usb_ensure_hid has set the configuration again for this device */
+static IOUSBHostInterface *hid_open(bool *there) {
+    IOUSBHostInterface *found = nil;
+    *there = false;
+    io_iterator_t it = 0;
+    IORegistryEntryGetChildIterator(g_dev.ioService, kIOServicePlane, &it);
+    io_service_t ch;
+    while ((ch = IOIteratorNext(it))) {
+        CFNumberRef n = IORegistryEntryCreateCFProperty(ch, CFSTR("bInterfaceNumber"), kCFAllocatorDefault, 0);
+        if (n) {
+            int idx = -1;
+            CFNumberGetValue(n, kCFNumberIntType, &idx);
+            CFRelease(n);
+            if (idx == IF_HID && !found) {
+                *there = true;
+                found = [[IOUSBHostInterface alloc] initWithIOService:ch options:IOUSBHostObjectInitOptionsNone
+                                                                queue:g_q error:nil interestHandler:nil];
+            }
+        }
+        IOObjectRelease(ch);
+    }
+    IOObjectRelease(it);
+    return found;
+}
+
 /* Open the box's HID side (device, HID interface, its two pipes), if not already open. The device
    is opened once and kept: if its HID interface isn't registered yet (interfaces appear
    asynchronously after the device is configured), a later call only looks for it again. */
@@ -1689,31 +1716,33 @@ static bool usb_ensure_hid(void) {
         io_service_t svc = find_sl2_service();
         if (!svc) return false;
         g_dev = [[IOUSBHostDevice alloc] initWithIOService:svc options:IOUSBHostObjectInitOptionsNone queue:g_q error:&e interestHandler:nil];
+        g_hid_reconfigured = false;
         uint32_t hubs = usb_hub_depth(svc);
         atomic_store(&g_hub_depth, hubs);
         if (hubs) LOG("Rane SL 2 is connected through %u USB hub%{public}s", hubs, hubs > 1 ? "s" : "");
         IOObjectRelease(svc);
         if (!g_dev) { LOG("Failed to open IOUSBHostDevice: %{public}@", e); return false; }
     }
-    if (!g_dev.configurationDescriptor) [g_dev configureWithValue:1 matchInterfaces:YES error:&e];
+    /* Configure it, unless already done, with its interfaces not offered to other drivers: the HID
+       interface is HID-class, so macOS's HID driver would take it otherwise, whenever it got there
+       before the driver (after a userspace reboot with the box attached, matching runs again before
+       coreaudiod is back). */
+    if (!g_dev.configurationDescriptor) [g_dev configureWithValue:1 matchInterfaces:NO error:&e];
 
-    /* The HID interface: the device's child service with bInterfaceNumber IF_HID. */
+    /* The HID interface. If another driver holds it (the box was configured with its interfaces
+       offered for matching, as when the box was configured by something else), set the configuration
+       again, once per device opened: that terminates the interfaces and their drivers, and the new
+       ones aren't offered to anyone. */
     if (!g_hid) {
-        io_iterator_t it = 0;
-        IORegistryEntryGetChildIterator(g_dev.ioService, kIOServicePlane, &it);
-        io_service_t ch;
-        while ((ch = IOIteratorNext(it))) {
-            CFNumberRef n = IORegistryEntryCreateCFProperty(ch, CFSTR("bInterfaceNumber"), kCFAllocatorDefault, 0);
-            if (n) {
-                int idx = -1;
-                CFNumberGetValue(n, kCFNumberIntType, &idx);
-                CFRelease(n);
-                if (idx == IF_HID && !g_hid)
-                    g_hid = [[IOUSBHostInterface alloc] initWithIOService:ch options:IOUSBHostObjectInitOptionsNone queue:g_q error:&e interestHandler:nil];
-            }
-            IOObjectRelease(ch);
+        bool there = false;
+        g_hid = hid_open(&there);
+        if (!g_hid && there && !g_hid_reconfigured) {
+            g_hid_reconfigured = true;
+            LOG("The SL 2's HID interface is held by another driver: setting the box's configuration again");
+            [g_dev configureWithValue:0 matchInterfaces:NO error:&e];
+            [g_dev configureWithValue:1 matchInterfaces:NO error:&e];
+            g_hid = hid_open(&there);
         }
-        IOObjectRelease(it);
         if (!g_hid) return false;
     }
 
@@ -1721,6 +1750,12 @@ static bool usb_ensure_hid(void) {
     g_hpipe_out = [g_hid copyPipeWithAddress:EP_HID_OUT error:&e];
     g_hpipe_in  = [g_hid copyPipeWithAddress:EP_HID_IN error:&e];
     if (!g_hpipe_out || !g_hpipe_in) return false;
+    /* Clear both endpoints' halt, which resets their data toggles at both ends. Another host-side
+       client (macOS's HID driver, which may have held the interface) can leave the box's toggle at
+       DATA1 against a new pipe's DATA0: the box then takes every command for a repeat, acknowledges
+       and drops it, and never replies. */
+    [g_hpipe_out clearStallWithError:nil];
+    [g_hpipe_in clearStallWithError:nil];
     g_hbuf_in   = [NSMutableData dataWithLength:64];
     hid_read();
     refresh_hw_status();
