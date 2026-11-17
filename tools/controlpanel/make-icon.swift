@@ -1,6 +1,10 @@
 // make-icon.swift <output.iconset> — draw the SL 2 Control Panel's app icon (the SL 2 box itself) at every
 // size an .iconset needs. build-app.sh compiles and runs it, then turns the .iconset into AppIcon.icns
 // with iconutil.
+// make-icon.swift --installer-background <output.png> — the installer's background: the icon in the
+// bottom-left corner of a transparent canvas the size of the installer's window, at 2x. The installer scales
+// the background to its window (Installer/package/Distribution.xml), so the icon sits under the list of
+// steps, clear of the text pane. Installer/build-pkg.sh runs it.
 
 import CoreGraphics
 import Foundation
@@ -258,8 +262,28 @@ func writePNG(pixels: Int, to url: URL) {
     guard CGImageDestinationFinalize(dest) else { fatalError("could not write \(url.path)") }
 }
 
+/* The installer background: a 620 x 418 point canvas (the installer window's content area) at 2x, with the
+   icon 150 points square, 10 points in from the bottom-left corner. */
+func writeInstallerBackground(to url: URL) {
+    let scale: CGFloat = 2, width = 620, height = 418, icon: CGFloat = 150, margin: CGFloat = 10
+    let ctx = CGContext(data: nil, width: width * 2, height: height * 2, bitsPerComponent: 8, bytesPerRow: 0,
+                        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+    ctx.interpolationQuality = .high
+    ctx.translateBy(x: margin * scale, y: margin * scale)
+    ctx.scaleBy(x: icon * scale / 1024, y: icon * scale / 1024)
+    drawIcon(ctx)
+    let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil)!
+    CGImageDestinationAddImage(dest, ctx.makeImage()!, [kCGImagePropertyDPIWidth: 144, kCGImagePropertyDPIHeight: 144] as CFDictionary)
+    guard CGImageDestinationFinalize(dest) else { fatalError("could not write \(url.path)") }
+}
+
+if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--installer-background" {
+    writeInstallerBackground(to: URL(fileURLWithPath: CommandLine.arguments[2]))
+    exit(0)
+}
 guard CommandLine.arguments.count == 2 else {
-    FileHandle.standardError.write("usage: make-icon <output.iconset>\n".data(using: .utf8)!)
+    FileHandle.standardError.write("usage: make-icon <output.iconset> | --installer-background <output.png>\n".data(using: .utf8)!)
     exit(2)
 }
 let iconset = URL(fileURLWithPath: CommandLine.arguments[1])
