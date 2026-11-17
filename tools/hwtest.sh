@@ -514,5 +514,8 @@ for r in "${RESULTS[@]}"; do
     case $s in PASS) pass=$((pass + 1)) ;; FAIL) fail=$((fail + 1)) ;; SKIP) skip=$((skip + 1)) ;; esac
 done
 echo "$pass passed, $fail failed, $skip skipped. Log: $LOG"
+# The decks end on analogue thru, which connects each deck's input to its output inside the box: with the
+# loopback cable still in, that is a feedback loop.
+[ $LOOPBACK = 1 ] && echo "Unplug the loopback cable now: with the deck on thru it makes a feedback loop."
 [ $fail = 0 ] && echo "PASS" || echo "FAIL"
 exit $([ $fail = 0 ] && echo 0 || echo 1)
