@@ -151,6 +151,7 @@ static os_log_t g_log;
 static uint32_t dbg_capdelay_hist[24];   /* capture handler time - bus start of its frame: 0.5 ms bins from -2 ms */
 static double   dbg_capdelay_min, dbg_capdelay_max, dbg_capstamp_min, dbg_capstamp_max;
 static uint32_t dbg_cap_pkt_err;         /* capture packets dropped: error status or impossible length */
+static uint32_t dbg_cap_pkt_frames[PKT_MAX / FRAME_BYTES + 1];   /* good capture packets by frames carried */
 static _Atomic uint32_t dbg_dp_written, dbg_dp_late, dbg_dp_unscheduled;   /* WriteMix samples, IO thread */
 /* The HAL's WriteMix calling pattern (see SL2_DoIOOperation): thread switches, concurrent calls,
    and samples written to positions already written */
@@ -170,6 +171,7 @@ static void dbg_reset(void) {
     memset(dbg_capdelay_hist, 0, sizeof dbg_capdelay_hist);
     dbg_capdelay_min = dbg_capstamp_min = 1e9; dbg_capdelay_max = dbg_capstamp_max = -1e9;
     dbg_cap_pkt_err = 0;
+    memset(dbg_cap_pkt_frames, 0, sizeof dbg_cap_pkt_frames);
     dbg_dp_written = dbg_dp_late = dbg_dp_unscheduled = 0;
     dbg_wm_thread_switches = dbg_wm_concurrent = dbg_wm_rewritten = 0;
     dbg_wm_last_thread = dbg_wm_high = 0;
@@ -1456,6 +1458,7 @@ static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *
         }
         /* A good packet: into the ring. */
         int n = done[k].completeCount / FRAME_BYTES;
+        DBG_DO(dbg_cap_pkt_frames[n]++);
         const uint8_t *p = b + k * PKT_MAX;
         for (int s = 0; s < n; s++) {
             float *fr = &g_in_ring[((ring_pos + got) & RING_MASK) * NCH];
@@ -1821,6 +1824,12 @@ static void usb_stop_streaming(bool box_attached) {
             hb, dbg_capdelay_min, dbg_capdelay_max, dbg_capstamp_min, dbg_capstamp_max);
     }
     dbg_er_log("result");
+    {
+        char pb[200]; int o = 0;
+        for (int i = 0; i <= PKT_MAX / FRAME_BYTES; i++)
+            if (dbg_cap_pkt_frames[i]) o += snprintf(pb + o, sizeof pb - o, " %d:%u", i, dbg_cap_pkt_frames[i]);
+        DBG_LOG("DBG capture packet sizes at %.0f Hz (frames:packets):%{public}s", g_sr, pb);
+    }
 #endif
     /* Release the audio interfaces, then put the decks back on analogue thru if the box is here. */
     usb_release_audio();
