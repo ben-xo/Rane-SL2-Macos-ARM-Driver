@@ -195,6 +195,10 @@ static pthread_mutex_t g_hid_mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_hout_mtx = PTHREAD_MUTEX_INITIALIZER;   /* writes to the HID OUT pipe */
 static pthread_mutex_t g_unsol_mtx = PTHREAD_MUTEX_INITIALIZER;
 
+/* The sample rate: 44.1 kHz unless chosen otherwise. The box powers up at 44.1 kHz, so the driver sets
+   it at every connect. The choice is kept in the plug-in's storage (rate_load / rate_save): the HAL
+   keeps a device's controls but not its rate. */
+#define RATE_STORAGE_KEY CFSTR("sample rate")
 static Float64  g_sr = 44100.0;
 static UInt32   g_io_clients = 0;
 static _Atomic bool g_io_running = false;
@@ -278,6 +282,23 @@ static void in_safety_save(void) {
     CFNumberRef n = CFNumberCreate(NULL, kCFNumberIntType, &us);
     if (!n) return;
     g_host->WriteToStorage(g_host, IN_SAFETY_STORAGE_KEY, n);
+    CFRelease(n);
+}
+/* The sample rate, from and to the plug-in's storage. */
+static void rate_load(void) {
+    CFPropertyListRef v = NULL;
+    if (!g_host || g_host->CopyFromStorage(g_host, RATE_STORAGE_KEY, &v) != 0 || !v) return;
+    double r = 0;
+    if (CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberGetValue((CFNumberRef)v, kCFNumberDoubleType, &r) &&
+        (r == 44100.0 || r == 48000.0))
+        g_sr = r;
+    CFRelease(v);
+}
+static void rate_save(void) {
+    if (!g_host) return;
+    CFNumberRef n = CFNumberCreate(NULL, kCFNumberDoubleType, &g_sr);
+    if (!n) return;
+    g_host->WriteToStorage(g_host, RATE_STORAGE_KEY, n);
     CFRelease(n);
 }
 static UInt32 in_safety_frames(void) {
@@ -2108,6 +2129,7 @@ static OSStatus SL2_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerP
     g_log = os_log_create("com.rane.sl2", "HAL");
     g_host = inHost;
     in_safety_load();
+    rate_load();
     in_safety_apply();
     mach_timebase_info(&g_tb);
     clk_reset();
@@ -2134,6 +2156,7 @@ static OSStatus SL2_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef 
         if (was_streaming) usb_stop_streaming(true);
         /* Switch the rate and start a new timeline at it. */
         g_sr = (Float64)action;
+        rate_save();
         clk_reset();
         atomic_fetch_add(&g_zts_seed, 1);   /* new timeline for the HAL */
         /* Restart the stream at the new rate, or, with none running, just tell the box. */
