@@ -718,8 +718,9 @@ build; *(hook)* uses `tools/latency/bin/sl2dbg`.
       with Serato DJ Pro 2.5.5 (every deck back in THRU, timecode sent to the mixer).
     - Fix: the routing at the unplug is remembered and restored at connect and at the next stream start,
       for a box back within 30 s; thru after all if no stream starts within 5 s.
-    - Test: Serato 2.5.5 streaming in REL, unplug and replug: the decks stay in REL; `make hwtest`,
-      "unplug and replug, mid-stream". `00b0418`.
+    - Test: Serato 2.5.5 streaming in REL, unplug and replug: the decks stay in REL (done on an SL 2: Serato
+      restarted its stream 0.3 s after the replug, the decks stayed in REL and the music carried on);
+      `make hwtest`, "unplug and replug, mid-stream". `00b0418`.
 
 54. **`sl2flash` would write older firmware over newer, and a backup needed a flash.**
     - Cause: it wrote whenever the EEPROM differed from the image. `Firmware-SL2.command` installs 1.10
