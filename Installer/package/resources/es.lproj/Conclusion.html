@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html>
+<html lang="es">
 <head>
 <meta charset="utf-8">
 <style>
@@ -14,27 +14,21 @@
     @media (prefers-color-scheme: dark) {
         body { color: #eaeaea; }
         .card { background: rgba(255,255,255,0.06) !important; border-color: rgba(255,255,255,0.12) !important; }
-        .badge { background: #00d2ff !important; color: #0b111e !important; }
+        .success { background: #30d158 !important; color: #081b0c !important; }
         .footer { border-color: rgba(255,255,255,0.12) !important; color: #b0b8c4 !important; }
     }
     h1 {
         font-size: 20px;
         font-weight: 700;
-        margin: 0 0 4px 0;
-        letter-spacing: -0.3px;
+        margin: 0 0 6px 0;
     }
-    .subtitle {
-        font-size: 12px;
-        opacity: 0.75;
-        margin-bottom: 14px;
-    }
-    .badge {
+    .success {
         display: inline-block;
-        background: #007aff;
+        background: #28cd41;
         color: #ffffff;
         font-size: 10px;
         font-weight: 700;
-        padding: 2px 7px;
+        padding: 2px 8px;
         border-radius: 4px;
         text-transform: uppercase;
         letter-spacing: 0.5px;
@@ -74,25 +68,24 @@
 </style>
 </head>
 <body>
-    <div class="badge">Apple Silicon M1 / M2 / M3 / M4 &amp; Intel</div>
-    <h1>Rane SL 2 — Native CoreAudio HAL Driver</h1>
-    <div class="subtitle">Version 1.0.0 &bull; macOS Big Sur, Monterey, Ventura, Sonoma &amp; Sequoia</div>
+    <div class="success">Instalación completada</div>
+    <h1>¡Tu Rane SL 2 está lista para pinchar!</h1>
 
-    <p>Welcome to the modern user-space macOS driver installer for the <strong>Rane SL 2</strong> USB 2.0 DJ Audio Interface. This package replaces the discontinued legacy Kernel Extension (<code>.kext</code>) with a native Apple Silicon &amp; Intel CoreAudio HAL Plug-In.</p>
+    <p>El servicio de audio de macOS (CoreAudio) se ha reiniciado automáticamente. Ya puedes conectar tu <strong>Rane SL 2</strong> &mdash; <strong>no hace falta reiniciar</strong>.</p>
 
     <div class="card">
-        <h3>What Will Be Installed:</h3>
+        <h3>Consejos rápidos:</h3>
         <ul>
-            <li><strong>SL2Device.driver</strong> &mdash; 4-Channel (4 In / 4 Out) 24-bit @ 44.1 / 48 kHz CoreAudio HAL Plug-In with Implicit Feedback clock sync.</li>
-            <li><strong>SL2Api.framework</strong> &mdash; Universal bridge allowing <strong>Serato DJ Pro 2.5.5</strong> to communicate with the SL 2 without a kernel extension.</li>
-            <li><strong>SL 2 Control Panel</strong> &mdash; an app (in Applications) showing the SL 2's status, Phono / Line switch and latency, for switching Analog Thru per deck and choosing the sample rate; plus the <code>sl2panel</code> Terminal utility.</li>
+            <li><strong>Software de audio y DVS:</strong> elige <strong>"SL 2"</strong> en Serato DJ Pro (hasta la 2.5.5), VirtualDJ, Traktor, Mixxx, Ableton Live o Logic Pro.</li>
+            <li><strong>Thru automático:</strong> los platos 1 y 2 pasan a audio USB cuando una app de audio empieza a usar la SL 2, y vuelven a Analog Thru cuando se cierra.</li>
+            <li><strong>SL 2 Control Panel:</strong> ábrelo desde Aplicaciones para ver el estado de la SL 2 y activar el Analog Thru de cada plato. Phono / Line es el selector de la propia caja.</li>
+            <li><strong>Terminal:</strong> ejecuta <code>sl2panel status</code>, <code>sl2panel thru</code>, <code>sl2panel usb</code>, <code>sl2panel sr 48000</code> o <code>sl2panel safety 2</code> (el margen de seguridad de entrada, en ms) cuando quieras desde Terminal.</li>
         </ul>
     </div>
 
-    <p><strong>No Reduced Security or kext approval required:</strong> Because this driver runs 100% in user space via Apple's modern <code>IOUSBHost</code> framework, your Mac's security settings remain intact and no system reboot is required.</p>
-
     <div class="footer">
-        Developed &amp; Packaged by <strong>Pepe Lee DJ</strong><br>
+        ¿Disfrutando de tu Rane SL 2 en Apple Silicon?<br>
+        Creado por <strong>Pepe Lee DJ</strong> &mdash;
         &#127760; <a href="https://pepeleedj.com">pepeleedj.com</a> &nbsp;|&nbsp;
         &#128247; Instagram: <a href="https://instagram.com/pepe_lee_dj">@pepe_lee_dj</a>
     </div>
