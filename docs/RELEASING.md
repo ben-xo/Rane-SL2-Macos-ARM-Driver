@@ -47,7 +47,7 @@ the installer's pages, and draws the installer's background. Before committing t
 ```
 pkgutil --expand-full build/RaneSL2-macOS-Universal.pkg /tmp/pkgcheck
 P=/tmp/pkgcheck/RaneSL2-Core.pkg/Payload
-find "$P" -type f                                   # 14 files: driver, SL2Api, kext Info.plist, app, 3 tools
+find "$P" -type f                                   # 17 files: driver, SL2Api, kext Info.plist, app (with its firmware script), 3 tools
 defaults read "$P/Library/Audio/Plug-Ins/HAL/SL2Device.driver/Contents/Info.plist" CFBundleShortVersionString
 defaults read "$P/Applications/SL 2 Control Panel.app/Contents/Info.plist" CFBundleShortVersionString
 "$P/usr/local/bin/sl2panel" --version
