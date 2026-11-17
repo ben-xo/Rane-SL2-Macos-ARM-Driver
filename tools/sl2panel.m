@@ -11,7 +11,7 @@
 #import "SL2Passthrough.h"
 
 #ifndef SL2_VERSION
-#define SL2_VERSION  "1.3.0"
+#define SL2_VERSION  "1.4.0"
 #endif
 #define kSL2PropHIDCommand  'sl2h'
 #define kSL2PropStatus      'sl2s'

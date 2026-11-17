@@ -14,7 +14,7 @@
 # with Installer/package/scripts as its pre- and post-install scripts.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-DEFAULT_VER=$(tr -d '[:space:]' < "$ROOT/VERSION" 2>/dev/null || echo "1.3.0")
+DEFAULT_VER=$(tr -d '[:space:]' < "$ROOT/VERSION" 2>/dev/null || echo "1.4.0")
 VERSION=${1:-$DEFAULT_VER}
 PKGSRC="$ROOT/Installer/package"
 OUT="$ROOT/build"

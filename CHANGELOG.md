@@ -2,7 +2,7 @@
 
 All notable changes to the Rane SL 2 macOS ARM Driver project are documented in this file.
 
-## [Unreleased]
+## [1.4.0] — 2026-11-17
 
 ### Added
 - `sl2panel` shows the USB link speed and the box's own sample rate (`Box Rate`); the control panel warns about a full-speed connection, shows firmware older than 2.00 in red, and greys out the input meters (with a link to Sound Settings) while nothing streams.
