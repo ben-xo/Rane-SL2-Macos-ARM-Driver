@@ -695,7 +695,8 @@ static void set_usb_switches(bool usb_mode) {
 static uint64_t g_resume_since;        /* host time of the unplug */
 static bool     g_resume_pending;
 static uint8_t  g_resume_thru[2];      /* each deck's thru state at the unplug: 1 = analogue thru */
-static uint32_t g_resume_window;       /* the latest fallback scheduled: an older one does nothing */
+static uint32_t g_resume_window;       /* the latest fallback scheduled: an older one, or one whose box has
+                                          gone again, does nothing */
 /* The routing with nothing streaming: the remembered one while a client is expected back, else thru. */
 static void set_idle_routing(void) {
     if (g_resume_pending) set_thru(g_resume_thru);
@@ -2153,7 +2154,7 @@ static void connect_box(int attempt) {
         set_idle_routing();   /* thru, or as before the unplug if a client was streaming */
         resuming = g_resume_pending;
         /* A fallback of its own: one left from an earlier replug (the box unplugged again before the
-           stream restarted) must not put the decks on thru early. */
+           stream restarted) must not put the decks on thru early; on_usb_removed moves the window on too. */
         if (resuming) window = ++g_resume_window;
         send_hw_samplerate((int)g_sr);   /* the box powers up at 44.1 kHz */
     }
@@ -2255,6 +2256,9 @@ static void on_usb_removed(void *refcon, io_iterator_t iter) {
             g_resume_pending = true;
             g_resume_since = mach_absolute_time();
         }
+        /* Any fallback still waiting belongs to a replug that has just ended: the next replug restores
+           the routing and waits again. */
+        g_resume_window++;
         usb_close_all();
         /* The device leaves the HAL's list with the box, and a client using it again after a
            replug sends a new StartIO: start counting clients from zero. */
