@@ -2,6 +2,21 @@
 
 All notable changes to the Rane SL 2 macOS ARM Driver project are documented in this file.
 
+## [Unreleased]
+
+### Added
+- `sl2panel` shows the USB link speed and the box's own sample rate (`Box Rate`); the control panel warns about a full-speed connection, shows firmware older than 2.00 in red, and greys out the input meters (with a link to Sound Settings) while nothing streams.
+- `sl2flash` saves the whole EEPROM to `sl2-eeprom-backup-<date>.bin` before writing it, and takes a blank Cypress FX2 for an SL 2 only with `--blank-fx2`.
+- The firmware extractor reads Rane's 1.0.3f1 and 2.0.1f2 drivers (firmware 2.00) as well as 1.0.1f4, and checks every image against the known build's SHA-256.
+- `make hwtest`: IO buffer sizes from 32 to 512 frames, the capture packet sizes (debug build), and a sleep/wake step.
+
+### Fixed
+- The chosen sample rate is kept across a coreaudiod restart.
+- Thru and the sample rate are checked again 2 s after connecting and after the Mac wakes.
+- Rane's firmware loader (bootstrap) is reported as boot mode, and the driver no longer streams from it or sends it thru and rate commands.
+- A box that doesn't answer the version command no longer shows the previous box's version.
+- The driver's start-up log line shows its version instead of `<private>`.
+
 ## [1.3.0] — 2026-11-10
 
 ### Added
