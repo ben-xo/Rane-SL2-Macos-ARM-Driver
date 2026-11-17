@@ -6,7 +6,7 @@ All notable changes to the Rane SL 2 macOS ARM Driver project are documented in 
 
 ### Added
 - `sl2panel` shows the USB link speed and the box's own sample rate (`Box Rate`); the control panel warns about a full-speed connection, shows firmware older than 2.00 in red, and greys out the input meters (with a link to Sound Settings) while nothing streams.
-- `sl2flash` saves the whole EEPROM to `sl2-eeprom-backup-<date>.bin` before writing it, and takes a blank Cypress FX2 for an SL 2 only with `--blank-fx2`.
+- `sl2flash` saves the whole EEPROM to `sl2-eeprom-backup-<date>.bin` before writing it, takes a blank Cypress FX2 for an SL 2 only with `--blank-fx2`, and `--backup-only` saves the EEPROM without writing anything.
 - The firmware extractor reads Rane's 1.0.3f1 and 2.0.1f2 drivers (firmware 2.00) as well as 1.0.1f4, and checks every image against the known build's SHA-256.
 - `make hwtest`: IO buffer sizes from 32 to 512 frames, the capture packet sizes (debug build), and a sleep/wake step.
 
@@ -16,6 +16,9 @@ All notable changes to the Rane SL 2 macOS ARM Driver project are documented in 
 - After a replug while an app is streaming, the decks keep the routing they had (Serato no longer comes back with every deck in THRU); they go back on thru if no stream restarts within 5 s.
 - Rane's firmware loader (bootstrap) is reported as boot mode, and the driver no longer streams from it or sends it thru and rate commands.
 - A box that doesn't answer the version command no longer shows the previous box's version.
+- After a macOS userspace reboot with the SL 2 attached, the box no longer stays unusable until it is replugged: macOS's HID driver can no longer take its command interface, and the driver recovers the box if it has.
+- `sl2flash` no longer writes older firmware over newer (the Scratch Live driver's 1.10 over 2.00) unless given `--force`, and no longer reports a successful flash as failed ("does not answer through the driver").
+- `tools/install-sl2.sh` installs the driver's `Info.plist` with the binary, so the control panel shows the installed driver's version.
 - The driver's start-up log line shows its version instead of `<private>`.
 
 ## [1.3.0] — 2026-11-10

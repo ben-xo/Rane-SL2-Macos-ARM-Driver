@@ -328,6 +328,10 @@ converters' pre-ringing, which is smaller on a quieter click. It is not latency.
 - **Opening the box at connect.** `connect_box` opens the device once and keeps it; if its HID interface is
   not registered yet (interfaces appear asynchronously after configuring), it looks again, every 100 ms for
   up to a second. The first open is occasionally refused while macOS is still setting the box up.
+- **No other driver gets the interfaces.** The box is configured with `matchInterfaces:NO`, as its command
+  interface (3) is HID-class and macOS's HID driver would otherwise take it whenever it got there first.
+  If it is held anyway, the driver sets configuration 0 and then 1, again without matching, and opens the
+  new interface. Both EP1 endpoints' halt is cleared at every open, which resets their data toggles.
 - **At connect, with nothing streaming,** the decks are put on analogue thru (the box powers up with thru on
   or off depending on a board input), and the box is given the driver's sample rate (it powers up at
   44.1 kHz). The link speed is checked (`0x0a`): the status carries it, and at full speed the log, `sl2panel`
@@ -420,6 +424,15 @@ converters' pre-ringing, which is smaller on a quieter click. It is not latency.
 - When a device disappears while a client streams, the HAL sends that client's StopIO afterwards.
 - A HAL client's property query can be answered by the HAL from its own model of the device without reaching
   the plug-in (e.g. `OwnedObjects` with a class qualifier).
+- A userspace reboot re-runs driver matching on every registered service while coreaudiod is down. A
+  device's interfaces are registered for matching only if it was configured with `matchInterfaces:YES`;
+  configured with `NO`, they can still be opened by the client that configured it, and stream as usual.
+- `IOUSBHostObjectInitOptionsDeviceSeize` only asks the holder to close: macOS's HID driver
+  (`AppleUserUSBHostHIDDevice`) refuses. `DeviceCapture` needs root or Apple's `com.apple.vm.device-access`
+  entitlement, which coreaudiod doesn't have.
+- A new `IOUSBHostPipe` starts at DATA0. If another client left the device's endpoint at DATA1, the device
+  takes each packet for a repeat, acknowledges it and drops it; `clearStallWithError:` resets both ends.
+  Interrupt pipes refuse a completion timeout (`kIOReturnBadArgument`); pass 0.
 - After `killall coreaudiod`, some long-running processes keep stale state:
   - QuickLookUIService and AirPlayXPCHelper ignore SIGTERM and need `kill -9`.
   - Control Center drops the device from its menu until it is restarted.
@@ -432,10 +445,10 @@ Entries refer to the [bug catalogue](#bug-catalogue).
 
 | Applies | Entries |
 |---|---|
-| **Directly**: shared code or a shared HAL/USB pattern | 1 sample-rate handshake; 2 fixed timeline anchor; 4 clock tracking; 5, 31 reporting real latency (measure with `rtlat`); 15 bus time; 19, 20 capture gaps filled with silence; 21 ReadInput's write head; 22, 23 teardown on the USB queue and stream generations; 24, 25 failed opens and unplug while streaming; 26 opening at connect; 27 property buffer sizes; 28 the `sl2h` passthrough; 30 the zero-timestamp period; 39 the status frame count; 35 device listed only while attached; 38 retry a refused first open; 45 a stale version; 47 `%{public}s` in the log; 49 the rate kept across restarts; 50 the settle check after connect and wake; 53 the routing kept across a replug mid-stream |
+| **Directly**: shared code or a shared HAL/USB pattern | 1 sample-rate handshake; 2 fixed timeline anchor; 4 clock tracking; 5, 31 reporting real latency (measure with `rtlat`); 15 bus time; 19, 20 capture gaps filled with silence; 21 ReadInput's write head; 22, 23 teardown on the USB queue and stream generations; 24, 25 failed opens and unplug while streaming; 26 opening at connect; 27 property buffer sizes; 28 the `sl2h` passthrough; 30 the zero-timestamp period; 39 the status frame count; 35 device listed only while attached; 38 retry a refused first open; 45 a stale version; 47 `%{public}s` in the log; 49 the rate kept across restarts; 50 the settle check after connect and wake; 53 the routing kept across a replug mid-stream; 57 interfaces not offered to other drivers, and the EP1 toggles reset (check whether the command interface is HID-class) |
 | **With the deep schedule** (late writes into queued transfers) | 7, 9, 10, 11, 12, 13, 14, 16, 17, 18 |
 | **Check the device first** (the early capture read relies on the low byte of each sample being 0) | 44 |
-| **SL 2 only, or check on the SL 3/SL 4 first** | 8 input safety value (measure); 29 the heartbeat (check the SL 3/SL 4 firmware); 36 LINE/PHONO report (note `0x61`); 37 thru at connect (board input PC7); 46 Rane's bootstrap (each box's bootstrap answers its own version); 48 the link speed (`0x0a`); 32–34, 40–43 SL2Api, `sl2panel` and the test tools (each device's API has its own signatures; the SL 3 uses `0x10` for its version) |
+| **SL 2 only, or check on the SL 3/SL 4 first** | 8 input safety value (measure); 29 the heartbeat (check the SL 3/SL 4 firmware); 36 LINE/PHONO report (note `0x61`); 37 thru at connect (board input PC7); 46 Rane's bootstrap (each box's bootstrap answers its own version); 54, 55 `sl2flash` (downgrades, `--backup-only`, the wait after `0x16`); 48 the link speed (`0x0a`); 32–34, 40–43 SL2Api, `sl2panel` and the test tools (each device's API has its own signatures; the SL 3 uses `0x10` for its version) |
 
 ## Bug catalogue
 
@@ -708,6 +721,35 @@ build; *(hook)* uses `tools/latency/bin/sl2dbg`.
     - Test: Serato 2.5.5 streaming in REL, unplug and replug: the decks stay in REL; `make hwtest`,
       "unplug and replug, mid-stream". `00b0418`.
 
+54. **`sl2flash` would write older firmware over newer, and a backup needed a flash.**
+    - Cause: it wrote whenever the EEPROM differed from the image. `Firmware-SL2.command` installs 1.10
+      (the Scratch Live driver), so on a box updated to 2.00 both offered to "write the firmware".
+    - Fix: a running box on a later version than the image is left alone unless `--force`;
+      `--backup-only` saves the EEPROM and changes nothing.
+    - Test: with 1.10 installed and the box on 2.00, `--dry-run` and a plain run refuse; `--backup-only`
+      writes a backup identical to the 2.00 image. `af4baeb`.
+55. **A successful flash ended "the box is back but does not answer through the driver".**
+    - Cause: after `0x16` sl2flash polled the device ID it found at the start, which leaves the HAL's list
+      while the box restarts (entry 35).
+    - Fix: the device is looked up again on each poll.
+    - Test: `sl2flash --firmware DIR --force` with the 2.00 images ends "running firmware 2.00", "done".
+      `e817c64`.
+56. **The control panel showed driver 1.0.0 with a 1.3.0 build installed.**
+    - Cause: `install-sl2.sh` replaced only the binary; the panel reads the bundle's `Info.plist`.
+    - Fix: the script installs `plugin/Device-Info.plist` too. Test: `make install`; the panel shows
+      1.3.0. `b3d6fa0`.
+57. **After a userspace reboot with the box attached, the SL 2 was unusable until replugged.**
+    - Cause: the box was configured with its interfaces offered for matching, and its command interface
+      is HID-class; the reboot re-ran matching while coreaudiod was down, and macOS's HID driver took it.
+      Once that driver had used it, the box also dropped every command on a new pipe (EP1 data toggle).
+    - Fix: configure with `matchInterfaces:NO`; if the interface is held, set the configuration again;
+      clear EP1's halt at every open (Design, section 6).
+    - Test: configure the box with matching from a small tool while the driver is moved aside, then put
+      the driver back: it logs "setting the box's configuration again" and the box works. `fceeeba`.
+58. **hwtest missed a real Mac sleep.**
+    - Cause: it looked for an 8 s jump in the wall clock, and the Mac woke into a DarkWake 8 s after
+      sleeping, where processes run again.
+    - Fix: the sleep and the full wake are read from `pmset -g log`. `1850b62`.
 ## Testing
 
 `make hwtest` runs the hardware tests in one go, in the order that needs the fewest physical steps, and
