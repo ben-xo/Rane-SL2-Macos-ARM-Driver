@@ -53,28 +53,8 @@ enum {
     SL2_EVT_SAMPLE_RATE    = 0x4F,   /* the driver's own event: [5..7] rate, big-endian */
 };
 
-/* The driver's status ('sl2s'); must match SL2Device.m */
-typedef struct {
-    uint32_t connected;
-    uint32_t streaming;
-    uint32_t sample_rate;
-    uint32_t version_maj;
-    uint32_t version_min;
-    uint8_t  serial[32];
-    uint8_t  phono[4];
-    uint8_t  thru[4];
-    uint8_t  port_a;
-    uint8_t  port_b;
-    uint64_t cap_frames;
-    uint64_t play_frames;
-    uint32_t boot_mode;
-    uint32_t debug_build;
-    uint32_t in_safety_us;
-    uint32_t early_read;
-    uint32_t hub_depth;
-    uint64_t in_dropouts;
-    uint32_t usb_link;
-} SL2StatusPacket;
+/* The driver's status ('sl2s'), defined once in plugin/SL2Status.h */
+#include "SL2Status.h"
 
 /* Rane's API types */
 typedef struct {
@@ -230,9 +210,12 @@ static AudioObjectID ready_hal_device(void) {
         /* Ready: the device is listed and the driver reports the box open. */
         AudioObjectID dev = find_hal_device();
         SL2StatusPacket st;
-        if (dev != kAudioObjectUnknown && hal_get_status(&st) && st.connected) return dev;
-        /* Not ready, and not about to be (no box, or no driver to open it), or waited long enough. */
-        if (waited >= READY_WAIT_MS || !in_usb_registry() || !driver_loaded()) return kAudioObjectUnknown;
+        bool have_st = dev != kAudioObjectUnknown && hal_get_status(&st);
+        if (have_st && st.connected) return dev;
+        /* Not ready, and not about to be (no box, a box in its bootloader, which the driver never opens,
+           or no driver to open it), or waited long enough. */
+        if (waited >= READY_WAIT_MS || (have_st && st.boot_mode) || !in_usb_registry() || !driver_loaded())
+            return kAudioObjectUnknown;
         if (waited == 0) TRACE(": the box is attached but the driver has not opened it yet: waiting");
         usleep(READY_POLL_MS * 1000);
     }

@@ -14,7 +14,7 @@
 # with Installer/package/scripts as its pre- and post-install scripts.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-DEFAULT_VER=$(tr -d '[:space:]' < "$ROOT/VERSION" 2>/dev/null || echo "1.4.0")
+DEFAULT_VER=$(tr -d '[:space:]' < "$ROOT/VERSION" 2>/dev/null || echo "1.4.1")
 VERSION=${1:-$DEFAULT_VER}
 PKGSRC="$ROOT/Installer/package"
 OUT="$ROOT/build"
@@ -66,9 +66,11 @@ pkgbuild --root "$STAGE" --component-plist "$WORK/components.plist" --scripts "$
     --identifier com.pepelee.ranesl2.driver --version "$VERSION" --install-location / \
     "$WORK/pkgs/RaneSL2-Core.pkg"
 
-# The product package, with the installer's pages, and its background drawn from the control panel's icon.
+# The product package, with the installer's pages (in English and Spanish, en.lproj and es.lproj: the
+# Installer shows the Mac's language) and its background drawn from the control panel's icon.
 sed "s/@VERSION@/$VERSION/" "$PKGSRC/Distribution.xml" > "$WORK/Distribution.xml"
 cp -R "$PKGSRC/resources" "$WORK/resources"
+for f in "$WORK"/resources/*.lproj/*.html; do sed -i '' "s/@VERSION@/$VERSION/g" "$f"; done
 swiftc -O tools/controlpanel/make-icon.swift -o "$WORK/make-icon"
 "$WORK/make-icon" --installer-background "$WORK/resources/background.png"
 mkdir -p "$OUT"

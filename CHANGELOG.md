@@ -2,6 +2,21 @@
 
 All notable changes to the Rane SL 2 macOS ARM Driver project are documented in this file.
 
+## [1.4.1] — 2026-11-17
+
+### Changed
+- The installer's pages are in English and Spanish (it shows the Mac's language), and the Welcome page shows the installer's own version (it said 1.0.0).
+
+### Fixed
+- After a replug mid-stream, a second unplug and replug before the app restarted its stream could put the decks back on thru (and Serato's decks in THRU) a second after the replug.
+- The driver resets the box's USB configuration only when another driver really holds its HID interface, and logs why an open failed.
+- A box that restarts (a firmware update) is reopened even if its new device is seen before the old one goes, instead of the driver staying on the old device and refusing to stream.
+- The check after connecting and after a Mac wake no longer puts a deck back on thru that was put on USB on purpose (`sl2panel usb`, Rane's control panel) with nothing streaming.
+- `sl2flash` refuses `--dry-run` with `--backup-only`, which loaded the bootstrap into a box in its bootloader.
+- `make hwtest` takes the loopback channel from `SL_LOOP_CH` in every step.
+- Hardening from the SL 3 driver's code review (none seen on an SL 2): playback can no longer be let back in after a stop and its buffers freed under it; a refused or failing HID read is retried instead of stopping commands or spinning; a reply arriving as its command times out can no longer reach the next command; the status is never read half-updated; a late StopIO from before an unplug no longer stops the stream started after the replug; a rate change while streaming sends the rate once.
+- SL2Api no longer waits 2 s on each call while a box in its bootloader is attached.
+
 ## [1.4.0] — 2026-11-17
 
 ### Added

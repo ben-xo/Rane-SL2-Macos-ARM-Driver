@@ -34,11 +34,13 @@
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <os/log.h>
+#include <os/lock.h>
+#include "SL2Status.h"
 #include <stdatomic.h>
 #include <math.h>
 
 #ifndef SL2_VERSION
-#define SL2_VERSION  "1.4.0"
+#define SL2_VERSION  "1.4.1"
 #endif
 #define VID          0x1cc5
 #define PID          0x0013
@@ -92,32 +94,13 @@ enum {
     SL2_NOTE_LINE_PHONO    = 0x61,   /* the one LINE/PHONO switch: On = phono (reported only) */
     /* Reports the driver makes itself (not from the box), queued for clients like the box's: */
     SL2_EVT_SAMPLE_RATE    = 0x4F,   /* [5..7] rate, big-endian */
+    /* Debug commands (debug build only): handled by the driver, never sent to the box. */
+    SL2_CMD_DEBUG_FIRST    = 0xF0,   /* this and above are debug commands; a release build refuses them */
+    SL2_CMD_DBG_STALL      = 0xF3,   /* [5..6] ms, big-endian: hold the USB queue this long, once */
+    SL2_CMD_DBG_ERRPKTS    = 0xF4,   /* [5] n: treat the next n capture packets as errored */
+    SL2_CMD_DBG_NOEARLY    = 0xF5,   /* [5] 1: the early reader places nothing; 0: back on */
 };
 
-typedef struct {
-    uint32_t connected;
-    uint32_t streaming;
-    uint32_t sample_rate;
-    uint32_t version_maj;
-    uint32_t version_min;
-    uint8_t  serial[32];
-    uint8_t  phono[4];       /* 1 = Phono, 0 = Line */
-    uint8_t  thru[4];        /* 1 = Analog Thru, 0 = USB Audio */
-    uint8_t  port_a;
-    uint8_t  port_b;
-    uint64_t cap_frames;
-    uint64_t play_frames;
-    uint32_t boot_mode;      /* 1 = the box is in its USB bootloader; no audio until firmware is loaded */
-    uint32_t debug_build;    /* 1 = this driver was built with SL2_DEBUG (make plugin DEBUG=1) */
-    /* Input health (see "Early read" and the input safety offset) */
-    uint32_t in_safety_us;          /* the input safety offset the HAL is using, in us */
-    uint32_t early_read;            /* 0 = not judged yet on this connection, 1 = working, 2 = not working */
-    uint32_t hub_depth;             /* USB hubs between the box and the Mac: 0 = connected directly */
-    uint64_t in_dropouts;           /* IO cycles in which input wasn't captured in time, since the device was
-                                       set up (the box connected, or the input safety offset changed) */
-    uint32_t usb_link;              /* the box's USB link (0x0a): 2 = high speed, 1 = full speed (no audio),
-                                       0 = not known */
-} SL2StatusPacket;
 
 enum {
     kObjPlugIn    = kAudioObjectPlugInObject,
@@ -204,6 +187,10 @@ static pthread_mutex_t g_unsol_mtx = PTHREAD_MUTEX_INITIALIZER;
 #define RATE_STORAGE_KEY CFSTR("sample rate")
 static Float64  g_sr = 44100.0;
 static UInt32   g_io_clients = 0;
+#define IO_CLIENTS_MAX 64
+static UInt32   g_io_cids[IO_CLIENTS_MAX];   /* the client IDs counted in g_io_clients (g_mutex); cleared with
+                                                it at an unplug, so a StopIO for a session from before the
+                                                unplug is told from one for a client started since */
 static _Atomic bool g_io_running = false;
 /* Stream generation: bumped when a stream starts and when it stops. Every USB completion and
    retry carries the generation it was queued in and does nothing once it has moved on, so work
@@ -216,6 +203,7 @@ static _Atomic bool g_hw_connected = false;
 static _Atomic bool g_boot_mode = false;     /* a box in its bootloader, or running Rane's EEPROM writer:
                                                 no firmware, no audio */
 static _Atomic bool g_box_present = false;   /* a box with running firmware is attached */
+static _Atomic bool g_bootstrap_open = false;   /* the box the driver has open is running Rane's bootstrap */
 static uint32_t g_ref_count = 0;
 
 /* Capture ring buffer (Float32 interleaved, NCH channels), indexed by timeline position */
@@ -395,8 +383,18 @@ static dispatch_semaphore_t g_hid_sem;
 static _Atomic bool g_waiting = false;
 static uint8_t  g_wait_cmd = 0;
 static uint32_t g_wait_seq = 0;
+/* Guards the hand-off of a reply: hid_read matches, copies and signals under it, and hid_cmd sets
+   up and gives up its wait under it, so a reply matched to one command can't be signalled after the
+   next one has started waiting. */
+static pthread_mutex_t g_reply_mtx = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t  g_reply_buf[HID_REPORT_LEN];
 static SL2StatusPacket g_st;
+/* g_st's box-state fields are written from the USB queue (reports), the hot-plug queue and client
+   threads: each write, and the copy 'sl2s' returns, is made under g_st_lock, so a client never gets
+   a packet mixed from two updates. Held only for the copy, never across a HID command. */
+static os_unfair_lock g_st_lock = OS_UNFAIR_LOCK_INIT;
+#define ST_LOCK()   os_unfair_lock_lock(&g_st_lock)
+#define ST_UNLOCK() os_unfair_lock_unlock(&g_st_lock)
 static _Atomic uint32_t g_thru_reports;   /* thru notes reported by the box (hid_read), to see a state dump arrive */
 
 
@@ -459,9 +457,19 @@ static void push_sr_unsol(int sr) {
 /* Keep one read queued on the HID IN pipe (runs on g_q). Each report is either the reply hid_cmd
    is waiting for, or an unsolicited report from the box,
    which updates the status and is queued for clients. */
+static void hid_read(void);
+static IOReturn g_hid_read_err;   /* the last HID read error logged, so a repeating one logs once (logging only) */
+/* Queue the next read after ms, if the pipe is still the one it was for (not closed or replaced). */
+static void hid_read_later(IOUSBHostPipe *pipe, int ms) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)ms * NSEC_PER_MSEC), g_q, ^{
+        if (g_hpipe_in == pipe) hid_read();
+    });
+}
 static void hid_read(void) {
     if (!g_hpipe_in || !g_hbuf_in) return;
-    [g_hpipe_in enqueueIORequestWithData:g_hbuf_in completionTimeout:0 error:nil completionHandler:^(IOReturn s, NSUInteger n) {
+    IOUSBHostPipe *pipe = g_hpipe_in;
+    NSError *e = nil;
+    BOOL queued = [pipe enqueueIORequestWithData:g_hbuf_in completionTimeout:0 error:&e completionHandler:^(IOReturn s, NSUInteger n) {
         if (s == kIOReturnSuccess && n > 0) {
             /* The report's command byte [0] and its tag [1..4]. */
             const uint8_t *b = g_hbuf_in.bytes;
@@ -470,6 +478,7 @@ static void hid_read(void) {
 
             /* The awaited reply: its command (or a rejection) with its tag. A refused EEPROM write
                carries a stale tag, so for that one any rejection is the answer. */
+            pthread_mutex_lock(&g_reply_mtx);
             bool reply = atomic_load(&g_waiting) &&
                          ((b[0] == g_wait_cmd && rseq == g_wait_seq) ||
                           (b[0] == SL2_REJECTED && (rseq == g_wait_seq || g_wait_cmd == SL2_CMD_EEPROM_WRITE)));
@@ -478,29 +487,45 @@ static void hid_read(void) {
                 memcpy(g_reply_buf, b, HID_REPORT_LEN);
                 atomic_store(&g_waiting, false);
                 dispatch_semaphore_signal(g_hid_sem);
+            }
+            pthread_mutex_unlock(&g_reply_mtx);
 
             /* An unsolicited report: note thru and switch state, and queue it for clients. */
-            } else if (b[0] == SL2_REPORT_HIDI) {
+            if (!reply && b[0] == SL2_REPORT_HIDI) {
                 /* Its payload is 3-byte MIDI messages (status, note, velocity), [5] bytes long. */
                 uint8_t len = b[5] > HID_MAX_ARGS - 1 ? HID_MAX_ARGS - 1 : b[5];
                 for (uint8_t i = 0; i + 2 < len; i += 3) {
                     uint8_t st = b[6 + i], note = b[6 + i + 1];   /* [6 + i + 2], the velocity, is always 0x40 */
                     int on = ((st & 0xF0) == 0x90) ? 1 : 0;
                     if (note == SL2_NOTE_THRU_DECK1 || note == SL2_NOTE_THRU_DECK2) {
-                        g_st.thru[note - SL2_NOTE_THRU_DECK1] = on;
+                        ST_LOCK(); g_st.thru[note - SL2_NOTE_THRU_DECK1] = on; ST_UNLOCK();
                         atomic_fetch_add(&g_thru_reports, 1);
                     } else if (note == SL2_NOTE_LINE_PHONO) {
                         /* the box's one LINE/PHONO switch (firmware input PE0), shared by both decks */
-                        g_st.phono[0] = g_st.phono[1] = on;
+                        ST_LOCK(); g_st.phono[0] = g_st.phono[1] = on; ST_UNLOCK();
                     }
                 }
                 unsol_push(b);
             }
             /* Anything else is a reply that came after hid_cmd gave up: not for clients. */
         }
-        /* Queue the next read, unless the pipe was aborted or released (the box is closing). */
-        if (s != kIOReturnAborted && g_hpipe_in) hid_read();
+        /* Queue the next read, unless the pipe was aborted or released (the box is closing). After
+           an error, clear the endpoint's halt and wait a little first, so a pipe that keeps failing
+           doesn't spin on g_q, which also runs the audio completions. */
+        if (s == kIOReturnAborted || g_hpipe_in != pipe) return;
+        if (s == kIOReturnSuccess) { g_hid_read_err = kIOReturnSuccess; hid_read(); return; }
+        if (s != g_hid_read_err) LOG("HID read failed (0x%x): clearing the endpoint and reading again", s);
+        g_hid_read_err = s;
+        [pipe clearStallWithError:nil];
+        hid_read_later(pipe, 10);
     }];
+    /* Not queued: try again shortly, rather than leave the box's replies and reports unread. */
+    if (!queued) {
+        if (g_hid_read_err != kIOReturnNotReady)
+            LOG("HID read could not be queued (%{public}@): trying again", e.localizedDescription);
+        g_hid_read_err = kIOReturnNotReady;   /* marks "not queued", so a lasting refusal logs once */
+        hid_read_later(pipe, 100);
+    }
 }
 
 /* Send a command and wait up to 150 ms for its reply. Every command gets one except
@@ -521,9 +546,11 @@ static bool hid_cmd(uint8_t cmd, const uint8_t *pl, size_t plen, uint8_t *reply_
     memcpy(buf + 1, &seq, 4);
     if (pl && plen > 0) memcpy(buf + 5, pl, plen > HID_MAX_ARGS ? HID_MAX_ARGS : plen);
     bool wait = cmd != SL2_CMD_NO_REPLY;
+    pthread_mutex_lock(&g_reply_mtx);
     g_wait_cmd = cmd;
     g_wait_seq = seq;
     atomic_store(&g_waiting, wait);
+    pthread_mutex_unlock(&g_reply_mtx);
 
     /* Send it. */
     NSMutableData *d = [NSMutableData dataWithBytes:buf length:HID_REPORT_LEN];
@@ -533,7 +560,9 @@ static bool hid_cmd(uint8_t cmd, const uint8_t *pl, size_t plen, uint8_t *reply_
     BOOL ok = [g_hpipe_out sendIORequestWithData:d bytesTransferred:&sent completionTimeout:0 error:&e];
     pthread_mutex_unlock(&g_hout_mtx);
     if (!ok) {
+        pthread_mutex_lock(&g_reply_mtx);
         atomic_store(&g_waiting, false);
+        pthread_mutex_unlock(&g_reply_mtx);
         pthread_mutex_unlock(&g_hid_mtx);
         return false;
     }
@@ -541,12 +570,19 @@ static bool hid_cmd(uint8_t cmd, const uint8_t *pl, size_t plen, uint8_t *reply_
     /* Wait for the reply. */
     bool accepted = true;
     if (wait) {
-        if (dispatch_semaphore_wait(g_hid_sem, dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC)) == 0) {
+        bool got = dispatch_semaphore_wait(g_hid_sem, dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC)) == 0;
+        if (!got) {
+            /* No reply in time: stop waiting, so hid_read doesn't take a late one as the answer,
+               unless it handed one over as the wait ran out (then take it). */
+            pthread_mutex_lock(&g_reply_mtx);
+            if (atomic_load(&g_waiting)) atomic_store(&g_waiting, false);
+            else got = dispatch_semaphore_wait(g_hid_sem, DISPATCH_TIME_NOW) == 0;
+            pthread_mutex_unlock(&g_reply_mtx);
+        }
+        if (got) {
             if (reply_out) memcpy(reply_out, g_reply_buf, HID_REPORT_LEN);
             accepted = g_reply_buf[0] != SL2_REJECTED;
         } else {
-            /* No reply in time: stop waiting, so hid_read doesn't take a late one as the answer. */
-            atomic_store(&g_waiting, false);
             accepted = false;
             if (reply_out) memset(reply_out, 0, HID_REPORT_LEN);
         }
@@ -578,19 +614,24 @@ static void refresh_hw_status(void) {
        reply[7..10]); c.f. the SL3, which uses 0x10. bcdDevice is only a mode marker
        (0x0100 = running firmware, 0x0000 = bootloader), not the version. */
     uint8_t r[64];
-    g_st.version_maj = g_st.version_min = 0;   /* not the previous box's, if this one doesn't answer */
-    g_st.port_a = g_st.port_b = 0;
+    uint8_t maj = 0, min = 0;   /* 0.00, not the previous box's, if this one doesn't answer */
     for (int attempt = 0; attempt < 2; attempt++) {   /* the box may still be loading its FPGA */
         if (hid_cmd(SL2_CMD_VERSION, NULL, 0, r, NULL)) {
-            g_st.version_maj = r[5];
-            g_st.version_min = r[6];
+            maj = r[5];
+            min = r[6];
             break;
         }
     }
+    ST_LOCK();
+    g_st.version_maj = maj; g_st.version_min = min;
+    g_st.port_a = g_st.port_b = 0;
+    g_st.usb_link = 0;
+    ST_UNLOCK();
     /* Rane's bootstrap (the RAM-loaded EEPROM writer that sl2flash and Rane's updater load into a box
        in its bootloader) enumerates exactly like the running firmware, bcdDevice 0x0100 included, and
        answers 01 02: that box has no audio. */
-    bool loader = (g_st.version_maj << 8 | g_st.version_min) == SL2_BOOTSTRAP_VERSION;
+    bool loader = (maj << 8 | min) == SL2_BOOTSTRAP_VERSION;
+    atomic_store(&g_bootstrap_open, loader);
     if (loader) {
         atomic_store(&g_boot_mode, true);
         LOG("Rane SL 2 is running Rane's firmware loader (1.02), not its firmware: no audio until the "
@@ -598,9 +639,8 @@ static void refresh_hw_status(void) {
     }
     /* USB speed (0x0a: 1 = full speed, 2 = high speed). At full speed the box offers only its HID
        interface, so there is no audio: say so, as the only other sign is a failed stream start. */
-    g_st.usb_link = 0;
     if (hid_cmd(SL2_CMD_PORT_SPEED, NULL, 0, r, NULL)) {
-        g_st.usb_link = r[5];
+        ST_LOCK(); g_st.usb_link = r[5]; ST_UNLOCK();
         if (r[5] == 1)
             LOG("The SL 2 is on a full-speed (USB 1.1) link: no audio. Connect it to a USB 2.0 high-speed port.");
     }
@@ -608,15 +648,16 @@ static void refresh_hw_status(void) {
        of the firmware version; c.f. the SL3, which queries it over HID 0x04. */
     CFTypeRef ser = IORegistryEntryCreateCFProperty(g_dev.ioService, CFSTR("USB Serial Number"), kCFAllocatorDefault, 0);
     if (ser) {
-        if (CFGetTypeID(ser) == CFStringGetTypeID())
-            CFStringGetCString((CFStringRef)ser, (char *)g_st.serial, sizeof g_st.serial, kCFStringEncodingUTF8);
+        char sb[sizeof g_st.serial] = {0};
+        if (CFGetTypeID(ser) == CFStringGetTypeID() && CFStringGetCString((CFStringRef)ser, sb, sizeof sb, kCFStringEncodingUTF8)) {
+            ST_LOCK(); memcpy(g_st.serial, sb, sizeof sb); ST_UNLOCK();
+        }
         CFRelease(ser);
     }
     /* Port status (0x45), kept in the status packet for clients; always 00 00 on the SL 2. */
     uint8_t req_ports[1] = {0};
     if (hid_cmd(SL2_CMD_PORT_STATUS, req_ports, 1, r, NULL)) {
-        g_st.port_a = r[5];
-        g_st.port_b = r[6];
+        ST_LOCK(); g_st.port_a = r[5]; g_st.port_b = r[6]; ST_UNLOCK();
     }
     /* The switch and thru state (the bootstrap has no switches to report and no 0x41). */
     if (!loader) request_state();
@@ -634,7 +675,7 @@ static void set_thru(const uint8_t thru[2]) {
     for (int i = 0; i < 2; i++) {
         uint8_t pl[4] = { 0x03, thru[i] ? 0x90 : 0x80, (uint8_t)(SL2_NOTE_THRU_DECK1 + i), 0x00 };
         hid_cmd(SL2_CMD_HIDI, pl, 4, NULL, NULL);
-        g_st.thru[i] = thru[i] ? 1 : 0;
+        ST_LOCK(); g_st.thru[i] = thru[i] ? 1 : 0; ST_UNLOCK();
     }
 }
 static void set_usb_switches(bool usb_mode) {
@@ -654,7 +695,8 @@ static void set_usb_switches(bool usb_mode) {
 static uint64_t g_resume_since;        /* host time of the unplug */
 static bool     g_resume_pending;
 static uint8_t  g_resume_thru[2];      /* each deck's thru state at the unplug: 1 = analogue thru */
-static uint32_t g_resume_window;       /* which window a fallback belongs to */
+static uint32_t g_resume_window;       /* the latest fallback scheduled: an older one, or one whose box has
+                                          gone again, does nothing */
 /* The routing with nothing streaming: the remembered one while a client is expected back, else thru. */
 static void set_idle_routing(void) {
     if (g_resume_pending) set_thru(g_resume_thru);
@@ -1674,12 +1716,14 @@ static dispatch_queue_t usb_queue_create(void) {
     return dispatch_queue_create("com.rane.sl2.usb", qa);
 }
 
-/* Open the HID interface (bInterfaceNumber IF_HID) if it is there and nobody else holds it; *there
-   says whether it is there at all. */
+/* Open the box's interface ifnum (its bInterfaceNumber) if it is there and nobody else holds it. *there
+   says whether it is there at all; if the open fails, *err gets why and *holder (if given) the name of
+   the client holding the interface (its UsbExclusiveOwner), or nil if nobody does. */
 static bool g_hid_reconfigured;   /* usb_ensure_hid has set the configuration again for this device */
-static IOUSBHostInterface *hid_open(bool *there) {
+static IOUSBHostInterface *usb_open_interface(int ifnum, bool *there, NSString **holder, NSError **err) {
     IOUSBHostInterface *found = nil;
     *there = false;
+    if (holder) *holder = nil;
     io_iterator_t it = 0;
     IORegistryEntryGetChildIterator(g_dev.ioService, kIOServicePlane, &it);
     io_service_t ch;
@@ -1689,10 +1733,15 @@ static IOUSBHostInterface *hid_open(bool *there) {
             int idx = -1;
             CFNumberGetValue(n, kCFNumberIntType, &idx);
             CFRelease(n);
-            if (idx == IF_HID && !found) {
+            if (idx == ifnum && !*there) {
                 *there = true;
                 found = [[IOUSBHostInterface alloc] initWithIOService:ch options:IOUSBHostObjectInitOptionsNone
-                                                                queue:g_q error:nil interestHandler:nil];
+                                                                queue:g_q error:err interestHandler:nil];
+                if (!found && holder) {
+                    CFTypeRef o = IORegistryEntryCreateCFProperty(ch, CFSTR("UsbExclusiveOwner"), kCFAllocatorDefault, 0);
+                    if (o && CFGetTypeID(o) == CFStringGetTypeID()) *holder = (__bridge_transfer NSString *)o;
+                    else if (o) CFRelease(o);
+                }
             }
         }
         IOObjectRelease(ch);
@@ -1735,14 +1784,18 @@ static bool usb_ensure_hid(void) {
        ones aren't offered to anyone. */
     if (!g_hid) {
         bool there = false;
-        g_hid = hid_open(&there);
-        if (!g_hid && there && !g_hid_reconfigured) {
+        NSString *holder = nil;
+        g_hid = usb_open_interface(IF_HID, &there, &holder, &e);
+        if (!g_hid && holder && !g_hid_reconfigured) {
             g_hid_reconfigured = true;
-            LOG("The SL 2's HID interface is held by another driver: setting the box's configuration again");
+            LOG("The SL 2's HID interface is held by %{public}@ (%{public}@): setting the box's configuration again",
+                holder, e.localizedFailureReason ?: e.localizedDescription);
             [g_dev configureWithValue:0 matchInterfaces:NO error:&e];
             [g_dev configureWithValue:1 matchInterfaces:NO error:&e];
-            g_hid = hid_open(&there);
+            g_hid = usb_open_interface(IF_HID, &there, &holder, &e);
         }
+        if (!g_hid && there)
+            LOG("Could not open the SL 2's HID interface: %{public}@", e.localizedFailureReason ?: e.localizedDescription);
         if (!g_hid) return false;
     }
 
@@ -1788,8 +1841,11 @@ static void usb_release_audio(void) {
     /* Abort the pipes: their queued transfers complete with kIOReturnAborted. */
     if (g_cpipe) [g_cpipe abortWithError:nil];
     if (g_ppipe) [g_ppipe abortWithError:nil];
-    /* Release buffers and pipes on g_q, behind any completion handler already queued there. */
+    /* Release buffers and pipes on g_q, behind any completion handler already queued there. Switch
+       the schedule off again first: a dp_start that passed its generation check before the stream
+       was stopped (it runs on g_q) can have let WriteMix back in after the caller's dp_stop. */
     if (g_q) dispatch_sync(g_q, ^{
+        dp_stop();
         dp_release();
         g_cpipe = nil; g_ppipe = nil;
     });
@@ -1816,21 +1872,9 @@ static bool usb_open_all(void) {
     DBG_DO(dbg_reset());
 
     /* Claim the playback and capture interfaces. */
-    io_iterator_t it = 0;
-    IORegistryEntryGetChildIterator(g_dev.ioService, kIOServicePlane, &it);
-    io_service_t ch;
-    while ((ch = IOIteratorNext(it))) {
-        CFNumberRef n = IORegistryEntryCreateCFProperty(ch, CFSTR("bInterfaceNumber"), kCFAllocatorDefault, 0);
-        if (n) {
-            int idx = -1;
-            CFNumberGetValue(n, kCFNumberIntType, &idx);
-            CFRelease(n);
-            if (idx == IF_PLAY && !g_play) g_play = [[IOUSBHostInterface alloc] initWithIOService:ch options:IOUSBHostObjectInitOptionsNone queue:g_q error:&e interestHandler:nil];
-            if (idx == IF_CAP  && !g_cap)  g_cap  = [[IOUSBHostInterface alloc] initWithIOService:ch options:IOUSBHostObjectInitOptionsNone queue:g_q error:&e interestHandler:nil];
-        }
-        IOObjectRelease(ch);
-    }
-    IOObjectRelease(it);
+    bool there = false;
+    if (!g_play) g_play = usb_open_interface(IF_PLAY, &there, NULL, &e);
+    if (!g_cap)  g_cap  = usb_open_interface(IF_CAP, &there, NULL, &e);
     if (!g_play || !g_cap) {
         LOG("Failed to claim Play/Cap interfaces");
         usb_release_audio();
@@ -1956,6 +2000,7 @@ static void usb_close_all(void) {
     if (g_hid)  { [g_hid destroy]; g_hid = nil; }
     if (g_dev)  { [g_dev destroy]; g_dev = nil; }
     atomic_store(&g_hw_connected, false);
+    atomic_store(&g_bootstrap_open, false);
 }
 
 /* The device is published (in the plug-in's device list, so it shows in the system's device
@@ -2046,9 +2091,10 @@ static void relist_if_safety_changed(void) {
 
 /* Thru and the rate can be lost after connect_box has set them: the box finishes starting up (it loads
    its FPGA) after it is configured, and it is suspended and resumed when the Mac sleeps. A while after
-   connecting, and after the Mac wakes, the driver checks: with nothing streaming, the decks' routing
-   (read from a state dump: thru, or as before a replug while the client is expected back, see
-   g_resume_pending); and the rate the driver's (0x30). Each correction is logged. */
+   connecting, and after the Mac wakes, the driver checks: with nothing streaming, that the decks' routing
+   (read from a state dump) is still what the driver last knew, which is what it set or what the box last
+   reported (a client's change, e.g. sl2panel usb, reaches it as a report, so it is left alone); and that
+   the box's rate (0x30) is the driver's. Each correction is logged. */
 #define SETTLE_CHECK_MS  2000
 #define SETTLE_DUMP_MS   200     /* time for a state dump's reports to arrive */
 static void settle_check(const char *why) {
@@ -2057,6 +2103,7 @@ static void settle_check(const char *why) {
     pthread_mutex_lock(&g_mutex);
     bool idle = false;
     uint32_t seen = atomic_load(&g_thru_reports);
+    uint8_t known0 = g_st.thru[0], known1 = g_st.thru[1];   /* the routing the driver last knew */
     if (usb_ensure_hid() && !atomic_load(&g_boot_mode)) {
         uint8_t r[HID_REPORT_LEN];
         if (hid_cmd(SL2_CMD_GET_RATE, NULL, 0, r, NULL)) {
@@ -2071,17 +2118,16 @@ static void settle_check(const char *why) {
     }
     pthread_mutex_unlock(&g_mutex);
     if (!idle) return;
-    /* Once the dump has reported both decks, still idle: put the routing right if it has changed. */
+    /* Once the dump has reported both decks, still idle: if the box has lost the routing, put it back. */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, SETTLE_DUMP_MS * NSEC_PER_MSEC), g_hotplug_q, ^{
         if (!atomic_load(&g_box_present)) return;
         pthread_mutex_lock(&g_mutex);
-        bool wrong = false;
-        for (int d = 0; d < 2; d++)
-            if ((g_st.thru[d] != 0) != (g_resume_pending ? g_resume_thru[d] != 0 : true)) wrong = true;
-        if (atomic_load(&g_thru_reports) - seen >= 2 && !atomic_load(&g_io_running) && wrong) {
-            LOG("%{public}s: the decks' routing had changed with nothing streaming: %{public}s", why,
-                g_resume_pending ? "routed as before the replug" : "back to thru");
-            set_idle_routing();
+        uint8_t known[2] = { known0, known1 };
+        bool lost = (g_st.thru[0] != 0) != (known[0] != 0) || (g_st.thru[1] != 0) != (known[1] != 0);
+        if (atomic_load(&g_thru_reports) - seen >= 2 && !atomic_load(&g_io_running) && lost) {
+            LOG("%{public}s: the box had lost the decks' routing: put back (deck 1 %{public}s, deck 2 %{public}s)", why,
+                known[0] ? "thru" : "USB", known[1] ? "thru" : "USB");
+            set_thru(known);
         }
         pthread_mutex_unlock(&g_mutex);
     });
@@ -2089,9 +2135,9 @@ static void settle_check(const char *why) {
 
 /* Open a newly attached box and, with no stream running, put its decks on analogue thru (the box
    powers up with thru on or off depending on a board input), as at stream stop, so turntables
-   reach the mixer until an app streams; after a replug mid-stream, as they were (g_resume_pending). The first open can be refused ("exclusive open of usb
-   object failed") while macOS is still setting the box up, about 1 connect in 30: retry for
-   about a second. */
+   reach the mixer until an app streams; after a replug mid-stream, route them as they were
+   (g_resume_pending). The first open can be refused ("exclusive open of usb object failed") while
+   macOS is still setting the box up, about 1 connect in 30: retry for about a second. */
 #define CONNECT_TRIES    10
 #define CONNECT_RETRY_MS 100
 static void connect_box(int attempt) {
@@ -2100,13 +2146,16 @@ static void connect_box(int attempt) {
     pthread_mutex_lock(&g_mutex);
     bool ok = usb_ensure_hid();
     bool resuming = false;
-    uint32_t window = g_resume_window;
+    uint32_t window = 0;
     if (g_resume_pending && (double)(mach_absolute_time() - g_resume_since) > RESUME_MAX_GAP_S * 1000.0 * ticks_per_ms())
         g_resume_pending = false;   /* back long after the unplug: not the same session */
     /* (Not on Rane's bootstrap: it has no audio, and the firmware tools are using it.) */
     if (ok && !atomic_load(&g_io_running) && !atomic_load(&g_boot_mode)) {
         set_idle_routing();   /* thru, or as before the unplug if a client was streaming */
         resuming = g_resume_pending;
+        /* A fallback of its own: one left from an earlier replug (the box unplugged again before the
+           stream restarted) must not put the decks on thru early; on_usb_removed moves the window on too. */
+        if (resuming) window = ++g_resume_window;
         send_hw_samplerate((int)g_sr);   /* the box powers up at 44.1 kHz */
     }
     pthread_mutex_unlock(&g_mutex);
@@ -2175,28 +2224,41 @@ static void on_usb_added(void *refcon, io_iterator_t iter) {
 
 /* Hot-plug: SL 2 USB devices went away (on the hot-plug queue). */
 static void on_usb_removed(void *refcon, io_iterator_t iter) {
-    /* Drain the iterator (which re-arms it); stop if nothing was actually removed. */
+    /* Drain the iterator (which re-arms it), noting whether the device the driver has open went; stop if
+       nothing was actually removed. */
+    pthread_mutex_lock(&g_mutex);
+    io_service_t open_svc = g_dev ? g_dev.ioService : IO_OBJECT_NULL;
+    if (open_svc) IOObjectRetain(open_svc);
+    pthread_mutex_unlock(&g_mutex);
     io_service_t s;
-    bool removed = false;
-    while ((s = IOIteratorNext(iter))) { IOObjectRelease(s); removed = true; }
+    bool removed = false, ours = false;
+    while ((s = IOIteratorNext(iter))) {
+        if (open_svc && IOObjectIsEqualTo(s, open_svc)) ours = true;
+        IOObjectRelease(s);
+        removed = true;
+    }
+    if (open_svc) IOObjectRelease(open_svc);
     if (!removed) return;
     /* The removed service can no longer be asked what it was: see what is still attached. */
     bool audio, bootloader;
     scan_attached(&audio, &bootloader);
     bool was_published = device_published();
 
-    /* The box with firmware is gone: close everything that was open on it. */
-    if (!audio && atomic_load(&g_box_present)) {
+    /* The box with firmware is gone, or the device the driver has open is (a box that restarted, whose
+       new device arrived first): close everything that was open on it. */
+    if ((!audio || ours) && atomic_load(&g_box_present)) {
         LOG("Rane SL 2 USB disconnected");
-        atomic_store(&g_box_present, false);
+        if (!audio) atomic_store(&g_box_present, false);
         pthread_mutex_lock(&g_mutex);
         /* A client streaming: remember the decks' routing, to restore after a replug (g_resume_pending). */
         if (g_io_clients > 0 && atomic_load(&g_io_running)) {
             for (int d = 0; d < 2; d++) g_resume_thru[d] = g_st.thru[d] ? 1 : 0;
             g_resume_pending = true;
-            g_resume_window++;
             g_resume_since = mach_absolute_time();
         }
+        /* Any fallback still waiting belongs to a replug that has just ended: the next replug restores
+           the routing and waits again. */
+        g_resume_window++;
         usb_close_all();
         /* The device leaves the HAL's list with the box, and a client using it again after a
            replug sends a new StartIO: start counting clients from zero. */
@@ -2204,11 +2266,12 @@ static void on_usb_removed(void *refcon, io_iterator_t iter) {
         g_io_clients = 0;
         pthread_mutex_unlock(&g_mutex);
     }
-    /* Boot mode follows what is still attached (a box in its bootloader, or Rane's bootstrap, known
-       by its version); tell the HAL if the device left its list. */
-    bool loader = atomic_load(&g_box_present) &&
-                  (g_st.version_maj << 8 | g_st.version_min) == SL2_BOOTSTRAP_VERSION;
-    atomic_store(&g_boot_mode, bootloader || loader);
+    /* A box with firmware is still attached: open it (its arrival was handled while the old device was
+       still open). */
+    if (ours && audio) connect_box(0);
+    /* Boot mode follows what is still attached (a box in its bootloader, or the open box running Rane's
+       bootstrap); tell the HAL if the device left its list. */
+    atomic_store(&g_boot_mode, bootloader || (atomic_load(&g_box_present) && atomic_load(&g_bootstrap_open)));
     if (was_published != device_published()) notify_device_list_changed();
 }
 
@@ -2327,8 +2390,11 @@ static OSStatus SL2_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef 
         clk_reset();
         atomic_fetch_add(&g_zts_seed, 1);   /* new timeline for the HAL */
         /* Restart the stream at the new rate, or, with none running, just tell the box. */
-        if (was_streaming && !usb_open_all()) LOG("Could not restart streaming at %.0f Hz", g_sr);   /* sends 0x31 itself */
-        else if (usb_ensure_hid()) send_hw_samplerate((int)g_sr);
+        if (was_streaming) {
+            if (!usb_open_all()) LOG("Could not restart streaming at %.0f Hz", g_sr);   /* sends 0x31 itself */
+        } else if (usb_ensure_hid()) {
+            send_hw_samplerate((int)g_sr);
+        }
         LOG("Sample rate changed to %.0f Hz", g_sr);
     }
     pthread_mutex_unlock(&g_mutex);
@@ -2958,6 +3024,7 @@ static OSStatus get_property_data(AudioServerPlugInDriverRef d, AudioObjectID oi
                 /* The status packet: fill in the live fields (the HID code keeps the rest up to
                    date), then return a copy as CFData. */
                 pthread_mutex_lock(&g_mutex);
+                ST_LOCK();
                 g_st.connected = atomic_load(&g_hw_connected) ? 1 : 0;
                 g_st.streaming = atomic_load(&g_io_running) ? 1 : 0;
                 g_st.sample_rate = (uint32_t)g_sr;
@@ -2969,8 +3036,10 @@ static OSStatus get_property_data(AudioServerPlugInDriverRef d, AudioObjectID oi
                 g_st.early_read = atomic_load(&g_early_state);
                 g_st.hub_depth = atomic_load(&g_hub_depth);
                 g_st.in_dropouts = atomic_load(&g_in_dropouts);
+                SL2StatusPacket copy = g_st;
+                ST_UNLOCK();
                 pthread_mutex_unlock(&g_mutex);
-                *(CFDataRef*)outData = CFDataCreate(kCFAllocatorDefault, (const UInt8*)&g_st, sizeof(g_st));
+                *(CFDataRef*)outData = CFDataCreate(kCFAllocatorDefault, (const UInt8*)&copy, sizeof(copy));
                 *outSize = sizeof(CFDataRef);
                 return 0;
             }
@@ -3103,16 +3172,16 @@ static OSStatus dbg_command(const uint8_t *c, CFIndex len) {
     /* Every command needs at least its first argument byte, [5]. */
     if (len < 6) return kAudioHardwareBadPropertySizeError;
     switch (c[0]) {
-        case 0xF3:
+        case SL2_CMD_DBG_STALL:
             if (len < 7) return kAudioHardwareBadPropertySizeError;
             atomic_store(&dbg_stall_ms, ((uint32_t)c[5] << 8) | c[6]);
             DBG_LOG("DBG next capture completion stalls the USB queue for %u ms", atomic_load(&dbg_stall_ms));
             return 0;
-        case 0xF4:
+        case SL2_CMD_DBG_ERRPKTS:
             atomic_store(&dbg_err_pkts, c[5]);
             DBG_LOG("DBG next %u capture packets treated as errored", c[5]);
             return 0;
-        case 0xF5:
+        case SL2_CMD_DBG_NOEARLY:
             atomic_store(&dbg_no_early, c[5] != 0);
             DBG_LOG("DBG early capture read %{public}s", c[5] ? "off" : "on");
             return 0;
@@ -3145,9 +3214,9 @@ static OSStatus SL2_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
     if (oid == kObjDevice && addr->mSelector == kSL2PropHIDCommand) {
         if (inSize == sizeof(CFDataRef) && inData) {
             CFDataRef cd = *(CFDataRef*)inData;
-            /* Debug commands (0xF0 and up) are handled by the driver, never sent to the box. */
+            /* Debug commands (SL2_CMD_DEBUG_FIRST and up) are handled by the driver, never sent to the box. */
             if (cd && CFGetTypeID(cd) == CFDataGetTypeID() && CFDataGetLength(cd) >= 1 &&
-                CFDataGetBytePtr(cd)[0] >= 0xF0) {
+                CFDataGetBytePtr(cd)[0] >= SL2_CMD_DEBUG_FIRST) {
 #if SL2_DEBUG
                 return dbg_command(CFDataGetBytePtr(cd), CFDataGetLength(cd));
 #else
@@ -3214,6 +3283,11 @@ static OSStatus SL2_StartIO(AudioServerPlugInDriverRef d, AudioObjectID oid, UIn
     /* The first client starts the stream; if the box can't be opened, the client gets an error
        rather than silence on a timeline with no box behind it. */
     pthread_mutex_lock(&g_mutex);
+    if (g_io_clients >= IO_CLIENTS_MAX) {
+        pthread_mutex_unlock(&g_mutex);
+        LOG("StartIO refused: %d clients already running", IO_CLIENTS_MAX);
+        return kAudioHardwareUnspecifiedError;
+    }
     /* No IO is running yet, so a new stream starts at the current gain rather than ramping from
        the level the last one ended at. */
     if (g_io_clients == 0) vol_snap();
@@ -3222,21 +3296,24 @@ static OSStatus SL2_StartIO(AudioServerPlugInDriverRef d, AudioObjectID oid, UIn
         LOG("StartIO failed: the SL 2 could not be opened");
         return kAudioHardwareNotRunningError;
     }
-    /* Count the client; StopIO stops the stream when the last one leaves. */
-    g_io_clients++;
+    /* Count the client, by its ID; StopIO stops the stream when the last one leaves. */
+    g_io_cids[g_io_clients++] = cid;
     pthread_mutex_unlock(&g_mutex);
     return 0;
 }
 
 static OSStatus SL2_StopIO(AudioServerPlugInDriverRef d, AudioObjectID oid, UInt32 cid) {
-    /* The last client stops the stream and puts the decks back on analogue thru. The count is
-       already zero if the box was unplugged while streaming (on_usb_removed resets it). */
+    /* The last client stops the stream and puts the decks back on analogue thru. A client not
+       counted is one whose session ended with an unplug (on_usb_removed clears the clients): its
+       StopIO, however late, mustn't stop a stream started since the replug. */
     pthread_mutex_lock(&g_mutex);
-    if (g_io_clients > 0) {
-        g_io_clients--;
+    int at = -1;
+    for (UInt32 i = 0; i < g_io_clients; i++) if (g_io_cids[i] == cid) { at = (int)i; break; }
+    if (at >= 0) {
+        g_io_cids[at] = g_io_cids[--g_io_clients];
         if (g_io_clients == 0) usb_stop_streaming(true);
     } else {
-        LOG("StopIO with no client running (the box was unplugged while it streamed)");
+        LOG("StopIO from a client not running (its session ended when the box was unplugged)");
     }
     pthread_mutex_unlock(&g_mutex);
     return 0;

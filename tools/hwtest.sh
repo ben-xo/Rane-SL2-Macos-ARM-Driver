@@ -5,7 +5,8 @@
 # The tests run in the order that needs the fewest physical steps:
 #   1. with the box attached, nothing else: driver status, SL2Api as Serato calls it (both slices),
 #      sample-rate switching, the input safety offset setting, and the early capture read working;
-#   2. with --loopback (a cable from Left Deck Out L to Left Deck In L; the tests play clicks and a
+#   2. with --loopback (a cable from Left Deck Out L to Left Deck In L, or the channel in SL_LOOP_CH;
+#      the tests play clicks and a
 #      loud tone into that output, so pass it only when the cable is in): restarts, a glitch test,
 #      48 kHz, IO buffer sizes, the output volume and mute, the level meters, and in a debug build (installed with
 #      make install DEBUG=1) the glitch test under load, the early capture read and the fault hooks;
@@ -21,6 +22,8 @@ PANEL="$ROOT/sl2panel"
 APITEST="$ROOT/sl2apitest"
 DEV="SL 2"
 SUBSYS=com.rane.sl2
+LOOP=${SL_LOOP_CH:-1}               # the looped-back channel: 1 = Left deck L (the latency scripts read it too)
+OTHER=$(( LOOP % 2 ? LOOP + 1 : LOOP - 1 ))   # the other side of the same deck, which nothing plays to
 WAIT_S=${HWTEST_WAIT:-120}          # how long to wait for a physical step
 
 LOOPBACK=0; PHYSICAL=1
@@ -225,7 +228,7 @@ else
 
     # A 30 s glitch test with the Mac idle.
     running "glitch test (30 s)"
-    out=$("$B/sinetest" "$DEV" 1 1 30 128 | grep RESULT)
+    out=$("$B/sinetest" "$DEV" $LOOP $LOOP 30 128 | grep RESULT)
     echo "$out" | grep -q 'RESULT: 0 glitches, 0 level drops' && record PASS "glitch test, 30 s" || record FAIL "glitch test, 30 s" "$out"
 
     # Idle and with every core loaded, with the driver's counters: a debug build only.
@@ -240,8 +243,8 @@ else
     # 48 kHz: every click found, and a clean 10 s glitch test.
     running "48 kHz (about 20 s)"
     "$B/setrate" "$DEV" 48000 >/dev/null; sleep 1
-    lat=$("$B/rtlat" "$DEV" 1 1 4 128 | grep -E 'mean|not found' | head -1)
-    sine=$("$B/sinetest" "$DEV" 1 1 10 128 | grep RESULT)
+    lat=$("$B/rtlat" "$DEV" $LOOP $LOOP 4 128 | grep -E 'mean|not found' | head -1)
+    sine=$("$B/sinetest" "$DEV" $LOOP $LOOP 10 128 | grep RESULT)
     "$B/setrate" "$DEV" "$orig" >/dev/null
     if echo "$lat" | grep -q '(4/4 clicks)' && echo "$sine" | grep -q 'RESULT: 0 glitches, 0 level drops'; then
         record PASS "48 kHz" "$(echo "$lat" | grep -oE 'DVS round trip est\. [0-9.]+ ms')"
@@ -256,7 +259,7 @@ else
     for r in 44100 48000; do
         "$B/setrate" "$DEV" $r >/dev/null; sleep 1
         for buf in 32 45 48 64 128 256 512; do
-            lat=$("$B/rtlat" "$DEV" 1 1 4 $buf | grep -E 'mean|not found' | head -1)
+            lat=$("$B/rtlat" "$DEV" $LOOP $LOOP 4 $buf | grep -E 'mean|not found' | head -1)
             rt=$(echo "$lat" | grep -oE 'DVS round trip est\. [0-9.]+' | grep -oE '[0-9.]+$')
             echo "$lat" | grep -q '(4/4 clicks)' || { ok=0; rt="FAIL"; }
             detail="$detail $((r / 1000))k/$buf:${rt:-?}"
@@ -265,8 +268,8 @@ else
     "$B/setrate" "$DEV" "$orig" >/dev/null
     [ $ok = 1 ] && record PASS "IO buffer sizes" "round trip ms:$detail" || record FAIL "IO buffer sizes" "round trip ms:$detail"
 
-    # Output volume. With everything at 0 dB every click is found at full level; channel 1 at -20 dB
-    # brings them down 20 dB; channel 2 at -20 dB leaves channel 1 alone; the virtual main volume (the
+    # Output volume. With everything at 0 dB every click is found at full level; the looped-back channel at
+    # -20 dB brings them down 20 dB; the other channel of its deck at -20 dB leaves it alone; the virtual main volume (the
     # volume keys) at the slider position for -20 dB (0.6875 squared, by CoreAudio's standard volume
     # curve) sets the main volume to -20 dB, leaving the channels' own levels, and brings the clicks
     # down 20 dB; mute silences them. (rtlat reads quieter clicks a
@@ -277,18 +280,18 @@ else
         running "output volume and mute (about 30 s)"
         peak() { grep -oE 'peak [0-9.]+' | tail -1 | grep -oE '[0-9.]+$'; }
         db() { awk -v r="$1" -v a="$2" 'BEGIN { if (r > 0 && a > 0) printf "%.1f", 20 * log(a / r) / log(10); else print "none" }'; }
-        full=$("$B/rtlat" "$DEV" 1 1 3 128); ref=$(echo "$full" | peak)
-        "$B/volctl" "$DEV" -20 1 >/dev/null
-        ch1=$(db "$ref" "$("$B/rtlat" "$DEV" 1 1 3 128 | peak)")
-        "$B/volctl" "$DEV" 0 1 >/dev/null; "$B/volctl" "$DEV" -20 2 >/dev/null
-        ch2=$(db "$ref" "$("$B/rtlat" "$DEV" 1 1 3 128 | peak)")
-        "$B/volctl" "$DEV" 0 2 >/dev/null
+        full=$("$B/rtlat" "$DEV" $LOOP $LOOP 3 128); ref=$(echo "$full" | peak)
+        "$B/volctl" "$DEV" -20 $LOOP >/dev/null
+        ch1=$(db "$ref" "$("$B/rtlat" "$DEV" $LOOP $LOOP 3 128 | peak)")
+        "$B/volctl" "$DEV" 0 $LOOP >/dev/null; "$B/volctl" "$DEV" -20 $OTHER >/dev/null
+        ch2=$(db "$ref" "$("$B/rtlat" "$DEV" $LOOP $LOOP 3 128 | peak)")
+        "$B/volctl" "$DEV" 0 $OTHER >/dev/null
         keys=$("$B/volctl" "$DEV" main 0.47265625)
-        main=$(db "$ref" "$("$B/rtlat" "$DEV" 1 1 3 128 | peak)")
+        main=$(db "$ref" "$("$B/rtlat" "$DEV" $LOOP $LOOP 3 128 | peak)")
         "$B/volctl" "$DEV" 0 >/dev/null; "$B/volctl" "$DEV" mute >/dev/null
-        muted=$("$B/rtlat" "$DEV" 1 1 3 128 | grep -c 'not found')
+        muted=$("$B/rtlat" "$DEV" $LOOP $LOOP 3 128 | grep -c 'not found')
         neutral_volume
-        detail="channel 1 at -20 dB: $ch1 dB; channel 2 at -20 dB: channel 1 $ch2 dB; volume keys: $main dB ($keys); muted: $muted/3 clicks gone"
+        detail="channel $LOOP at -20 dB: $ch1 dB; channel $OTHER at -20 dB: channel $LOOP $ch2 dB; volume keys: $main dB ($keys); muted: $muted/3 clicks gone"
         if echo "$full" | grep -q '(3/3 clicks)' && [ "$muted" = 3 ] &&
            awk -v a="$ch1" -v b="$ch2" -v c="$main" 'BEGIN { exit !(a > -21 && a < -19 && b > -0.5 && b < 0.5 && c > -21 && c < -19) }' &&
            echo "$keys" | grep -qE '^volume -20(\.[0-9]*)? dB, channels 0 0 0 0 dB'; then
@@ -301,18 +304,18 @@ else
     fi
 
     # The level meters ('sl2m', which the control panel shows): while sinetest plays its 0.4 tone
-    # (-8 dB) on output 1, output 1 must read -8 dB +-1, input 1 must clearly get it (the loopback),
-    # and outputs 2-4, which nothing plays to, must be silent.
-    "$B/sinetest" "$DEV" 1 1 4 128 >/dev/null 2>&1 &
+    # (-8 dB) on the looped-back output, that output must read -8 dB +-1, its input must clearly get it
+    # (the loopback), and the other outputs, which nothing plays to, must be silent.
+    "$B/sinetest" "$DEV" $LOOP $LOOP 4 128 >/dev/null 2>&1 &
     sine=$!
     sleep 1.5
     m=$("$B/meters" "$DEV" 1.5)
     wait $sine
-    if awk -v m="$m" 'BEGIN {
+    if awk -v m="$m" -v lp=$LOOP 'BEGIN {
             gsub(/in |, out | dB/, " ", m); n = split(m, v, " ")
             if (n != 8) exit 1
-            for (i = 6; i <= 8; i++) if (v[i] != "-inf" && v[i] + 0 > -60) exit 1
-            exit !(v[5] + 0 > -9 && v[5] + 0 < -7 && v[1] != "-inf" && v[1] + 0 > -20) }'; then
+            for (i = 5; i <= 8; i++) if (i != 4 + lp && v[i] != "-inf" && v[i] + 0 > -60) exit 1
+            exit !(v[4 + lp] + 0 > -9 && v[4 + lp] + 0 < -7 && v[lp] != "-inf" && v[lp] + 0 > -20) }'; then
         record PASS "level meters" "$m"
     else
         record FAIL "level meters" "${m:-no reading}"
@@ -328,7 +331,7 @@ else
         for r in 44100 48000; do
             "$B/setrate" "$DEV" $r >/dev/null; sleep 1
             start=$(now)
-            "$B/sinetest" "$DEV" 1 1 3 128 >/dev/null 2>&1
+            "$B/sinetest" "$DEV" $LOOP $LOOP 3 128 >/dev/null 2>&1
             h=$(driver_log_since "$start" 'DBG capture packet sizes' | head -1 | sed -E 's/.*\): *//')
             detail="$detail $((r / 1000))k:${h:-none};"
             if [ $r = 44100 ]; then
@@ -352,7 +355,7 @@ else
         running "early capture read under a 20 ms stall (about 12 s)"
         start=$(now)
         ( sleep 3; "$B/sl2dbg" stall 20 >/dev/null ) &
-        sine=$("$B/sinetest" "$DEV" 1 1 10 64 | grep RESULT); wait
+        sine=$("$B/sinetest" "$DEV" $LOOP $LOOP 10 64 | grep RESULT); wait
         er=$(driver_log_since "$start" 'DBG early read result' | head -1)
         gap=$(driver_log_since "$start" 'Capture: [0-9]+ ms not captured' | head -1)
         diff=$(echo "$er" | grep -oE 'completion found [0-9]+ different' | grep -oE '[0-9]+')
@@ -371,7 +374,7 @@ else
     if [ $BUILD = debug ]; then
         set_ms=$("$PANEL" safety | grep -oE '[0-9]+(\.[0-9]+)? ms' | head -1 | cut -d' ' -f1)
         "$B/sl2dbg" noearly 1 >/dev/null
-        "$B/sinetest" "$DEV" 1 1 3 64 >/dev/null 2>&1
+        "$B/sinetest" "$DEV" $LOOP $LOOP 3 64 >/dev/null 2>&1
         "$B/sl2dbg" noearly 0 >/dev/null
         er=$(field 'Early Read'); safety=$(field 'Input Safety')
         "$PANEL" safety "$set_ms" >/dev/null
@@ -392,7 +395,7 @@ else
         for hook in "stall 100" "errpkts 20"; do
             start=$(now)
             ( sleep 3; "$B/sl2dbg" $hook >/dev/null ) &
-            sine=$("$B/sinetest" "$DEV" 1 1 10 128 | grep RESULT); wait
+            sine=$("$B/sinetest" "$DEV" $LOOP $LOOP 10 128 | grep RESULT); wait
             starts=$(driver_log_since "$start" 'Streaming started' | wc -l | tr -d ' ')
             if [ "$hook" = "stall 100" ]; then
                 name="fault hook: USB stall"

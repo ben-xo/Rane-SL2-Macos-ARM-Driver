@@ -11,35 +11,13 @@
 #import "SL2Passthrough.h"
 
 #ifndef SL2_VERSION
-#define SL2_VERSION  "1.4.0"
+#define SL2_VERSION  "1.4.1"
 #endif
 #define kSL2PropHIDCommand  'sl2h'
 #define kSL2PropStatus      'sl2s'
 #define kSL2PropInSafety    'sl2i'
 
-typedef struct {
-    uint32_t connected;
-    uint32_t streaming;
-    uint32_t sample_rate;
-    uint32_t version_maj;
-    uint32_t version_min;
-    uint8_t  serial[32];
-    uint8_t  phono[4];
-    uint8_t  thru[4];
-    uint8_t  port_a;
-    uint8_t  port_b;
-    uint64_t cap_frames;
-    uint64_t play_frames;
-    uint32_t boot_mode;      /* 1 = box is in its USB bootloader with no firmware loaded */
-    uint32_t debug_build;    /* 1 = the driver is a debug build; 0 also from a driver too old to say */
-    /* Input health (newer drivers; zero from an older one) */
-    uint32_t in_safety_us;          /* the input safety offset the HAL is using, in us */
-    uint32_t early_read;            /* 0 = not judged yet on this connection, 1 = working, 2 = not working */
-    uint32_t hub_depth;             /* USB hubs between the box and the Mac: 0 = connected directly */
-    uint64_t in_dropouts;           /* IO cycles in which input wasn't captured in time, since the device was
-                                       set up (the box connected, or the input safety offset changed) */
-    uint32_t usb_link;              /* the box's USB link: 2 = high speed, 1 = full speed (no audio), 0 = not known */
-} SL2StatusPacket;
+#include "SL2Status.h"
 
 static AudioObjectID find_hal_device(void) {
     AudioObjectPropertyAddress a = {
@@ -126,7 +104,7 @@ static void print_status(AudioObjectID dev) {
     printf("  Driver Build  : %s\n", s.debug_build ? "DEBUG" : "release");
     if (s.boot_mode) {
         /* In its bootloader, or running Rane's bootstrap (the EEPROM writer, which answers 1.02). */
-        if (s.version_maj == 1 && s.version_min == 2)
+        if (sl2_is_bootstrap(s.version_maj, s.version_min))
             printf("  Firmware      : NOT RUNNING — box is running Rane's firmware loader (1.02)\n");
         else
             printf("  Firmware      : NOT LOADED — box is in USB bootloader mode\n");
@@ -137,7 +115,7 @@ static void print_status(AudioObjectID dev) {
     printf("  Streaming I/O : %s\n", s.streaming ? "ACTIVE" : "IDLE");
     printf("  Sample Rate   : %u Hz\n", s.sample_rate);
     /* The box's own rate (0x30), which can differ from the driver's if the box has lost it. */
-    uint8_t rq[SL2_REPORT] = { 0x30 }, rr[SL2_REPORT];
+    uint8_t rq[SL2_REPORT] = { SL2_CMD_GET_RATE }, rr[SL2_REPORT];
     if (s.connected && sl2h_command(dev, rq, rr)) printf("  Box Rate      : %u Hz\n", (unsigned)(rr[5] << 8 | rr[6]));
     printf("  Firmware Ver  : %u.%02u\n", s.version_maj, s.version_min);
     if (s.usb_link) printf("  USB Link      : %s\n", s.usb_link == 2 ? "high speed" : "FULL SPEED (no audio: use a USB 2.0 port)");
