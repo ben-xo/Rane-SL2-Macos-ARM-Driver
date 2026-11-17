@@ -419,6 +419,9 @@ else
         record SKIP "fault hook: errored capture packets" "release build (make install DEBUG=1)"
     fi
     [ $have_volume = 1 ] && restore_volume
+    # With nothing streaming the deck is on analogue thru, which connects its input to its output inside
+    # the box: with the loopback cable still in, that is a feedback loop.
+    echo "   >>> Unplug the loopback cable now: with the deck on thru it makes a feedback loop."
 fi
 echo
 
@@ -445,17 +448,21 @@ else
     # The Mac sleeping and waking, with nothing playing: the box is suspended with the Mac and resumed
     # after it. A few seconds after the wake both decks must be on thru and the box's own rate (0x30,
     # sl2panel's Box Rate) the driver's: the driver's settle check puts them back if the box lost them
-    # (and logs it). The sleep is seen as a jump in the wall clock between two half-second polls.
+    # (and logs it). The sleep and the full wake are read from the power management log (pmset -g log):
+    # a short sleep can't be told from the wall clock, as the Mac runs processes again in a DarkWake
+    # a few seconds in, before the user wakes it.
     if pmset -g assertions 2>/dev/null | grep -qE '^ *PreventSystemSleep +1'; then
         record SKIP "thru and rate after the Mac sleeps" "something holds a PreventSystemSleep assertion (pmset -g assertions; Internet Sharing does)"
     else
+        pm_events() { pmset -g log | grep -E '^[0-9-]+ [0-9:]+ [+-][0-9]{4} (Sleep|Wake) {2,}' | cut -c27-31; }
+        sleeps0=$(pm_events | grep -c Sleep)
         start=$(now)
         echo "   >>> Put the Mac to sleep (Apple menu > Sleep). Wait about 15 s, then wake it."
-        t0=$(date +%s); slept=0
-        for i in $(seq 1 $((WAIT_S * 2))); do
-            sleep 0.5; t1=$(date +%s)
-            if [ $((t1 - t0)) -ge 8 ]; then slept=1; break; fi
-            t0=$t1
+        slept=0
+        for i in $(seq 1 $((WAIT_S / 2))); do
+            sleep 2; ev=$(pm_events)
+            # A sleep since the prompt, and the last event since then a full wake.
+            if [ "$(echo "$ev" | grep -c Sleep)" -gt "$sleeps0" ] && [ "$(echo "$ev" | tail -1)" = "Wake " ]; then slept=1; break; fi
         done
         if [ $slept = 0 ]; then
             record FAIL "thru and rate after the Mac sleeps" "no sleep seen within ${WAIT_S} s"
@@ -548,8 +555,5 @@ for r in "${RESULTS[@]}"; do
     case $s in PASS) pass=$((pass + 1)) ;; FAIL) fail=$((fail + 1)) ;; SKIP) skip=$((skip + 1)) ;; esac
 done
 echo "$pass passed, $fail failed, $skip skipped. Log: $LOG"
-# The decks end on analogue thru, which connects each deck's input to its output inside the box: with the
-# loopback cable still in, that is a feedback loop.
-[ $LOOPBACK = 1 ] && echo "Unplug the loopback cable now: with the deck on thru it makes a feedback loop."
 [ $fail = 0 ] && echo "PASS" || echo "FAIL"
 exit $([ $fail = 0 ] && echo 0 || echo 1)
