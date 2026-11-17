@@ -42,6 +42,21 @@ unless noted.
 | Deep schedule + early capture read, 48 kHz, release build | 64 / 128 frames | 2.8 ms | **8.9 / 11.6 ms** | none in a 30 s check, idle |
 | Deep schedule + early capture read, release build: Serato's 1 ms | **45 frames** | 2.8 ms | **8.3 ms** | none in 60 s idle and 150 s with six x264 encodes; no input dropouts |
 
+**Round trip by IO buffer size** (`make hwtest`, debug build, firmware 2.00, box behind two USB hubs;
+every click found at every size):
+
+| IO buffer (frames) | 32 | 45 | 48 | 64 | 128 | 256 | 512 |
+|---|---|---|---|---|---|---|---|
+| 44.1 kHz | 7.8 ms | 8.3 ms | 8.5 ms | 9.2 ms | 12.1 ms | 17.9 ms | 29.5 ms |
+| 48 kHz | 7.5 ms | 8.1 ms | 8.2 ms | 8.9 ms | 11.5 ms | 16.9 ms | 27.5 ms |
+
+**Capture packet sizes** (same run, 3 s at each rate): at 44.1 kHz 11,635 packets of 5 frames and 12,205
+of 6 (5.512 on average, for 5.5125); at 48 kHz 23,723 of 6, with 78 of 5 and 63 of 7 (0.6%), where the
+box corrects its clock.
+
+**Across a Mac sleep** (at 44.1 kHz, with nothing streaming) the box kept both decks on thru and its rate:
+the settle check found nothing to correct.
+
 **Serato's "USB buffer size" is the CoreAudio IO buffer size.** Serato DJ Pro (2.5.5, from its code) turns
 the setting into frames (1 ms is 45 frames at 44.1 kHz, after rounding to the device's alignment) and sets
 `kAudioDevicePropertyBufferFrameSize` through PortAudio, restarting its stream. It tells neither SL2Api
@@ -674,7 +689,8 @@ build; *(hook)* uses `tools/latency/bin/sl2dbg`.
       connect and after a USB resume; whether the SL 2 loses either is not yet known.
     - Fix: the settle check (Design, section 6), which logs any correction.
     - Test: `make hwtest`, "thru and rate after the Mac sleeps"; the log after a sleep shows whether the
-      box needed a correction. `19f00ce`.
+      box needed a correction. Seen on an SL 2 at 44.1 kHz: it kept both (the SL 3's firmware doesn't).
+      `19f00ce`.
 51. **`sl2flash` would take any blank FX2 for an SL 2, and kept no copy of the EEPROM it replaced.**
     - Fix: a blank FX2 (`04b4:8613`) only with `--blank-fx2`; the whole EEPROM is saved to
       `sl2-eeprom-backup-<date>.bin` before anything is written, and `sl2flash` stops if it can't save it.
