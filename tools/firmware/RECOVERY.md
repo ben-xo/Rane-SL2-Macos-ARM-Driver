@@ -58,15 +58,17 @@ The direct‑EEPROM reflash below fixes *all* of these and is the surest route, 
 ### You need
 - A Raspberry Pi (any with a 40‑pin header; the GPIO I²C is **3.3 V**, which matches)
 - A **SOIC‑8 test clip** + jumper wires
-- Your own copy of the official **Serato Scratch Live** installer (for the firmware),
-  from <https://serato.com/scratchlive/downloads/mac>
+- Your own copy of one of Rane's SL 2 drivers for the firmware (`README.md` says where to get
+  them): `SL2-2.0.1f2.zip` (firmware 2.00) or the **Serato Scratch Live** installer (1.10)
 
 ### Step 1 — build the firmware image (on a Mac, from your own driver copy)
-Mount the Scratch Live installer DMG, then:
+Unzip `SL2-2.0.1f2.zip` and give the extractor its `SL2.pkg`, or mount the Scratch Live
+installer DMG and give it the volume:
 ```
+python3 extract-sl2-firmware.py SL2-2.0.1f2/SL2.pkg .
 python3 extract-sl2-firmware.py "/Volumes/ScratchLive Installer" .
 ```
-This expands `Rane Device Drivers/SL2/SL2 1.0.1f4.pkg`, pulls the two firmware images out
+This expands Rane's package, pulls the two firmware images out
 of `SL2Api.framework`, XOR‑deobfuscates them, and writes **`eeprom-image-24lc512.bin`**
 (65 536 bytes) — the exact contents a healthy EEPROM holds (C2 boot header + firmware).
 It self‑checks the Rane header and CRC, so a wrong/garbled extract fails loudly.

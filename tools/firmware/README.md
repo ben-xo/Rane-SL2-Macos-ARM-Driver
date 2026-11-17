@@ -6,9 +6,17 @@ EEPROM is blank or corrupt the box comes up in the FX2 USB bootloader ("Unnamed 
 `bcdDevice 0x0000`) and passes no audio until firmware is written again; a healthy box runs
 as "Rane SL 2", `bcdDevice 0x0100`.
 
-The firmware is Rane's and is **not** included here. You extract it from **your own** copy of
-the official Serato Scratch Live driver with `extract-sl2-firmware.py`; `.gitignore` keeps the
-extracted images out of the repo.
+The firmware is Rane's and is **not** included here. You extract it with
+`extract-sl2-firmware.py` from **your own** copy of one of Rane's drivers; `.gitignore` keeps the
+extracted images out of the repo:
+
+- **Firmware 2.00** (the newest): Rane's last SL 2 driver for Mac, `SL2-2.0.1f2.zip`. Rane no
+  longer hosts it; the Internet Archive keeps a copy,
+  <https://web.archive.org/web/20170722091911/http://dj.rane.com/files/product-downloads/SL2-2.0.1f2.zip>
+  (SHA-256 `00e7ebe5a8d22617725ab52a8ee4922b6b88df16823cbaf12dfcd86398c328de`). Serato DJ Pro 2.5.5
+  bundles the same package.
+- **Firmware 1.10**: the free Serato Scratch Live download for Mac,
+  <https://serato.com/scratchlive/downloads/mac> (needs a free Serato account).
 
 ## Two ways to write it
 
@@ -29,7 +37,8 @@ extracted images out of the repo.
   produced over USB to test it.
 
 `Installer/Firmware-SL2.command` wraps the over-USB flow (download → extract → install →
-check → flash, asking before it writes). It runs from a checkout of this repository, not from
+check → flash, asking before it writes). It downloads Rane's 2.0.1f2 zip from the Internet
+Archive, and falls back to a Scratch Live download in `~/Downloads` when it can't. It runs from a checkout of this repository, not from
 the installer zip.
 
 ## Usage
@@ -58,7 +67,7 @@ after a flash; both on = running.
 ## Files
 - `extract-sl2-firmware.py` — de-obfuscate the firmware out of your own copy of
   SL2Api.framework (Mac): Rane's SL2 driver package 1.0.1f4 or 1.0.3f1 (firmware 1.10) or
-  2.0.1f2 (firmware 2.00, bundled with Serato DJ Pro 2.5.5), the SL2Api binary, or a folder
+  2.0.1f2 (firmware 2.00, in `SL2-2.0.1f2.zip`), the SL2Api binary, or a folder
   holding either. It checks each image against the SHA-256 of the known build. Produces
   `eeprom-image-24lc512.bin` (for the Pi reflash and for `sl2dump --verify`) plus the
   bootstrap and final images (for `sl2flash`).
