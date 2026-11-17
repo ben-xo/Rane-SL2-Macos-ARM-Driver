@@ -1675,11 +1675,13 @@ static dispatch_queue_t usb_queue_create(void) {
 }
 
 /* Open the box's interface ifnum (its bInterfaceNumber) if it is there and nobody else holds it. *there
-   says whether it is there at all; *err gets why the open failed. */
+   says whether it is there at all; if the open fails, *err gets why and *holder (if given) the name of
+   the client holding the interface (its UsbExclusiveOwner), or nil if nobody does. */
 static bool g_hid_reconfigured;   /* usb_ensure_hid has set the configuration again for this device */
-static IOUSBHostInterface *usb_open_interface(int ifnum, bool *there, NSError **err) {
+static IOUSBHostInterface *usb_open_interface(int ifnum, bool *there, NSString **holder, NSError **err) {
     IOUSBHostInterface *found = nil;
     *there = false;
+    if (holder) *holder = nil;
     io_iterator_t it = 0;
     IORegistryEntryGetChildIterator(g_dev.ioService, kIOServicePlane, &it);
     io_service_t ch;
@@ -1693,6 +1695,11 @@ static IOUSBHostInterface *usb_open_interface(int ifnum, bool *there, NSError **
                 *there = true;
                 found = [[IOUSBHostInterface alloc] initWithIOService:ch options:IOUSBHostObjectInitOptionsNone
                                                                 queue:g_q error:err interestHandler:nil];
+                if (!found && holder) {
+                    CFTypeRef o = IORegistryEntryCreateCFProperty(ch, CFSTR("UsbExclusiveOwner"), kCFAllocatorDefault, 0);
+                    if (o && CFGetTypeID(o) == CFStringGetTypeID()) *holder = (__bridge_transfer NSString *)o;
+                    else if (o) CFRelease(o);
+                }
             }
         }
         IOObjectRelease(ch);
@@ -1735,14 +1742,18 @@ static bool usb_ensure_hid(void) {
        ones aren't offered to anyone. */
     if (!g_hid) {
         bool there = false;
-        g_hid = usb_open_interface(IF_HID, &there, &e);
-        if (!g_hid && there && !g_hid_reconfigured) {
+        NSString *holder = nil;
+        g_hid = usb_open_interface(IF_HID, &there, &holder, &e);
+        if (!g_hid && holder && !g_hid_reconfigured) {
             g_hid_reconfigured = true;
-            LOG("The SL 2's HID interface is held by another driver: setting the box's configuration again");
+            LOG("The SL 2's HID interface is held by %{public}@ (%{public}@): setting the box's configuration again",
+                holder, e.localizedFailureReason ?: e.localizedDescription);
             [g_dev configureWithValue:0 matchInterfaces:NO error:&e];
             [g_dev configureWithValue:1 matchInterfaces:NO error:&e];
-            g_hid = usb_open_interface(IF_HID, &there, &e);
+            g_hid = usb_open_interface(IF_HID, &there, &holder, &e);
         }
+        if (!g_hid && there)
+            LOG("Could not open the SL 2's HID interface: %{public}@", e.localizedFailureReason ?: e.localizedDescription);
         if (!g_hid) return false;
     }
 
@@ -1817,8 +1828,8 @@ static bool usb_open_all(void) {
 
     /* Claim the playback and capture interfaces. */
     bool there = false;
-    if (!g_play) g_play = usb_open_interface(IF_PLAY, &there, &e);
-    if (!g_cap)  g_cap  = usb_open_interface(IF_CAP, &there, &e);
+    if (!g_play) g_play = usb_open_interface(IF_PLAY, &there, NULL, &e);
+    if (!g_cap)  g_cap  = usb_open_interface(IF_CAP, &there, NULL, &e);
     if (!g_play || !g_cap) {
         LOG("Failed to claim Play/Cap interfaces");
         usb_release_audio();
