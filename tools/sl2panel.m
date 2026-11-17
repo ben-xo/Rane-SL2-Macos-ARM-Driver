@@ -17,29 +17,7 @@
 #define kSL2PropStatus      'sl2s'
 #define kSL2PropInSafety    'sl2i'
 
-typedef struct {
-    uint32_t connected;
-    uint32_t streaming;
-    uint32_t sample_rate;
-    uint32_t version_maj;
-    uint32_t version_min;
-    uint8_t  serial[32];
-    uint8_t  phono[4];
-    uint8_t  thru[4];
-    uint8_t  port_a;
-    uint8_t  port_b;
-    uint64_t cap_frames;
-    uint64_t play_frames;
-    uint32_t boot_mode;      /* 1 = box is in its USB bootloader with no firmware loaded */
-    uint32_t debug_build;    /* 1 = the driver is a debug build; 0 also from a driver too old to say */
-    /* Input health (newer drivers; zero from an older one) */
-    uint32_t in_safety_us;          /* the input safety offset the HAL is using, in us */
-    uint32_t early_read;            /* 0 = not judged yet on this connection, 1 = working, 2 = not working */
-    uint32_t hub_depth;             /* USB hubs between the box and the Mac: 0 = connected directly */
-    uint64_t in_dropouts;           /* IO cycles in which input wasn't captured in time, since the device was
-                                       set up (the box connected, or the input safety offset changed) */
-    uint32_t usb_link;              /* the box's USB link: 2 = high speed, 1 = full speed (no audio), 0 = not known */
-} SL2StatusPacket;
+#include "SL2Status.h"
 
 static AudioObjectID find_hal_device(void) {
     AudioObjectPropertyAddress a = {

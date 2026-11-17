@@ -2,7 +2,7 @@
 // connection, firmware and driver versions, sample rate, latency, each deck's analogue thru and the
 // CD/PHONO (line/phono) switch, the decks' input and output levels, and the output volume. It talks to the
 // SL2Device HAL plug-in through CoreAudio, as sl2panel does:
-//   'sl2s'  the driver's status (SL2StatusPacket, SL2Status.h)
+//   'sl2s'  the driver's status (SL2StatusPacket, plugin/SL2Status.h)
 //   'sl2h'  a 64-byte HID command to the box; reading it back returns the box's reply
 //   'sl2m'  the peak level of each input and output channel since the last read
 //   'sl2i'  the input safety offset setting, in microseconds (set with nothing streaming)

@@ -13,7 +13,7 @@ trap 'rm -rf "$TMP"' EXIT
 # Compile each architecture, then join them.
 for arch in arm64 x86_64; do
     swiftc -O -parse-as-library -target "$arch-apple-macos13.0" \
-        -import-objc-header "$HERE/SL2Status.h" \
+        -import-objc-header "$HERE/../../plugin/SL2Status.h" \
         "$HERE/SL2ControlPanel.swift" -o "$TMP/SL2ControlPanel-$arch"
 done
 
