@@ -19,6 +19,7 @@
 #define SL2_REPORT        64
 #define SL2_EEPROM_SIZE   0x10000
 #define SL2_EEPROM_BLOCK  32      /* bytes per 0x02 write / 0x03 read */
+#define SL2_CMD_GET_RATE  0x30    /* the box's sample rate: reply [5..6], big-endian */
 
 /* The SL 2's HAL device, or kAudioObjectUnknown if the driver is not loaded. The device exists
    whenever the driver is loaded, whether or not a box is connected. */

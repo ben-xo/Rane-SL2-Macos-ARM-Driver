@@ -137,7 +137,7 @@ static void print_status(AudioObjectID dev) {
     printf("  Streaming I/O : %s\n", s.streaming ? "ACTIVE" : "IDLE");
     printf("  Sample Rate   : %u Hz\n", s.sample_rate);
     /* The box's own rate (0x30), which can differ from the driver's if the box has lost it. */
-    uint8_t rq[SL2_REPORT] = { 0x30 }, rr[SL2_REPORT];
+    uint8_t rq[SL2_REPORT] = { SL2_CMD_GET_RATE }, rr[SL2_REPORT];
     if (s.connected && sl2h_command(dev, rq, rr)) printf("  Box Rate      : %u Hz\n", (unsigned)(rr[5] << 8 | rr[6]));
     printf("  Firmware Ver  : %u.%02u\n", s.version_maj, s.version_min);
     if (s.usb_link) printf("  USB Link      : %s\n", s.usb_link == 2 ? "high speed" : "FULL SPEED (no audio: use a USB 2.0 port)");
