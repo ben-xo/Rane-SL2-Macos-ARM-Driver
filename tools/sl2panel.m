@@ -8,9 +8,10 @@
 #import <CoreAudio/CoreAudio.h>
 #import <IOKit/IOKitLib.h>
 #import <IOKit/usb/IOUSBLib.h>
+#import "SL2Passthrough.h"
 
 #ifndef SL2_VERSION
-#define SL2_VERSION  "1.3.0"
+#define SL2_VERSION  "1.4.0"
 #endif
 #define kSL2PropHIDCommand  'sl2h'
 #define kSL2PropStatus      'sl2s'
@@ -37,6 +38,7 @@ typedef struct {
     uint32_t hub_depth;             /* USB hubs between the box and the Mac: 0 = connected directly */
     uint64_t in_dropouts;           /* IO cycles in which input wasn't captured in time, since the device was
                                        set up (the box connected, or the input safety offset changed) */
+    uint32_t usb_link;              /* the box's USB link: 2 = high speed, 1 = full speed (no audio), 0 = not known */
 } SL2StatusPacket;
 
 static AudioObjectID find_hal_device(void) {
@@ -123,14 +125,22 @@ static void print_status(AudioObjectID dev) {
     printf("  USB Connected : %s\n", s.connected ? "YES" : "NO");
     printf("  Driver Build  : %s\n", s.debug_build ? "DEBUG" : "release");
     if (s.boot_mode) {
-        printf("  Firmware      : NOT LOADED — box is in USB bootloader mode\n");
+        /* In its bootloader, or running Rane's bootstrap (the EEPROM writer, which answers 1.02). */
+        if (s.version_maj == 1 && s.version_min == 2)
+            printf("  Firmware      : NOT RUNNING — box is running Rane's firmware loader (1.02)\n");
+        else
+            printf("  Firmware      : NOT LOADED — box is in USB bootloader mode\n");
         printf("                  the box needs its firmware restored\n");
         printf("==================================================\n");
         return;
     }
     printf("  Streaming I/O : %s\n", s.streaming ? "ACTIVE" : "IDLE");
     printf("  Sample Rate   : %u Hz\n", s.sample_rate);
+    /* The box's own rate (0x30), which can differ from the driver's if the box has lost it. */
+    uint8_t rq[SL2_REPORT] = { 0x30 }, rr[SL2_REPORT];
+    if (s.connected && sl2h_command(dev, rq, rr)) printf("  Box Rate      : %u Hz\n", (unsigned)(rr[5] << 8 | rr[6]));
     printf("  Firmware Ver  : %u.%02u\n", s.version_maj, s.version_min);
+    if (s.usb_link) printf("  USB Link      : %s\n", s.usb_link == 2 ? "high speed" : "FULL SPEED (no audio: use a USB 2.0 port)");
     printf("  Serial Number : %s\n", s.serial[0] ? (const char *)s.serial : "N/A");
     printf("  Deck 1 Input  : %s  |  Mode: %s\n", s.phono[0] ? "PHONO" : "LINE ", s.thru[0] ? "ANALOG THRU" : "USB AUDIO");
     printf("  Deck 2 Input  : %s  |  Mode: %s\n", s.phono[1] ? "PHONO" : "LINE ", s.thru[1] ? "ANALOG THRU" : "USB AUDIO");

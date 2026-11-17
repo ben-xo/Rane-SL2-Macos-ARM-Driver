@@ -7,6 +7,7 @@ S=$(dirname "$0")
 B="$S/bin"                                   # built by: make latency
 DEV=${SL_DEVICE:-SL 2}                       # CoreAudio device name (substring)
 SUBSYS=${SL_LOG_SUBSYSTEM:-com.rane.sl2}     # the driver's os_log subsystem
+LOOP=${SL_LOOP_CH:-1}                        # the looped-back channel: 1 = Left deck L (Out to In)
 SECS=${1:?usage: dptest.sh <seconds>}
 NCPU=$(sysctl -n hw.ncpu)
 fail=0
@@ -19,7 +20,7 @@ for load in idle loaded; do
     echo "=== $load, $SECS s"
 
     # The glitch test itself.
-    out=$("$B/sinetest" "$DEV" 1 1 "$SECS" 128)
+    out=$("$B/sinetest" "$DEV" "$LOOP" "$LOOP" "$SECS" 128)
     echo "$out" | grep -E 'RESULT|glitch at|level drop|not found' | head -8
     echo "$out" | grep -q 'RESULT: 0 glitches, 0 level drops' || fail=1
     [ ${#pids[@]} -gt 0 ] && { kill "${pids[@]}" 2>/dev/null; wait 2>/dev/null; }

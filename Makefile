@@ -21,7 +21,7 @@ api:
 	$(CC) $(ARCH) -dynamiclib $(CFLAGS) -install_name /Library/Frameworks/SL2Api.framework/Versions/A/SL2Api -current_version $(VERSION) -compatibility_version 1.0.0 -framework Foundation -framework CoreAudio -framework IOKit tools/SL2Api.m -o SL2Api
 
 panel:
-	$(CC) $(ARCH) $(CFLAGS) -framework Foundation -framework CoreAudio -framework IOKit tools/sl2panel.m -o sl2panel
+	$(CC) $(ARCH) $(CFLAGS) -framework Foundation -framework CoreAudio -framework IOKit tools/sl2panel.m tools/SL2Passthrough.m -o sl2panel
 
 dump:
 	$(CC) $(ARCH) $(CFLAGS) -framework Foundation -framework CoreAudio tools/sl2dump.m tools/SL2Passthrough.m -o sl2dump
@@ -30,7 +30,7 @@ dump:
 controlpanel:
 	tools/controlpanel/build-app.sh
 
-# the installer package and download zip, built into build/ (VERSION=x.y.z, default 1.3.0)
+# the installer package and download zip, built into build/ (VERSION=x.y.z, default 1.4.0)
 package:
 	Installer/build-pkg.sh $(VERSION)
 

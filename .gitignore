@@ -11,3 +11,5 @@
 /sl2apitest
 /SL 2 Control Panel.app/
 /build/
+# sl2flash's EEPROM backups hold Rane's firmware
+sl2-eeprom-backup-*.bin

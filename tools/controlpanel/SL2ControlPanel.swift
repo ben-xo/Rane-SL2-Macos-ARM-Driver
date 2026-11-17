@@ -23,6 +23,9 @@ enum SL2Driver {
 
     static let vendorID = 0x1cc5
     static let productID = 0x0013
+    /// The newest SL 2 firmware known: 2.00, the image in Rane's last driver (SL2Api 2.0.1f2); sl2flash
+    /// installs it (tools/firmware/README.md). Rane's earlier drivers carry 1.10.
+    static let latestFirmware = (major: 2, minor: 0)
 
     // HID: command 0x41 carries MIDI-style messages; Note On / Note Off of these notes switch a
     // deck's thru on / off (docs/SL2-COMMANDS.md).
@@ -171,6 +174,9 @@ enum SL2Driver {
         AudioObjectSetPropertyData(dev, &addr, 0, nil, UInt32(MemoryLayout<UInt32>.size), &value)
     }
 
+    /// System Settings' Sound pane, where the SL 2 can be chosen as the input device.
+    static let soundSettings = URL(string: "x-apple.systempreferences:com.apple.Sound-Settings.extension")
+
     /// Audio MIDI Setup, where each output channel's volume is set.
     static let audioMIDISetup = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.audio.AudioMIDISetup")
 
@@ -219,9 +225,11 @@ struct BoxState: Equatable {
     var streaming: Bool
     var sampleRate: Int
     var firmware: String
+    var firmwareOutdated: Bool   // older than SL2Driver.latestFirmware
     var serial: String
     var phono: Bool
     var thru: [Bool]
+    var fullSpeed: Bool      // connected at USB full speed, which carries no audio
     var outputLatencyMs: Double
     var inputLatencyMs: Double
     var volume: Volume?      // the main output volume; nil if none
@@ -326,9 +334,12 @@ final class PanelModel: ObservableObject {
             streaming: s.streaming != 0,
             sampleRate: Int(s.sample_rate),
             firmware: s.version_maj == 0 && s.version_min == 0 ? "—" : String(format: "%u.%02u", s.version_maj, s.version_min),
+            firmwareOutdated: (s.version_maj != 0 || s.version_min != 0) &&
+                (Int(s.version_maj), Int(s.version_min)) < SL2Driver.latestFirmware,
             serial: serial.isEmpty ? "—" : serial,
             phono: s.phono.0 != 0,
             thru: [s.thru.0 != 0, s.thru.1 != 0],
+            fullSpeed: s.usb_link == 1,
             outputLatencyMs: Double(SL2Driver.latencyFrames(dev, kAudioObjectPropertyScopeOutput)) * 1000 / rate,
             inputLatencyMs: Double(SL2Driver.latencyFrames(dev, kAudioObjectPropertyScopeInput)) * 1000 / rate,
             volume: volume.map { BoxState.Volume(scalar: $0.scalar, db: $0.db) },
@@ -524,7 +535,15 @@ struct PanelView: View {
     private func boxSections(_ box: BoxState) -> some View {
         Section("Rane SL 2") {
             LabeledContent("Status", value: box.streaming ? "Connected, streaming audio" : "Connected")
-            LabeledContent("Firmware", value: box.firmware)
+            // The firmware in red if it's older than the newest known, which is shown beside it.
+            LabeledContent("Firmware") {
+                if box.firmwareOutdated {
+                    (Text(box.firmware).foregroundColor(.red) +
+                     Text(String(format: " (latest known: %d.%02d)", SL2Driver.latestFirmware.major, SL2Driver.latestFirmware.minor)))
+                } else {
+                    Text(box.firmware)
+                }
+            }
             LabeledContent("Serial number", value: box.serial)
             LabeledContent("Driver", value: model.driverVersion ?? "—")
             if let input = box.input {
@@ -582,10 +601,15 @@ struct PanelView: View {
         us % 1000 == 0 ? "\(us / 1000) ms" : String(format: "%.1f ms", Double(us) / 1000)
     }
 
-    /// What the panel warns about: input the driver couldn't read early, and input dropouts.
+    /// What the panel warns about: a full-speed USB connection, input the driver couldn't read early,
+    /// and input dropouts.
     static func warnings(_ box: BoxState) -> [String] {
-        guard let input = box.input else { return [] }
         var w: [String] = []
+        // At full speed the box enumerates without its audio interfaces.
+        if box.fullSpeed {
+            w.append("The SL 2 is connected at USB full speed, which carries no audio. Connect it to a USB 2.0 (high-speed) port.")
+        }
+        guard let input = box.input else { return w }
         // Where the early read doesn't work, input can drop out below 8 ms (completion delivery).
         if input.earlyRead == 2 && input.safetyUs < 8000 {
             w.append("Input can't be read early on this Mac, so it can drop out at \(ms(input.safetyUs)). Set the input safety offset to 8 ms.")
@@ -607,6 +631,16 @@ struct PanelView: View {
         return text
     }
 
+    /// Over the input meters while no app is using the SL 2: there is nothing to measure then (the decks are
+    /// on thru and the box sends no audio), so say how to make them move, with "Sound Settings" a link to it.
+    private var inputsIdleNote: AttributedString {
+        var text = AttributedString("Choose the SL 2 as your input device in ")
+        var pane = AttributedString("Sound Settings")
+        if let url = SL2Driver.soundSettings { pane.link = url }
+        text.append(pane)
+        return text
+    }
+
     /// The right column: any warnings, the input and output levels, and the output volume.
     @ViewBuilder
     private func levelSections(_ box: BoxState) -> some View {
@@ -621,12 +655,28 @@ struct PanelView: View {
             }
         }
         Section {
-            DeckMeterRow(meters: model.meters, name: Self.deckNames[0], left: 0, right: 1)
-            DeckMeterRow(meters: model.meters, name: Self.deckNames[1], left: 2, right: 3)
+            // The meters as one block (a VStack, or the overlay would collapse the rows into one),
+            // greyed out with a note over them while nothing streams.
+            VStack(spacing: 12) {
+                DeckMeterRow(meters: model.meters, name: Self.deckNames[0], left: 0, right: 1)
+                DeckMeterRow(meters: model.meters, name: Self.deckNames[1], left: 2, right: 3)
+            }
+            .padding(.vertical, 4)
+            .opacity(box.streaming ? 1 : 0.3)
+            .overlay {
+                if !box.streaming {
+                    Text(inputsIdleNote)
+                        .font(.callout)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 12)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                }
+            }
         } header: {
             Text("Inputs")
         } footer: {
-            Text("The level of each deck's input, left and right, while an app is using the SL 2. With nothing using it the decks are on thru, and the box sends the computer no audio.")
+            Text("The level of each deck's input, left and right, while an app is using the SL 2 (as its input or output device). With nothing using it the decks are on thru, and the box sends the computer no audio.")
                 .foregroundStyle(.secondary)
         }
         Section {

@@ -24,8 +24,9 @@ extracted images out of the repo.
 
   Tested on hardware: rewriting a running box, and recovering a box from bootloader mode both
   by re-marking an intact EEPROM bootable and by a full rewrite. Not tested: a box with a
-  blank EEPROM (the Cypress default device, `04b4:8613`), which `sl2flash` accepts but which
-  can't be produced over USB to test it.
+  blank EEPROM (the Cypress default device, `04b4:8613`), which `sl2flash` accepts only with
+  `--blank-fx2` (any other device built on a blank FX2 shows up the same) and which can't be
+  produced over USB to test it.
 
 `Installer/Firmware-SL2.command` wraps the over-USB flow (download → extract → install →
 check → flash, asking before it writes). It runs from a checkout of this repository, not from
@@ -36,12 +37,17 @@ the installer zip.
 ```
 make flash dump
 ./sl2flash --dry-run                # check the images and the box; change nothing
+./sl2flash --backup-only            # save the EEPROM to sl2-eeprom-backup-<date>.bin; change nothing
 ./sl2flash                          # write the firmware if the EEPROM doesn't already hold it
 ./sl2dump --verify eeprom-image-24lc512.bin   # independent check of a running box's EEPROM
 ```
 
 `sl2flash` reads the images from `/Library/Audio/Plug-Ins/HAL/SL2Device.firmware` (where
-`sl2-firmware-install.sh` puts them), or from `--firmware DIR`. It needs no root. Stop any
+`sl2-firmware-install.sh` puts them), or from `--firmware DIR`. It needs no root. Before it
+writes anything it saves the whole EEPROM to `sl2-eeprom-backup-<date>.bin` in the current
+directory (and stops if it can't); that file holds Rane's firmware, so keep it out of any
+repository. It doesn't write firmware older than the box is running (Rane's 2.0.1f2 driver
+carries 2.00, the Scratch Live driver 1.10) unless given `--force`. Stop any
 audio on the SL 2 and quit sl2panel and Serato first: they talk to the box through the same
 driver channel.
 
@@ -51,8 +57,11 @@ after a flash; both on = running.
 
 ## Files
 - `extract-sl2-firmware.py` — de-obfuscate the firmware out of your own copy of
-  SL2Api.framework (Mac); produces `eeprom-image-24lc512.bin` (for the Pi reflash and for
-  `sl2dump --verify`) plus the bootstrap and final images (for `sl2flash`).
+  SL2Api.framework (Mac): Rane's SL2 driver package 1.0.1f4 or 1.0.3f1 (firmware 1.10) or
+  2.0.1f2 (firmware 2.00, bundled with Serato DJ Pro 2.5.5), the SL2Api binary, or a folder
+  holding either. It checks each image against the SHA-256 of the known build. Produces
+  `eeprom-image-24lc512.bin` (for the Pi reflash and for `sl2dump --verify`) plus the
+  bootstrap and final images (for `sl2flash`).
 - `pi/pi-eeprom-24lc512.py` — safety-gated read / write / verify of the EEPROM from a Pi.
 - `sl2flash.m` — the over-USB flasher.
 - `sl2-firmware-install.sh` — install firmware images next to the HAL driver for `sl2flash`.

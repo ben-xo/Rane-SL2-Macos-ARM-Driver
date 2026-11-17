@@ -7,11 +7,11 @@ with no glitches under load. See `docs/SL2-AUDIO-ENGINE.md`.
 
 They are written for the SL 2 driver, but they are a model for testing the SL 3 and SL 4 drivers. The
 measurement tools work with any CoreAudio device. `dptest.sh`, `restartcheck.sh` and `logq.sh` take the
-device name and the driver's log subsystem from two environment variables (the other tools take the device
-name as an argument):
+device name, the driver's log subsystem and the looped-back channel (`SL_LOOP_CH`, default 1) from
+environment variables (the other tools take the device name and channels as arguments):
 
 ```
-SL_DEVICE="SL 3" SL_LOG_SUBSYSTEM=com.rane.sl3 tools/latency/restartcheck.sh
+SL_DEVICE="SL 3" SL_LOG_SUBSYSTEM=com.rane.sl3 SL_LOOP_CH=3 tools/latency/restartcheck.sh
 ```
 
 The log lines the scripts look for are the SL 2 driver's, so they need adapting for another driver.
@@ -23,6 +23,10 @@ The log lines the scripts look for are the SL 2 driver's, so they need adapting 
    the tools send clicks and a loud tone into it.
 3. Set the box's LINE/PHONO switch to **LINE**. A line-level signal into the phono preamp clips, and the
    glitch test then reports a glitch at its first analysed sample.
+
+   Unplug the cable when the tests are done. With nothing streaming the deck is on analogue thru, which
+   connects its input to its output inside the box: with the cable in, that is a feedback loop (on an
+   SL 3 it set the box's overload light).
 4. Install the driver build under test: `make install` (add `DEBUG=1` for the driver's counters and
    `sl2dbg`), which builds it and runs `sudo tools/install-sl2.sh`. The script replaces the binary inside
    the installed driver, so the release package (`Installer/RaneSL2-macOS-Universal.pkg`) must be
@@ -38,11 +42,13 @@ fewest physical steps:
 1. with only the box attached: the driver's status, SL2Api as Serato DJ Pro 2.5.5 calls it (`sl2apitest`,
    both slices), and sample-rate switching;
 2. with `ARGS="--loopback"`, which says the loopback cable is in (the tests play clicks and a loud tone
-   into Left Deck Out): `restartcheck.sh`, a 30 s glitch test, 48 kHz, the output volume and mute
-   (it puts your volume and mute back afterwards), the level meters, and with a debug build `dptest.sh`
-   and the `sl2dbg` fault hooks (a USB stall, errored capture packets);
-3. steps for someone at the box: flipping the LINE/PHONO switch, and unplugging and replugging while idle
-   and while a (silent) stream runs. The script prints each step and waits until it sees the change, so
+   into Left Deck Out): `restartcheck.sh`, a 30 s glitch test, 48 kHz, IO buffer sizes from 32 to 512
+   frames at both rates (recording the round trip at each), the output volume and mute (it puts your
+   volume and mute back afterwards), the level meters, and with a debug build `dptest.sh`, the capture
+   packet sizes at both rates and the `sl2dbg` fault hooks (a USB stall, errored capture packets);
+3. steps for someone at the box: flipping the LINE/PHONO switch, sleeping and waking the Mac (both decks
+   must be back on thru and the box at the driver's rate), and unplugging and replugging while idle and
+   while a (silent) stream runs. The script prints each step and waits until it sees the change, so
    nothing needs typing. `ARGS="--no-physical"` skips them.
 
 Run it in a Terminal window, so the steps show as they come up. A release build skips the tests that

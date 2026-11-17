@@ -42,6 +42,21 @@ unless noted.
 | Deep schedule + early capture read, 48 kHz, release build | 64 / 128 frames | 2.8 ms | **8.9 / 11.6 ms** | none in a 30 s check, idle |
 | Deep schedule + early capture read, release build: Serato's 1 ms | **45 frames** | 2.8 ms | **8.3 ms** | none in 60 s idle and 150 s with six x264 encodes; no input dropouts |
 
+**Round trip by IO buffer size** (`make hwtest`, debug build, firmware 2.00, box behind two USB hubs;
+every click found at every size):
+
+| IO buffer (frames) | 32 | 45 | 48 | 64 | 128 | 256 | 512 |
+|---|---|---|---|---|---|---|---|
+| 44.1 kHz | 7.8 ms | 8.3 ms | 8.5 ms | 9.2 ms | 12.1 ms | 17.9 ms | 29.5 ms |
+| 48 kHz | 7.5 ms | 8.1 ms | 8.2 ms | 8.9 ms | 11.5 ms | 16.9 ms | 27.5 ms |
+
+**Capture packet sizes** (same run, 3 s at each rate): at 44.1 kHz 11,635 packets of 5 frames and 12,205
+of 6 (5.512 on average, for 5.5125); at 48 kHz 23,723 of 6, with 78 of 5 and 63 of 7 (0.6%), where the
+box corrects its clock.
+
+**Across a Mac sleep** (at 44.1 kHz and at 48 kHz, with nothing streaming) the box kept both decks on thru
+and its rate: the settle check found nothing to correct.
+
 **Serato's "USB buffer size" is the CoreAudio IO buffer size.** Serato DJ Pro (2.5.5, from its code) turns
 the setting into frames (1 ms is 45 frames at 44.1 kHz, after rounding to the device's alignment) and sets
 `kAudioDevicePropertyBufferFrameSize` through PortAudio, restarting its stream. It tells neither SL2Api
@@ -302,6 +317,8 @@ converters' pre-ringing, which is smaller on a quieter click. It is not latency.
 - `0x31` from a client over `sl2h` to the other supported rate is routed the same way: the box only gets it
   from Perform, so the HAL's rate and the box's change together.
 - The zero-timestamp seed is bumped, so the HAL resyncs.
+- The chosen rate is kept in the plug-in's storage and restored at Initialize (44.1 kHz by default): the HAL
+  keeps a device's controls, but not its rate.
 
 ### 6. Connect, disconnect and status
 
@@ -311,15 +328,30 @@ converters' pre-ringing, which is smaller on a quieter click. It is not latency.
 - **Opening the box at connect.** `connect_box` opens the device once and keeps it; if its HID interface is
   not registered yet (interfaces appear asynchronously after configuring), it looks again, every 100 ms for
   up to a second. The first open is occasionally refused while macOS is still setting the box up.
+- **No other driver gets the interfaces.** The box is configured with `matchInterfaces:NO`, as its command
+  interface (3) is HID-class and macOS's HID driver would otherwise take it whenever it got there first.
+  If it is held anyway, the driver sets configuration 0 and then 1, again without matching, and opens the
+  new interface. Both EP1 endpoints' halt is cleared at every open, which resets their data toggles.
 - **At connect, with nothing streaming,** the decks are put on analogue thru (the box powers up with thru on
   or off depending on a board input), and the box is given the driver's sample rate (it powers up at
-  44.1 kHz). The link speed is checked: at full speed the log says so.
-- **Status.** At open the driver enables the box's unsolicited reports (`0x36`) and asks for a state dump
+  44.1 kHz). The link speed is checked (`0x0a`): the status carries it, and at full speed the log, `sl2panel`
+  and the control panel say there is no audio.
+- **A settle check** runs 2 s after connecting and 4 s after the Mac wakes (`IORegisterForSystemPower`): the
+  rate is sent again if `0x30` reports another, and with nothing streaming a state dump is requested and a
+  deck reported on USB audio goes back to thru. Each correction is logged.
+- **Rane's bootstrap** (the RAM-loaded EEPROM writer `sl2flash` loads into a box in its bootloader)
+  enumerates exactly like the firmware, bcdDevice `0x0100` included. The driver knows it by its `0x01` reply
+  (`01 02`), reports it as boot mode, sends it nothing at connect beyond the status read, and refuses to
+  stream from it. The firmware tools reach it through `sl2h`.
+- **Status.** At open the driver clears the previous box's version, port status and link speed, asks the
+  box for them, enables the box's unsolicited reports (`0x36`) and asks for a state dump
   (`0x41` SysEx `F0 17 04 F7`). The reports give each deck's thru state and the LINE/PHONO switch (one
   physical switch for both decks, note `0x61`, On = phono), which the `sl2s` status carries.
 - **Unplugging while streaming.** The stream stops (nothing is sent to the box), and the client count is
   reset: the device leaves the HAL's list, and a client using it again after a replug sends a new StartIO.
   Observed: the HAL does send a StopIO shortly after the device disappears; it is logged and ignored.
+  If a client was streaming, each deck's thru state is remembered: a box back within 30 s gets that
+  routing at connect and at the next stream start, and goes back on thru if no stream starts within 5 s.
 - **StartIO fails** (`kAudioHardwareNotRunningError`) when the box can't be opened, rather than running a
   timeline with no box behind it.
 
@@ -392,6 +424,15 @@ converters' pre-ringing, which is smaller on a quieter click. It is not latency.
 - When a device disappears while a client streams, the HAL sends that client's StopIO afterwards.
 - A HAL client's property query can be answered by the HAL from its own model of the device without reaching
   the plug-in (e.g. `OwnedObjects` with a class qualifier).
+- A userspace reboot re-runs driver matching on every registered service while coreaudiod is down. A
+  device's interfaces are registered for matching only if it was configured with `matchInterfaces:YES`;
+  configured with `NO`, they can still be opened by the client that configured it, and stream as usual.
+- `IOUSBHostObjectInitOptionsDeviceSeize` only asks the holder to close: macOS's HID driver
+  (`AppleUserUSBHostHIDDevice`) refuses. `DeviceCapture` needs root or Apple's `com.apple.vm.device-access`
+  entitlement, which coreaudiod doesn't have.
+- A new `IOUSBHostPipe` starts at DATA0. If another client left the device's endpoint at DATA1, the device
+  takes each packet for a repeat, acknowledges it and drops it; `clearStallWithError:` resets both ends.
+  Interrupt pipes refuse a completion timeout (`kIOReturnBadArgument`); pass 0.
 - After `killall coreaudiod`, some long-running processes keep stale state:
   - QuickLookUIService and AirPlayXPCHelper ignore SIGTERM and need `kill -9`.
   - Control Center drops the device from its menu until it is restarted.
@@ -404,10 +445,10 @@ Entries refer to the [bug catalogue](#bug-catalogue).
 
 | Applies | Entries |
 |---|---|
-| **Directly**: shared code or a shared HAL/USB pattern | 1 sample-rate handshake; 2 fixed timeline anchor; 4 clock tracking; 5, 31 reporting real latency (measure with `rtlat`); 15 bus time; 19, 20 capture gaps filled with silence; 21 ReadInput's write head; 22, 23 teardown on the USB queue and stream generations; 24, 25 failed opens and unplug while streaming; 26 opening at connect; 27 property buffer sizes; 28 the `sl2h` passthrough; 30 the zero-timestamp period; 39 the status frame count; 35 device listed only while attached; 38 retry a refused first open |
+| **Directly**: shared code or a shared HAL/USB pattern | 1 sample-rate handshake; 2 fixed timeline anchor; 4 clock tracking; 5, 31 reporting real latency (measure with `rtlat`); 15 bus time; 19, 20 capture gaps filled with silence; 21 ReadInput's write head; 22, 23 teardown on the USB queue and stream generations; 24, 25 failed opens and unplug while streaming; 26 opening at connect; 27 property buffer sizes; 28 the `sl2h` passthrough; 30 the zero-timestamp period; 39 the status frame count; 35 device listed only while attached; 38 retry a refused first open; 45 a stale version; 47 `%{public}s` in the log; 49 the rate kept across restarts; 50 the settle check after connect and wake; 53 the routing kept across a replug mid-stream; 57 interfaces not offered to other drivers, and the EP1 toggles reset (check whether the command interface is HID-class) |
 | **With the deep schedule** (late writes into queued transfers) | 7, 9, 10, 11, 12, 13, 14, 16, 17, 18 |
 | **Check the device first** (the early capture read relies on the low byte of each sample being 0) | 44 |
-| **SL 2 only, or check on the SL 3/SL 4 first** | 8 input safety value (measure); 29 the heartbeat (check the SL 3/SL 4 firmware); 36 LINE/PHONO report (note `0x61`); 37 thru at connect (board input PC7); 32–34, 40–43 SL2Api, `sl2panel` and the test tools (each device's API has its own signatures; the SL 3 uses `0x10` for its version) |
+| **SL 2 only, or check on the SL 3/SL 4 first** | 8 input safety value (measure); 29 the heartbeat (check the SL 3/SL 4 firmware); 36 LINE/PHONO report (note `0x61`); 37 thru at connect (board input PC7); 46 Rane's bootstrap (each box's bootstrap answers its own version); 54, 55 `sl2flash` (downgrades, `--backup-only`, the wait after `0x16`); 48 the link speed (`0x0a`); 32–34, 40–43 SL2Api, `sl2panel` and the test tools (each device's API has its own signatures; the SL 3 uses `0x10` for its version) |
 
 ## Bug catalogue
 
@@ -633,14 +674,92 @@ build; *(hook)* uses `tools/latency/bin/sl2dbg`.
       the counters clean; `dptest.sh`; `rtlat` at 64 frames
       (≈9.3 ms DVS round trip); `DBG early read` counters *(debug)*.
     - `19669c5`, `ffbe09c`.
+45. **A box that didn't answer `0x01` kept the previous box's version in the status.**
+    - Cause: `refresh_hw_status` set the version and port status only when the box answered.
+    - Fix: both are cleared before the box is asked. Found in review; not observed.
+    - Test: replug; `sl2panel` shows the box's own version. `c48eed0`.
+46. **The driver treated Rane's bootstrap as a working SL 2.**
+    - Cause: the bootstrap enumerates exactly like the firmware (bcdDevice `0x0100`), and opening the box
+      cleared boot mode. The status said the firmware was running, connect sent thru (`0x41`, which the
+      bootstrap rejects) and the rate, and a StartIO would have tried to stream.
+    - Fix: the bootstrap is known by its version (`01 02`): boot mode, no commands at connect beyond the
+      status read, no streaming; boot mode after a removal accounts for it. Found in review; not observed.
+    - Test: run `sl2flash` on a box in its bootloader and watch `sl2panel` while the bootstrap runs
+      ("running Rane's firmware loader (1.02)"). `92d05ac`.
+47. **The start-up log line said `SL2Device <private> (<private>)`.**
+    - Cause: `%s` in `os_log` is redacted. Fix: `%{public}s`. Test: `log show` after an install. `597fe17`.
+48. **A full-speed connection looked like a working box.**
+    - Cause: the link speed (`0x0a`) was only logged.
+    - Fix: `usb_link` in the status; `sl2panel` and the control panel warn; `hwtest` requires high speed.
+    - Test: `sl2panel` shows "USB Link: high speed"; a USB 1.1 hub shows the warning (not tested). `5eac987`.
+49. **The sample rate went back to 44.1 kHz whenever coreaudiod restarted.**
+    - Cause: the driver started at 44.1 kHz, and the HAL doesn't store a device's rate (its settings hold
+      the SL 2's volume and mute, not its rate).
+    - Fix: the rate is kept in the plug-in's storage and restored at Initialize.
+    - Test: 48 kHz in Audio MIDI Setup, `sudo killall coreaudiod`, `sl2panel` shows 48000 Hz. `3de0273`.
+50. **Nothing checked thru and the rate after connect, or after the Mac slept.**
+    - Cause: `connect_box` set them once. The SL 3's firmware resets both whenever its DSP boots, after
+      connect and after a USB resume; whether the SL 2 loses either is not yet known.
+    - Fix: the settle check (Design, section 6), which logs any correction.
+    - Test: `make hwtest`, "thru and rate after the Mac sleeps"; the log after a sleep shows whether the
+      box needed a correction. Seen on an SL 2 at both rates: it kept both (the SL 3's firmware doesn't).
+      `19f00ce`.
+51. **`sl2flash` would take any blank FX2 for an SL 2, and kept no copy of the EEPROM it replaced.**
+    - Fix: a blank FX2 (`04b4:8613`) only with `--blank-fx2`; the whole EEPROM is saved to
+      `sl2-eeprom-backup-<date>.bin` before anything is written, and `sl2flash` stops if it can't save it.
+    - Test: `sl2flash --force` on a running box writes the backup. `bcedf7f`, `ce5271a`.
+52. **The firmware extractor read only the 1.0.1f4 driver, and checked only the header's CRC.**
+    - Fix: the images are carved at the offsets of the three known builds (1.0.1f4, 1.0.3f1, 2.0.1f2) and
+      checked against their SHA-256; the .pkg, an expanded package, a folder or SL2Api itself is accepted.
+    - Test: run it on each driver package. `9ebb50a`.
+53. **After a replug mid-stream, both decks came back on thru, and Serato adopted it.**
+    - Cause: `connect_box` put both decks on thru at every connect with nothing streaming; the client,
+      restarting its stream by itself, takes each deck's thru state from the box first. Seen on an SL 3
+      with Serato DJ Pro 2.5.5 (every deck back in THRU, timecode sent to the mixer).
+    - Fix: the routing at the unplug is remembered and restored at connect and at the next stream start,
+      for a box back within 30 s; thru after all if no stream starts within 5 s.
+    - Test: Serato 2.5.5 streaming in REL, unplug and replug: the decks stay in REL (done on an SL 2: Serato
+      restarted its stream 0.3 s after the replug, the decks stayed in REL and the music carried on);
+      `make hwtest`, "unplug and replug, mid-stream". `00b0418`.
 
+54. **`sl2flash` would write older firmware over newer, and a backup needed a flash.**
+    - Cause: it wrote whenever the EEPROM differed from the image. `Firmware-SL2.command` installs 1.10
+      (the Scratch Live driver), so on a box updated to 2.00 both offered to "write the firmware".
+    - Fix: a running box on a later version than the image is left alone unless `--force`;
+      `--backup-only` saves the EEPROM and changes nothing.
+    - Test: with 1.10 installed and the box on 2.00, `--dry-run` and a plain run refuse; `--backup-only`
+      writes a backup identical to the 2.00 image. `af4baeb`.
+55. **A successful flash ended "the box is back but does not answer through the driver".**
+    - Cause: after `0x16` sl2flash polled the device ID it found at the start, which leaves the HAL's list
+      while the box restarts (entry 35).
+    - Fix: the device is looked up again on each poll.
+    - Test: `sl2flash --firmware DIR --force` with the 2.00 images ends "running firmware 2.00", "done".
+      `e817c64`.
+56. **The control panel showed driver 1.0.0 with a 1.3.0 build installed.**
+    - Cause: `install-sl2.sh` replaced only the binary; the panel reads the bundle's `Info.plist`.
+    - Fix: the script installs `plugin/Device-Info.plist` too. Test: `make install`; the panel shows
+      1.3.0. `b3d6fa0`.
+57. **After a userspace reboot with the box attached, the SL 2 was unusable until replugged.**
+    - Cause: the box was configured with its interfaces offered for matching, and its command interface
+      is HID-class; the reboot re-ran matching while coreaudiod was down, and macOS's HID driver took it.
+      Once that driver had used it, the box also dropped every command on a new pipe (EP1 data toggle).
+    - Fix: configure with `matchInterfaces:NO`; if the interface is held, set the configuration again;
+      clear EP1's halt at every open (Design, section 6).
+    - Test: configure the box with matching from a small tool while the driver is moved aside, then put
+      the driver back: it logs "setting the box's configuration again" and the box works. `fceeeba`.
+58. **hwtest missed a real Mac sleep.**
+    - Cause: it looked for an 8 s jump in the wall clock, and the Mac woke into a DarkWake 8 s after
+      sleeping, where processes run again.
+    - Fix: the sleep and the full wake are read from `pmset -g log`. `1850b62`.
 ## Testing
 
 `make hwtest` runs the hardware tests in one go, in the order that needs the fewest physical steps, and
 ends with a PASS / FAIL / SKIP summary (`ARGS="--loopback"` with the loopback cable in). It covers the
 status, SL2Api as Serato calls it, rate switching, the input safety offset setting, the early capture
-read working (no cable needed), restarts, glitches (idle and loaded), 48 kHz, the
-output volume and mute (and that they survive a replug), the level meters, the early capture read, the fault hooks, the LINE/PHONO report, and unplug and replug while idle and mid-stream.
+read working (no cable needed), restarts, glitches (idle and loaded), 48 kHz, IO buffer sizes from 32 to
+512 frames at both rates, the output volume and mute (and that they survive a replug), the level meters, the
+capture packet sizes, the early capture read, the fault hooks, the LINE/PHONO report, thru and the box's
+rate after the Mac sleeps, and unplug and replug while idle and mid-stream.
 
 The tools are in `tools/latency/` (build them with `make latency`). Its README covers the loopback setup,
 what each tool does and the expected results. The main ones:
@@ -677,6 +796,7 @@ Each was removed from the tip in its own commit.
 - sent − captured within ±2;
 - `rewritten samples 0`;
 - `capture packet errors` rarely above 0;
+- `DBG capture packet sizes` (at stream stop): 5 and 6 frames at 44.1 kHz, 6 at 48 kHz;
 - `DBG early read`: `completion found 0 different`, `SILENCE (not captured yet) 0`, and a least margin
   above 0.5 ms (at the 1.5 ms input safety offset).
 

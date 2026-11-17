@@ -2,13 +2,19 @@
 /*
  * sl2flash — write the Rane SL 2's firmware into its boot EEPROM over USB.
  *
- *   sl2flash [--firmware DIR] [--force] [--dry-run] [--wait SECONDS]
+ *   sl2flash [--firmware DIR] [--force] [--dry-run] [--backup-only] [--wait SECONDS] [--blank-fx2]
  *     --firmware DIR  directory holding the firmware images (*.bin, recognised by content);
  *                     default: /Library/Audio/Plug-Ins/HAL/SL2Device.firmware
- *     --force         rewrite the EEPROM even if it already holds the image
+ *     --force         rewrite the EEPROM even if it already holds the image, or holds newer
+ *                     firmware than the image
  *     --dry-run       check the images and the box (and compare a running box's EEPROM with
  *                     the image) without changing anything
+ *     --backup-only   save the EEPROM to sl2-eeprom-backup-<date>.bin and change nothing (a box in
+ *                     its bootloader first has the bootstrap loaded into its RAM to read it, and
+ *                     runs it until it is power-cycled); needs no final image
  *     --wait SECONDS  wait up to this long for a box to be connected
+ *     --blank-fx2     also take a Cypress FX2 with a blank EEPROM (04b4:8613) as the SL 2: any
+ *                     other device built on a blank FX2 (a logic analyser, say) shows up the same
  *
  *   Exit status: 0 done, or nothing to do; 1 failed; 2 bad arguments; 3 (--dry-run only) the
  *   box needs writing.
@@ -36,7 +42,10 @@
  * opens a box in that mode.
  *
  * The EEPROM is read first. If it already holds the image, a running box is left alone and a
- * box in its bootloader is only marked bootable again (0x16), unless --force is given.
+ * box in its bootloader is only marked bootable again (0x16), unless --force is given. A box
+ * running newer firmware than the image is left alone too, unless --force is given. Before
+ * anything is written, the whole EEPROM (64 KiB) is saved to sl2-eeprom-backup-<date>.bin in the
+ * current directory; sl2flash stops if it can't save it.
  * Otherwise every block is written and read back, and then the whole EEPROM is read again and
  * compared with the image before 0x16 makes it bootable. If anything fails before 0x16, byte 0
  * stays 0xC0: a running box keeps working until it is power-cycled, then comes up in its
@@ -52,6 +61,7 @@
 #import <IOUSBHost/IOUSBHost.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #import "SL2Passthrough.h"
 
@@ -236,10 +246,12 @@ done:
 
 /* ---- the EEPROM, through the driver ---- */
 
-/* Poll command 0x01 until the box answers through the driver (which opens it on demand). */
-static bool wait_for_answer(AudioObjectID hal, double seconds, uint8_t *maj, uint8_t *min) {
+/* Poll command 0x01 until the box answers through the driver. The driver lists its device only
+   while a box is attached, so the device is looked up again each time. */
+static bool wait_for_answer(AudioObjectID *hal, double seconds, uint8_t *maj, uint8_t *min) {
     for (int i = 0; i < (int)(seconds * 4); i++) {
-        if (sl2h_version(hal, maj, min)) return true;
+        *hal = sl2h_find_device();
+        if (*hal != kAudioObjectUnknown && sl2h_version(*hal, maj, min)) return true;
         usleep(250000);
     }
     return false;
@@ -252,6 +264,23 @@ static bool read_eeprom(AudioObjectID hal, uint8_t *buf, const char *what) {
         if ((a & 0x3FFF) == 0) { printf("."); fflush(stdout); }
     }
     printf(" done\n");
+    return true;
+}
+
+/* The whole EEPROM, before anything is written, into sl2-eeprom-backup-<date>.bin here. It holds
+   Rane's firmware: keep it out of any repository. */
+static bool save_backup(const uint8_t *eeprom) {
+    char name[64];
+    time_t t = time(NULL);
+    strftime(name, sizeof name, "sl2-eeprom-backup-%Y%m%d-%H%M%S.bin", localtime(&t));
+    FILE *f = fopen(name, "wb");
+    if (!f || fwrite(eeprom, 1, SL2_EEPROM_SIZE, f) != SL2_EEPROM_SIZE) {
+        printf("cannot write the EEPROM backup %s; nothing written to the box\n", name);
+        if (f) fclose(f);
+        return false;
+    }
+    fclose(f);
+    printf("saved the EEPROM as it was to %s\n", name);
     return true;
 }
 
@@ -312,7 +341,7 @@ static bool finalize(AudioObjectID hal, const uint8_t *final_hdr) {
     if (!back) { printf("the box did not come back within 30 s\n"); return false; }
 
     uint8_t maj, min;
-    if (!wait_for_answer(hal, 15, &maj, &min)) { printf("the box is back but does not answer through the driver\n"); return false; }
+    if (!wait_for_answer(&hal, 15, &maj, &min)) { printf("the box is back but does not answer through the driver\n"); return false; }
     printf("the box is running firmware %u.%02u\n", maj, min);
     if (maj != final_hdr[0x27] || min != final_hdr[0x28]) {
         printf("expected %u.%02u from the image\n", final_hdr[0x27], final_hdr[0x28]);
@@ -326,18 +355,21 @@ static bool finalize(AudioObjectID hal, const uint8_t *final_hdr) {
 int main(int argc, char **argv) {
   @autoreleasepool {
     const char *dir = kDefaultDir;
-    bool dry = false, force = false;
+    bool dry = false, force = false, blank_ok = false, backup_only = false;
     int waitsecs = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--dry-run")) dry = true;
         else if (!strcmp(argv[i], "--force")) force = true;
         else if (!strcmp(argv[i], "--firmware") && i + 1 < argc) dir = argv[++i];
         else if (!strcmp(argv[i], "--wait") && i + 1 < argc) waitsecs = atoi(argv[++i]);
-        else { fprintf(stderr, "usage: %s [--firmware DIR] [--force] [--dry-run] [--wait SECONDS]\n", argv[0]); return 2; }
+        else if (!strcmp(argv[i], "--blank-fx2")) blank_ok = true;
+        else if (!strcmp(argv[i], "--backup-only")) backup_only = true;
+        else { fprintf(stderr, "usage: %s [--firmware DIR] [--force] [--dry-run] [--backup-only] [--wait SECONDS] [--blank-fx2]\n", argv[0]); return 2; }
     }
 
+    /* The images (a backup needs none, unless the bootstrap has to be loaded to read the EEPROM). */
     image_t final = {0}, boot = {0};
-    if (!load_images(dir, &final, &boot)) return 1;
+    if (!load_images(dir, &final, &boot) && !backup_only) return 1;
     const uint8_t *hdr = final.data.bytes, *pay = hdr + RANE_HDR;
 
     AudioObjectID hal = sl2h_find_device();
@@ -354,6 +386,12 @@ int main(int argc, char **argv) {
     for (int i = 0; ; i++) {
         n = find_boxes(b, 4);
         if (n > 1) { printf("%d SL 2s (or blank FX2s) are connected; connect only the one to flash\n", n); release_boxes(b, n); return 1; }
+        if (n == 1 && b[0].vid == FX2_DEFAULT_VID && !blank_ok) {
+            printf("a Cypress FX2 with a blank EEPROM (04b4:8613) is connected. It may be an SL 2 whose EEPROM is\n"
+                   "blank, or any other device built on an FX2: if you are sure it is the SL 2, run again with --blank-fx2\n");
+            release_boxes(b, n);
+            return 1;
+        }
         if (n == 1 && is_loadable(&b[0])) break;
         if (n == 1 && b[0].bcd == BCD_RUNNING && sl2h_version(hal, &maj, &min)) { running = true; break; }
         release_boxes(b, n); n = 0;
@@ -368,25 +406,53 @@ int main(int argc, char **argv) {
     } else {
         printf("SL 2 in its bootloader (%04x:%04x, bcdDevice 0x%04x)\n", b[0].vid, b[0].vid == SL2_VID ? SL2_PID : FX2_DEFAULT_PID, b[0].bcd);
         if (!boot.data) { printf("no bootstrap image in %s; it is needed for a box in this mode\n", dir); release_boxes(b, n); return 1; }
-        if (dry) { printf("dry run: would load the bootstrap, then program the EEPROM\n"); release_boxes(b, n); return EXIT_WOULD_WRITE; }
+        if (dry && !backup_only) { printf("dry run: would load the bootstrap, then program the EEPROM\n"); release_boxes(b, n); return EXIT_WOULD_WRITE; }
         bool ok = stage1(b[0].svc, boot.data);
         release_boxes(b, n);
         if (!ok) return 1;
-        if (!wait_for_answer(hal, 20, &maj, &min)) { printf("the bootstrap did not answer through the driver within 20 s\n"); return 1; }
+        if (!wait_for_answer(&hal, 20, &maj, &min)) { printf("the bootstrap did not answer through the driver within 20 s\n"); return 1; }
         printf("bootstrap running (reports %u.%02u)\n", maj, min);
     }
     if (sl2h_is_streaming(hal)) { printf("the SL 2 is in use for audio; stop playback (or quit the app using it) and try again\n"); return 1; }
 
+    /* Read the whole EEPROM: it decides what to do, and it is the backup. */
     uint8_t *cur = malloc(SL2_EEPROM_SIZE);
     if (!read_eeprom(hal, cur, "reading the EEPROM")) { free(cur); return 1; }
+    if (backup_only) {
+        bool saved = save_backup(cur);
+        free(cur);
+        if (saved && !running) printf("the box runs the bootstrap until it is power-cycled; its EEPROM is unchanged\n");
+        return saved ? 0 : 1;
+    }
     bool same = memcmp(cur + 1, pay + 1, SL2_EEPROM_SIZE - 1) == 0;
     uint8_t boot_hdr = cur[0];
-    free(cur);
     printf("EEPROM %s the image; boot header 0x%02x (%s)\n", same ? "matches" : "differs from", boot_hdr,
            boot_hdr == HDR_BOOT ? "bootable" : boot_hdr == HDR_NOBOOT ? "not bootable" : "invalid");
 
-    if (same && !force && running && boot_hdr == HDR_BOOT) { printf("nothing to do (--force rewrites it anyway)\n"); return 0; }
-    if (dry) { printf("dry run: would %s\n", same && !force ? "mark the EEPROM bootable" : "program the EEPROM"); return EXIT_WOULD_WRITE; }
+    /* Not over newer firmware: a running box (not the bootstrap, 1.02) on a later version than the
+       image is left alone. */
+    bool bootstrap = maj == 1 && min == 2;
+    if (running && !bootstrap && !same && !force && (hdr[0x27] << 8 | hdr[0x28]) < (maj << 8 | min)) {
+        printf("the box runs firmware %u.%02u, newer than the image's %u.%02u: not writing it (--force writes it anyway)\n",
+               maj, min, hdr[0x27], hdr[0x28]);
+        free(cur);
+        return 0;
+    }
+
+    /* Decide: nothing to do, a dry run's answer, or save the backup and write. */
+    if (same && !force && running && boot_hdr == HDR_BOOT) {
+        printf("nothing to do (--force rewrites it anyway)\n");
+        free(cur);
+        return 0;
+    }
+    if (dry) {
+        printf("dry run: would %s\n", same && !force ? "mark the EEPROM bootable" : "program the EEPROM");
+        free(cur);
+        return EXIT_WOULD_WRITE;
+    }
+    bool saved = save_backup(cur);
+    free(cur);
+    if (!saved) return 1;
     if (same && !force) printf("the EEPROM already holds the image; only marking it bootable\n");
     else if (!program(hal, pay)) {
         printf("FAILED before the EEPROM was marked bootable. The box %s; run sl2flash again.\n",

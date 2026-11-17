@@ -6,13 +6,14 @@ S=$(dirname "$0")
 B="$S/bin"                                   # built by: make latency
 DEV=${SL_DEVICE:-SL 2}                       # CoreAudio device name (substring)
 SUBSYS=${SL_LOG_SUBSYSTEM:-com.rane.sl2}     # the driver's os_log subsystem
+LOOP=${SL_LOOP_CH:-1}                        # the looped-back channel: 1 = Left deck L (Out to In)
 start=$(date '+%Y-%m-%d %H:%M:%S')
 fail=0
 
 # Three streams, each measuring round-trip latency with 4 clicks.
 for i in 1 2 3; do
     echo -n "stream $i: "
-    line=$("$B/rtlat" "$DEV" 1 1 4 128 | grep -E 'mean|not found' | head -1)
+    line=$("$B/rtlat" "$DEV" "$LOOP" "$LOOP" 4 128 | grep -E 'mean|not found' | head -1)
     echo "$line"
     echo "$line" | grep -q '(4/4 clicks)' || fail=1
 done

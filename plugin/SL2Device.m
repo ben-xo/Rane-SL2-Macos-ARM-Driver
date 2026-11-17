@@ -18,13 +18,18 @@
  *   - Bootloader detection: a box whose EEPROM firmware is missing/corrupt enumerates in the
  *     USB bootloader (bcdDevice 0x0000, "Unnamed Device") and passes no audio. The driver
  *     detects this and reports it — in the log and via a boot_mode flag in the 'sl2s' status —
- *     so a client can tell the box needs its firmware restored.
+ *     so a client can tell the box needs its firmware restored. Rane's bootstrap (the EEPROM
+ *     writer loaded into a box in its bootloader) enumerates like the firmware and is known by
+ *     its version (1.02): it is reported the same way, and the driver neither streams from it nor
+ *     sends it anything at connect beyond reading its status.
  */
 
 #import <Foundation/Foundation.h>
 #import <CoreAudio/AudioServerPlugIn.h>
 #import <IOKit/IOKitLib.h>
 #import <IOKit/usb/IOUSBLib.h>
+#import <IOKit/pwr_mgt/IOPMLib.h>
+#import <IOKit/IOMessage.h>
 #import <IOUSBHost/IOUSBHost.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
@@ -33,11 +38,12 @@
 #include <math.h>
 
 #ifndef SL2_VERSION
-#define SL2_VERSION  "1.3.0"
+#define SL2_VERSION  "1.4.0"
 #endif
 #define VID          0x1cc5
 #define PID          0x0013
 #define BCD_LOADER   0x0000  /* USB bootloader: EEPROM has no bootable firmware ("Unnamed Device") */
+#define SL2_BOOTSTRAP_VERSION 0x0102  /* 0x01's reply from Rane's RAM-loaded EEPROM writer (1.02): no audio */
 #define BCD_AUDIO    0x0100  /* running firmware: the 4-interface audio device */
 #define IF_PLAY      1
 #define IF_CAP       2
@@ -72,6 +78,7 @@ enum {
     SL2_CMD_EEPROM_WRITE   = 0x02,   /* refused (0xFF, stale tag) unless 0x17 enabled it */
     SL2_CMD_NO_REPLY       = 0x06,   /* the box sends no reply */
     SL2_CMD_PORT_SPEED     = 0x0a,   /* reply [5]: 0 unconfigured, 1 full speed, 2 high speed */
+    SL2_CMD_GET_RATE       = 0x30,   /* reply [5..6] rate, big-endian */
     SL2_CMD_SET_RATE       = 0x31,   /* [5..6] rate, big-endian: 44100 or 48000 */
     SL2_CMD_REPORTS        = 0x36,   /* [5] non-zero: send unsolicited 0x40 reports */
     SL2_CMD_CHALLENGE      = 0x37,   /* [5..12] challenge -> reply [5..12] response */
@@ -108,6 +115,8 @@ typedef struct {
     uint32_t hub_depth;             /* USB hubs between the box and the Mac: 0 = connected directly */
     uint64_t in_dropouts;           /* IO cycles in which input wasn't captured in time, since the device was
                                        set up (the box connected, or the input safety offset changed) */
+    uint32_t usb_link;              /* the box's USB link (0x0a): 2 = high speed, 1 = full speed (no audio),
+                                       0 = not known */
 } SL2StatusPacket;
 
 enum {
@@ -147,6 +156,7 @@ static os_log_t g_log;
 static uint32_t dbg_capdelay_hist[24];   /* capture handler time - bus start of its frame: 0.5 ms bins from -2 ms */
 static double   dbg_capdelay_min, dbg_capdelay_max, dbg_capstamp_min, dbg_capstamp_max;
 static uint32_t dbg_cap_pkt_err;         /* capture packets dropped: error status or impossible length */
+static uint32_t dbg_cap_pkt_frames[PKT_MAX / FRAME_BYTES + 1];   /* good capture packets by frames carried */
 static _Atomic uint32_t dbg_dp_written, dbg_dp_late, dbg_dp_unscheduled;   /* WriteMix samples, IO thread */
 /* The HAL's WriteMix calling pattern (see SL2_DoIOOperation): thread switches, concurrent calls,
    and samples written to positions already written */
@@ -166,6 +176,7 @@ static void dbg_reset(void) {
     memset(dbg_capdelay_hist, 0, sizeof dbg_capdelay_hist);
     dbg_capdelay_min = dbg_capstamp_min = 1e9; dbg_capdelay_max = dbg_capstamp_max = -1e9;
     dbg_cap_pkt_err = 0;
+    memset(dbg_cap_pkt_frames, 0, sizeof dbg_cap_pkt_frames);
     dbg_dp_written = dbg_dp_late = dbg_dp_unscheduled = 0;
     dbg_wm_thread_switches = dbg_wm_concurrent = dbg_wm_rewritten = 0;
     dbg_wm_last_thread = dbg_wm_high = 0;
@@ -187,6 +198,10 @@ static pthread_mutex_t g_hid_mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_hout_mtx = PTHREAD_MUTEX_INITIALIZER;   /* writes to the HID OUT pipe */
 static pthread_mutex_t g_unsol_mtx = PTHREAD_MUTEX_INITIALIZER;
 
+/* The sample rate: 44.1 kHz unless chosen otherwise. The box powers up at 44.1 kHz, so the driver sets
+   it at every connect. The choice is kept in the plug-in's storage (rate_load / rate_save): the HAL
+   keeps a device's controls but not its rate. */
+#define RATE_STORAGE_KEY CFSTR("sample rate")
 static Float64  g_sr = 44100.0;
 static UInt32   g_io_clients = 0;
 static _Atomic bool g_io_running = false;
@@ -198,7 +213,8 @@ static bool stream_live(uint32_t gen) {
     return atomic_load(&g_io_running) && atomic_load(&g_stream_gen) == gen;
 }
 static _Atomic bool g_hw_connected = false;
-static _Atomic bool g_boot_mode = false;     /* a bootloader-mode box (no firmware) is attached */
+static _Atomic bool g_boot_mode = false;     /* a box in its bootloader, or running Rane's EEPROM writer:
+                                                no firmware, no audio */
 static _Atomic bool g_box_present = false;   /* a box with running firmware is attached */
 static uint32_t g_ref_count = 0;
 
@@ -269,6 +285,23 @@ static void in_safety_save(void) {
     CFNumberRef n = CFNumberCreate(NULL, kCFNumberIntType, &us);
     if (!n) return;
     g_host->WriteToStorage(g_host, IN_SAFETY_STORAGE_KEY, n);
+    CFRelease(n);
+}
+/* The sample rate, from and to the plug-in's storage. */
+static void rate_load(void) {
+    CFPropertyListRef v = NULL;
+    if (!g_host || g_host->CopyFromStorage(g_host, RATE_STORAGE_KEY, &v) != 0 || !v) return;
+    double r = 0;
+    if (CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberGetValue((CFNumberRef)v, kCFNumberDoubleType, &r) &&
+        (r == 44100.0 || r == 48000.0))
+        g_sr = r;
+    CFRelease(v);
+}
+static void rate_save(void) {
+    if (!g_host) return;
+    CFNumberRef n = CFNumberCreate(NULL, kCFNumberDoubleType, &g_sr);
+    if (!n) return;
+    g_host->WriteToStorage(g_host, RATE_STORAGE_KEY, n);
     CFRelease(n);
 }
 static UInt32 in_safety_frames(void) {
@@ -364,6 +397,7 @@ static uint8_t  g_wait_cmd = 0;
 static uint32_t g_wait_seq = 0;
 static uint8_t  g_reply_buf[HID_REPORT_LEN];
 static SL2StatusPacket g_st;
+static _Atomic uint32_t g_thru_reports;   /* thru notes reported by the box (hid_read), to see a state dump arrive */
 
 
 /* Reports for clients (see unsol_push) */
@@ -454,6 +488,7 @@ static void hid_read(void) {
                     int on = ((st & 0xF0) == 0x90) ? 1 : 0;
                     if (note == SL2_NOTE_THRU_DECK1 || note == SL2_NOTE_THRU_DECK2) {
                         g_st.thru[note - SL2_NOTE_THRU_DECK1] = on;
+                        atomic_fetch_add(&g_thru_reports, 1);
                     } else if (note == SL2_NOTE_LINE_PHONO) {
                         /* the box's one LINE/PHONO switch (firmware input PE0), shared by both decks */
                         g_st.phono[0] = g_st.phono[1] = on;
@@ -527,12 +562,24 @@ static bool hid_cmd(uint8_t cmd, const uint8_t *pl, size_t plen, uint8_t *reply_
     return accepted;
 }
 
+/* Switch and thru state arrive as unsolicited 0x40 reports (parsed in hid_read), which the box sends
+   only once 0x36 has enabled them. Enable them, then ask for a state dump (0x41 SysEx F0 17 04 F7),
+   which reports the LINE/PHONO switch and both decks' thru, so they are known before they change. */
+static void request_state(void) {
+    uint8_t enable[1] = { 1 };
+    hid_cmd(SL2_CMD_REPORTS, enable, 1, NULL, NULL);
+    uint8_t dump[5] = { 4, 0xF0, 0x17, 0x04, 0xF7 };
+    hid_cmd(SL2_CMD_HIDI, dump, 5, NULL, NULL);
+}
+
 static void refresh_hw_status(void) {
     /* Firmware version via HID command 0x01, as Rane's SL2Api reads it
        (SendHidRequest(dev, 0x01, ...) -> reply[5]=major, reply[6]=minor, 32-bit build stamp at
        reply[7..10]); c.f. the SL3, which uses 0x10. bcdDevice is only a mode marker
        (0x0100 = running firmware, 0x0000 = bootloader), not the version. */
     uint8_t r[64];
+    g_st.version_maj = g_st.version_min = 0;   /* not the previous box's, if this one doesn't answer */
+    g_st.port_a = g_st.port_b = 0;
     for (int attempt = 0; attempt < 2; attempt++) {   /* the box may still be loading its FPGA */
         if (hid_cmd(SL2_CMD_VERSION, NULL, 0, r, NULL)) {
             g_st.version_maj = r[5];
@@ -540,10 +587,23 @@ static void refresh_hw_status(void) {
             break;
         }
     }
+    /* Rane's bootstrap (the RAM-loaded EEPROM writer that sl2flash and Rane's updater load into a box
+       in its bootloader) enumerates exactly like the running firmware, bcdDevice 0x0100 included, and
+       answers 01 02: that box has no audio. */
+    bool loader = (g_st.version_maj << 8 | g_st.version_min) == SL2_BOOTSTRAP_VERSION;
+    if (loader) {
+        atomic_store(&g_boot_mode, true);
+        LOG("Rane SL 2 is running Rane's firmware loader (1.02), not its firmware: no audio until the "
+            "firmware is written and the box restarted.");
+    }
     /* USB speed (0x0a: 1 = full speed, 2 = high speed). At full speed the box offers only its HID
        interface, so there is no audio: say so, as the only other sign is a failed stream start. */
-    if (hid_cmd(SL2_CMD_PORT_SPEED, NULL, 0, r, NULL) && r[5] == 1)
-        LOG("The SL 2 is on a full-speed (USB 1.1) link: no audio. Connect it to a USB 2.0 high-speed port.");
+    g_st.usb_link = 0;
+    if (hid_cmd(SL2_CMD_PORT_SPEED, NULL, 0, r, NULL)) {
+        g_st.usb_link = r[5];
+        if (r[5] == 1)
+            LOG("The SL 2 is on a full-speed (USB 1.1) link: no audio. Connect it to a USB 2.0 high-speed port.");
+    }
     /* Serial from the USB iSerialNumber string ("SL2.01.00"), a fixed device serial independent
        of the firmware version; c.f. the SL3, which queries it over HID 0x04. */
     CFTypeRef ser = IORegistryEntryCreateCFProperty(g_dev.ioService, CFSTR("USB Serial Number"), kCFAllocatorDefault, 0);
@@ -558,13 +618,8 @@ static void refresh_hw_status(void) {
         g_st.port_a = r[5];
         g_st.port_b = r[6];
     }
-    /* Switch and thru state arrive as unsolicited 0x40 reports (parsed in hid_read), which the box
-       sends only once 0x36 has enabled them. Then ask for a state dump (0x41 SysEx F0 17 04 F7),
-       so the LINE/PHONO switch is known before it is first moved. */
-    uint8_t enable[1] = { 1 };
-    hid_cmd(SL2_CMD_REPORTS, enable, 1, NULL, NULL);
-    uint8_t dump[5] = { 4, 0xF0, 0x17, 0x04, 0xF7 };
-    hid_cmd(SL2_CMD_HIDI, dump, 5, NULL, NULL);
+    /* The switch and thru state (the bootstrap has no switches to report and no 0x41). */
+    if (!loader) request_state();
 }
 
 static void send_hw_samplerate(int sr) {
@@ -573,15 +628,37 @@ static void send_hw_samplerate(int sr) {
     push_sr_unsol(sr);
 }
 
-/* Switch both decks to USB audio (Note Off) or analogue thru (Note On), notes 0x5C / 0x5D through
+/* Switch each deck to USB audio (Note Off) or analogue thru (Note On), notes 0x5C / 0x5D through
    0x41. The box confirms each change with its own 0x40 report, which reaches clients. */
-static void set_usb_switches(bool usb_mode) {
-    uint8_t status_byte = usb_mode ? 0x80 : 0x90;
+static void set_thru(const uint8_t thru[2]) {
     for (int i = 0; i < 2; i++) {
-        uint8_t pl[4] = { 0x03, status_byte, (uint8_t)(SL2_NOTE_THRU_DECK1 + i), 0x00 };
+        uint8_t pl[4] = { 0x03, thru[i] ? 0x90 : 0x80, (uint8_t)(SL2_NOTE_THRU_DECK1 + i), 0x00 };
         hid_cmd(SL2_CMD_HIDI, pl, 4, NULL, NULL);
-        g_st.thru[i] = usb_mode ? 0 : 1;
+        g_st.thru[i] = thru[i] ? 1 : 0;
     }
+}
+static void set_usb_switches(bool usb_mode) {
+    uint8_t thru[2] = { !usb_mode, !usb_mode };
+    set_thru(thru);
+}
+
+/* The decks' routing across an unplug while a client streams. The client restarts its stream after
+   the replug (Serato DJ Pro does, by itself) and takes each deck's thru state from the box's reports to
+   decide its own deck modes: putting both decks on thru at connect would put them in THRU there, and
+   send the turntables' timecode straight to the mixer. So the routing at the unplug is remembered and
+   restored at connect and at the next stream start; if no stream starts within RESUME_WAIT_MS (the app
+   was quit meanwhile), the decks go back on thru. Only for a box back within RESUME_MAX_GAP_S of the
+   unplug (a replug, not a box plugged in again later). All under g_mutex. */
+#define RESUME_WAIT_MS   5000
+#define RESUME_MAX_GAP_S 30
+static uint64_t g_resume_since;        /* host time of the unplug */
+static bool     g_resume_pending;
+static uint8_t  g_resume_thru[2];      /* each deck's thru state at the unplug: 1 = analogue thru */
+static uint32_t g_resume_window;       /* which window a fallback belongs to */
+/* The routing with nothing streaming: the remembered one while a client is expected back, else thru. */
+static void set_idle_routing(void) {
+    if (g_resume_pending) set_thru(g_resume_thru);
+    else set_usb_switches(false);
 }
 
 static IOUSBHostPipe *copy_isoch_pipe(IOUSBHostInterface *intf, uint8_t dir, uint8_t fallback1, uint8_t fallback2) {
@@ -1290,10 +1367,11 @@ static void cap_read_early(void) {
             break;
         }
         /* Count the frames that arrived by their marks; none means missing or errored. A frame counts
-           only once the pad bytes of its first and last samples both read 0. That catches most frames
-           caught part-way through being written, but not the last sample's three audio bytes (no byte
-           value marks those): the settle time (CAP_SETTLE_UF) is what keeps the early reader clear of
-           a packet still being written. */
+           only once the pad bytes of its first and last samples both read 0: the controller writes a
+           packet in order, so the frame has then arrived up to its last sample, whose three audio bytes
+           come in the same aligned 32-bit word as its pad byte. (c.f. the SL 3, whose packed 24-bit
+           samples have no pad byte to mark.) The settle time (CAP_SETTLE_UF) keeps the early reader
+           clear of a packet still being written. */
         const volatile uint8_t *p = g_cap_bytes[idx] + k * PKT_MAX;
         int n = 0;
         while (n < PKT_MAX / FRAME_BYTES && p[n * FRAME_BYTES] == 0x00 &&
@@ -1438,6 +1516,7 @@ static void cap_complete(int idx, uint64_t fc, IOUSBHostIsochronousTransaction *
         }
         /* A good packet: into the ring. */
         int n = done[k].completeCount / FRAME_BYTES;
+        DBG_DO(dbg_cap_pkt_frames[n]++);
         const uint8_t *p = b + k * PKT_MAX;
         for (int s = 0; s < n; s++) {
             float *fr = &g_in_ring[((ring_pos + got) & RING_MASK) * NCH];
@@ -1595,6 +1674,33 @@ static dispatch_queue_t usb_queue_create(void) {
     return dispatch_queue_create("com.rane.sl2.usb", qa);
 }
 
+/* Open the HID interface (bInterfaceNumber IF_HID) if it is there and nobody else holds it; *there
+   says whether it is there at all. */
+static bool g_hid_reconfigured;   /* usb_ensure_hid has set the configuration again for this device */
+static IOUSBHostInterface *hid_open(bool *there) {
+    IOUSBHostInterface *found = nil;
+    *there = false;
+    io_iterator_t it = 0;
+    IORegistryEntryGetChildIterator(g_dev.ioService, kIOServicePlane, &it);
+    io_service_t ch;
+    while ((ch = IOIteratorNext(it))) {
+        CFNumberRef n = IORegistryEntryCreateCFProperty(ch, CFSTR("bInterfaceNumber"), kCFAllocatorDefault, 0);
+        if (n) {
+            int idx = -1;
+            CFNumberGetValue(n, kCFNumberIntType, &idx);
+            CFRelease(n);
+            if (idx == IF_HID && !found) {
+                *there = true;
+                found = [[IOUSBHostInterface alloc] initWithIOService:ch options:IOUSBHostObjectInitOptionsNone
+                                                                queue:g_q error:nil interestHandler:nil];
+            }
+        }
+        IOObjectRelease(ch);
+    }
+    IOObjectRelease(it);
+    return found;
+}
+
 /* Open the box's HID side (device, HID interface, its two pipes), if not already open. The device
    is opened once and kept: if its HID interface isn't registered yet (interfaces appear
    asynchronously after the device is configured), a later call only looks for it again. */
@@ -1610,31 +1716,33 @@ static bool usb_ensure_hid(void) {
         io_service_t svc = find_sl2_service();
         if (!svc) return false;
         g_dev = [[IOUSBHostDevice alloc] initWithIOService:svc options:IOUSBHostObjectInitOptionsNone queue:g_q error:&e interestHandler:nil];
+        g_hid_reconfigured = false;
         uint32_t hubs = usb_hub_depth(svc);
         atomic_store(&g_hub_depth, hubs);
-        if (hubs) LOG("Rane SL 2 is connected through %u USB hub%s", hubs, hubs > 1 ? "s" : "");
+        if (hubs) LOG("Rane SL 2 is connected through %u USB hub%{public}s", hubs, hubs > 1 ? "s" : "");
         IOObjectRelease(svc);
         if (!g_dev) { LOG("Failed to open IOUSBHostDevice: %{public}@", e); return false; }
     }
-    if (!g_dev.configurationDescriptor) [g_dev configureWithValue:1 matchInterfaces:YES error:&e];
+    /* Configure it, unless already done, with its interfaces not offered to other drivers: the HID
+       interface is HID-class, so macOS's HID driver would take it otherwise, whenever it got there
+       before the driver (after a userspace reboot with the box attached, matching runs again before
+       coreaudiod is back). */
+    if (!g_dev.configurationDescriptor) [g_dev configureWithValue:1 matchInterfaces:NO error:&e];
 
-    /* The HID interface: the device's child service with bInterfaceNumber IF_HID. */
+    /* The HID interface. If another driver holds it (the box was configured with its interfaces
+       offered for matching, as when the box was configured by something else), set the configuration
+       again, once per device opened: that terminates the interfaces and their drivers, and the new
+       ones aren't offered to anyone. */
     if (!g_hid) {
-        io_iterator_t it = 0;
-        IORegistryEntryGetChildIterator(g_dev.ioService, kIOServicePlane, &it);
-        io_service_t ch;
-        while ((ch = IOIteratorNext(it))) {
-            CFNumberRef n = IORegistryEntryCreateCFProperty(ch, CFSTR("bInterfaceNumber"), kCFAllocatorDefault, 0);
-            if (n) {
-                int idx = -1;
-                CFNumberGetValue(n, kCFNumberIntType, &idx);
-                CFRelease(n);
-                if (idx == IF_HID && !g_hid)
-                    g_hid = [[IOUSBHostInterface alloc] initWithIOService:ch options:IOUSBHostObjectInitOptionsNone queue:g_q error:&e interestHandler:nil];
-            }
-            IOObjectRelease(ch);
+        bool there = false;
+        g_hid = hid_open(&there);
+        if (!g_hid && there && !g_hid_reconfigured) {
+            g_hid_reconfigured = true;
+            LOG("The SL 2's HID interface is held by another driver: setting the box's configuration again");
+            [g_dev configureWithValue:0 matchInterfaces:NO error:&e];
+            [g_dev configureWithValue:1 matchInterfaces:NO error:&e];
+            g_hid = hid_open(&there);
         }
-        IOObjectRelease(it);
         if (!g_hid) return false;
     }
 
@@ -1642,12 +1750,18 @@ static bool usb_ensure_hid(void) {
     g_hpipe_out = [g_hid copyPipeWithAddress:EP_HID_OUT error:&e];
     g_hpipe_in  = [g_hid copyPipeWithAddress:EP_HID_IN error:&e];
     if (!g_hpipe_out || !g_hpipe_in) return false;
+    /* Clear both endpoints' halt, which resets their data toggles at both ends. Another host-side
+       client (macOS's HID driver, which may have held the interface) can leave the box's toggle at
+       DATA1 against a new pipe's DATA0: the box then takes every command for a repeat, acknowledges
+       and drops it, and never replies. */
+    [g_hpipe_out clearStallWithError:nil];
+    [g_hpipe_in clearStallWithError:nil];
     g_hbuf_in   = [NSMutableData dataWithLength:64];
     hid_read();
     refresh_hw_status();
-    /* Connected, and running firmware (only such a box is opened: find_sl2_service). */
+    /* Connected. (Only a box with bcdDevice 0x0100 is opened, find_sl2_service; refresh_hw_status has
+       set boot mode if it is running Rane's bootstrap.) */
     atomic_store(&g_hw_connected, true);
-    atomic_store(&g_boot_mode, false);
     return true;
 }
 
@@ -1689,6 +1803,11 @@ static void usb_release_audio(void) {
    failure, everything opened so far is released again. */
 static bool usb_open_all(void) {
     if (!usb_ensure_hid()) return false;
+    /* Rane's bootstrap has no audio to stream. */
+    if (atomic_load(&g_boot_mode)) {
+        LOG("Not streaming: the SL 2 is running Rane's firmware loader, not its firmware");
+        return false;
+    }
     NSError *e = nil;
 
     /* Playback stays off until the capture handler starts it; clear the debug counters. */
@@ -1743,8 +1862,14 @@ static bool usb_open_all(void) {
         atomic_store(&g_cap_tag[i], 0);
     }
 
-    /* Decks to USB audio. */
-    set_usb_switches(true);
+    /* Decks to USB audio, or as they were if this is the stream restarting after a replug. */
+    if (g_resume_pending) {
+        g_resume_pending = false;
+        set_thru(g_resume_thru);
+        LOG("Stream restarted after the replug: decks routed as before it");
+    } else {
+        set_usb_switches(true);
+    }
 
     /* A new timeline and an empty capture ring. */
     memset(g_in_ring, 0, sizeof(g_in_ring));
@@ -1798,6 +1923,12 @@ static void usb_stop_streaming(bool box_attached) {
             hb, dbg_capdelay_min, dbg_capdelay_max, dbg_capstamp_min, dbg_capstamp_max);
     }
     dbg_er_log("result");
+    {
+        char pb[200]; int o = 0;
+        for (int i = 0; i <= PKT_MAX / FRAME_BYTES; i++)
+            if (dbg_cap_pkt_frames[i]) o += snprintf(pb + o, sizeof pb - o, " %d:%u", i, dbg_cap_pkt_frames[i]);
+        DBG_LOG("DBG capture packet sizes at %.0f Hz (frames:packets):%{public}s", g_sr, pb);
+    }
 #endif
     /* Release the audio interfaces, then put the decks back on analogue thru if the box is here. */
     usb_release_audio();
@@ -1913,9 +2044,52 @@ static void relist_if_safety_changed(void) {
     });
 }
 
+/* Thru and the rate can be lost after connect_box has set them: the box finishes starting up (it loads
+   its FPGA) after it is configured, and it is suspended and resumed when the Mac sleeps. A while after
+   connecting, and after the Mac wakes, the driver checks: with nothing streaming, the decks' routing
+   (read from a state dump: thru, or as before a replug while the client is expected back, see
+   g_resume_pending); and the rate the driver's (0x30). Each correction is logged. */
+#define SETTLE_CHECK_MS  2000
+#define SETTLE_DUMP_MS   200     /* time for a state dump's reports to arrive */
+static void settle_check(const char *why) {
+    if (!atomic_load(&g_box_present)) return;   /* unplugged meanwhile */
+    /* The rate, streaming or not; and, with nothing streaming, a state dump for thru. */
+    pthread_mutex_lock(&g_mutex);
+    bool idle = false;
+    uint32_t seen = atomic_load(&g_thru_reports);
+    if (usb_ensure_hid() && !atomic_load(&g_boot_mode)) {
+        uint8_t r[HID_REPORT_LEN];
+        if (hid_cmd(SL2_CMD_GET_RATE, NULL, 0, r, NULL)) {
+            int sr = (r[5] << 8) | r[6];
+            if (sr != (int)g_sr) {
+                LOG("%{public}s: the box was at %d Hz: set to %.0f Hz", why, sr, g_sr);
+                send_hw_samplerate((int)g_sr);
+            }
+        }
+        idle = !atomic_load(&g_io_running);
+        if (idle) request_state();
+    }
+    pthread_mutex_unlock(&g_mutex);
+    if (!idle) return;
+    /* Once the dump has reported both decks, still idle: put the routing right if it has changed. */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, SETTLE_DUMP_MS * NSEC_PER_MSEC), g_hotplug_q, ^{
+        if (!atomic_load(&g_box_present)) return;
+        pthread_mutex_lock(&g_mutex);
+        bool wrong = false;
+        for (int d = 0; d < 2; d++)
+            if ((g_st.thru[d] != 0) != (g_resume_pending ? g_resume_thru[d] != 0 : true)) wrong = true;
+        if (atomic_load(&g_thru_reports) - seen >= 2 && !atomic_load(&g_io_running) && wrong) {
+            LOG("%{public}s: the decks' routing had changed with nothing streaming: %{public}s", why,
+                g_resume_pending ? "routed as before the replug" : "back to thru");
+            set_idle_routing();
+        }
+        pthread_mutex_unlock(&g_mutex);
+    });
+}
+
 /* Open a newly attached box and, with no stream running, put its decks on analogue thru (the box
    powers up with thru on or off depending on a board input), as at stream stop, so turntables
-   reach the mixer until an app streams. The first open can be refused ("exclusive open of usb
+   reach the mixer until an app streams; after a replug mid-stream, as they were (g_resume_pending). The first open can be refused ("exclusive open of usb
    object failed") while macOS is still setting the box up, about 1 connect in 30: retry for
    about a second. */
 #define CONNECT_TRIES    10
@@ -1925,13 +2099,35 @@ static void connect_box(int attempt) {
     /* Open it; unless a stream is already running, set thru and the current rate. */
     pthread_mutex_lock(&g_mutex);
     bool ok = usb_ensure_hid();
-    if (ok && !atomic_load(&g_io_running)) {
-        set_usb_switches(false);
+    bool resuming = false;
+    uint32_t window = g_resume_window;
+    if (g_resume_pending && (double)(mach_absolute_time() - g_resume_since) > RESUME_MAX_GAP_S * 1000.0 * ticks_per_ms())
+        g_resume_pending = false;   /* back long after the unplug: not the same session */
+    /* (Not on Rane's bootstrap: it has no audio, and the firmware tools are using it.) */
+    if (ok && !atomic_load(&g_io_running) && !atomic_load(&g_boot_mode)) {
+        set_idle_routing();   /* thru, or as before the unplug if a client was streaming */
+        resuming = g_resume_pending;
         send_hw_samplerate((int)g_sr);   /* the box powers up at 44.1 kHz */
     }
     pthread_mutex_unlock(&g_mutex);
+    /* Expecting a client back: if no stream has started after RESUME_WAIT_MS, thru after all. */
+    if (resuming) {
+        LOG("Decks routed as before the unplug; waiting %d s for the stream to restart", RESUME_WAIT_MS / 1000);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, RESUME_WAIT_MS * NSEC_PER_MSEC), g_hotplug_q, ^{
+            pthread_mutex_lock(&g_mutex);
+            if (g_resume_pending && g_resume_window == window && !atomic_load(&g_io_running)) {
+                g_resume_pending = false;
+                if (atomic_load(&g_box_present) && usb_ensure_hid()) set_usb_switches(false);
+                LOG("No stream restarted within %d s of the replug: decks back on thru", RESUME_WAIT_MS / 1000);
+            }
+            pthread_mutex_unlock(&g_mutex);
+        });
+    }
     if (ok) {
         if (attempt > 0) LOG("Rane SL 2 opened on attempt %d", attempt + 1);
+        /* Check again once the box has surely finished starting up (see settle_check). */
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, SETTLE_CHECK_MS * NSEC_PER_MSEC), g_hotplug_q,
+                       ^{ settle_check("After connecting"); });
         return;
     }
     /* Refused: try again on the hot-plug queue shortly, up to CONNECT_TRIES times in all. */
@@ -1994,6 +2190,13 @@ static void on_usb_removed(void *refcon, io_iterator_t iter) {
         LOG("Rane SL 2 USB disconnected");
         atomic_store(&g_box_present, false);
         pthread_mutex_lock(&g_mutex);
+        /* A client streaming: remember the decks' routing, to restore after a replug (g_resume_pending). */
+        if (g_io_clients > 0 && atomic_load(&g_io_running)) {
+            for (int d = 0; d < 2; d++) g_resume_thru[d] = g_st.thru[d] ? 1 : 0;
+            g_resume_pending = true;
+            g_resume_window++;
+            g_resume_since = mach_absolute_time();
+        }
         usb_close_all();
         /* The device leaves the HAL's list with the box, and a client using it again after a
            replug sends a new StartIO: start counting clients from zero. */
@@ -2001,9 +2204,35 @@ static void on_usb_removed(void *refcon, io_iterator_t iter) {
         g_io_clients = 0;
         pthread_mutex_unlock(&g_mutex);
     }
-    /* Bootloader mode follows what is still attached; tell the HAL if the device left its list. */
-    atomic_store(&g_boot_mode, bootloader);
+    /* Boot mode follows what is still attached (a box in its bootloader, or Rane's bootstrap, known
+       by its version); tell the HAL if the device left its list. */
+    bool loader = atomic_load(&g_box_present) &&
+                  (g_st.version_maj << 8 | g_st.version_min) == SL2_BOOTSTRAP_VERSION;
+    atomic_store(&g_boot_mode, bootloader || loader);
     if (was_published != device_published()) notify_device_list_changed();
+}
+
+/* System sleep and wake: the box is suspended with the Mac and resumed after it (see settle_check).
+   Sleep itself is always allowed. */
+static io_connect_t g_pm_root;
+static IONotificationPortRef g_pm_port;
+static io_object_t g_pm_notifier;
+static void on_power(void *refcon, io_service_t svc, natural_t msg, void *arg) {
+    switch (msg) {
+        case kIOMessageCanSystemSleep:
+        case kIOMessageSystemWillSleep:
+            IOAllowPowerChange(g_pm_root, (long)arg);
+            break;
+        case kIOMessageSystemHasPoweredOn:
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * SETTLE_CHECK_MS * NSEC_PER_MSEC), g_hotplug_q,
+                           ^{ settle_check("After the Mac woke"); });
+            break;
+    }
+}
+static void start_power_monitor(void) {
+    g_pm_root = IORegisterForSystemPower(NULL, &g_pm_port, on_power, &g_pm_notifier);
+    if (!g_pm_root) { LOG("System wake notifications could not be set up: thru and rate aren't checked after a wake"); return; }
+    IONotificationPortSetDispatchQueue(g_pm_port, g_hotplug_q);
 }
 
 /* Watch for the box being plugged in and unplugged, and handle one already attached. */
@@ -2066,11 +2295,13 @@ static OSStatus SL2_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerP
     g_log = os_log_create("com.rane.sl2", "HAL");
     g_host = inHost;
     in_safety_load();
+    rate_load();
     in_safety_apply();
     mach_timebase_info(&g_tb);
     clk_reset();
     start_hotplug_monitor();
-    LOG("SL2Device %s (%s) AudioServerPlugIn Initialized", SL2_VERSION, SL2_DEBUG ? "DEBUG" : "release");
+    start_power_monitor();
+    LOG("SL2Device %{public}s (%{public}s) AudioServerPlugIn Initialized", SL2_VERSION, SL2_DEBUG ? "DEBUG" : "release");
     return kAudioHardwareNoError;
 }
 
@@ -2092,6 +2323,7 @@ static OSStatus SL2_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef 
         if (was_streaming) usb_stop_streaming(true);
         /* Switch the rate and start a new timeline at it. */
         g_sr = (Float64)action;
+        rate_save();
         clk_reset();
         atomic_fetch_add(&g_zts_seed, 1);   /* new timeline for the HAL */
         /* Restart the stream at the new rate, or, with none running, just tell the box. */
