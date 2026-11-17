@@ -16,15 +16,22 @@ static int usage(void) {
     return 2;
 }
 
+/* The driver's debug commands (SL2_CMD_DBG_* in plugin/SL2Device.m). */
+enum {
+    SL2_CMD_DBG_STALL   = 0xF3,   /* [5..6] ms, big-endian */
+    SL2_CMD_DBG_ERRPKTS = 0xF4,   /* [5] n */
+    SL2_CMD_DBG_NOEARLY = 0xF5,   /* [5] 1 = off, 0 = on */
+};
+
 int main(int argc, char **argv) {
     if (argc < 3) return usage();
 
     // Build the command: opcode at [0], argument from [5] (bytes [1..4] are the request tag).
     UInt8 cmd[64] = {0};
     long v = strtol(argv[2], NULL, 10);
-    if (!strcmp(argv[1], "stall"))     { cmd[0] = 0xF3; cmd[5] = (UInt8)(v >> 8); cmd[6] = (UInt8)v; }
-    else if (!strcmp(argv[1], "errpkts"))   { cmd[0] = 0xF4; cmd[5] = (UInt8)v; }
-    else if (!strcmp(argv[1], "noearly"))   { cmd[0] = 0xF5; cmd[5] = v ? 1 : 0; }
+    if (!strcmp(argv[1], "stall"))          { cmd[0] = SL2_CMD_DBG_STALL; cmd[5] = (UInt8)(v >> 8); cmd[6] = (UInt8)v; }
+    else if (!strcmp(argv[1], "errpkts"))   { cmd[0] = SL2_CMD_DBG_ERRPKTS; cmd[5] = (UInt8)v; }
+    else if (!strcmp(argv[1], "noearly"))   { cmd[0] = SL2_CMD_DBG_NOEARLY; cmd[5] = v ? 1 : 0; }
     else return usage();
 
     // Find the driver's device by its UID.

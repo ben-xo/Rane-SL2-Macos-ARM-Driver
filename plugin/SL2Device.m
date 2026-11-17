@@ -94,6 +94,11 @@ enum {
     SL2_NOTE_LINE_PHONO    = 0x61,   /* the one LINE/PHONO switch: On = phono (reported only) */
     /* Reports the driver makes itself (not from the box), queued for clients like the box's: */
     SL2_EVT_SAMPLE_RATE    = 0x4F,   /* [5..7] rate, big-endian */
+    /* Debug commands (debug build only): handled by the driver, never sent to the box. */
+    SL2_CMD_DEBUG_FIRST    = 0xF0,   /* this and above are debug commands; a release build refuses them */
+    SL2_CMD_DBG_STALL      = 0xF3,   /* [5..6] ms, big-endian: hold the USB queue this long, once */
+    SL2_CMD_DBG_ERRPKTS    = 0xF4,   /* [5] n: treat the next n capture packets as errored */
+    SL2_CMD_DBG_NOEARLY    = 0xF5,   /* [5] 1: the early reader places nothing; 0: back on */
 };
 
 
@@ -3163,16 +3168,16 @@ static OSStatus dbg_command(const uint8_t *c, CFIndex len) {
     /* Every command needs at least its first argument byte, [5]. */
     if (len < 6) return kAudioHardwareBadPropertySizeError;
     switch (c[0]) {
-        case 0xF3:
+        case SL2_CMD_DBG_STALL:
             if (len < 7) return kAudioHardwareBadPropertySizeError;
             atomic_store(&dbg_stall_ms, ((uint32_t)c[5] << 8) | c[6]);
             DBG_LOG("DBG next capture completion stalls the USB queue for %u ms", atomic_load(&dbg_stall_ms));
             return 0;
-        case 0xF4:
+        case SL2_CMD_DBG_ERRPKTS:
             atomic_store(&dbg_err_pkts, c[5]);
             DBG_LOG("DBG next %u capture packets treated as errored", c[5]);
             return 0;
-        case 0xF5:
+        case SL2_CMD_DBG_NOEARLY:
             atomic_store(&dbg_no_early, c[5] != 0);
             DBG_LOG("DBG early capture read %{public}s", c[5] ? "off" : "on");
             return 0;
@@ -3205,9 +3210,9 @@ static OSStatus SL2_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
     if (oid == kObjDevice && addr->mSelector == kSL2PropHIDCommand) {
         if (inSize == sizeof(CFDataRef) && inData) {
             CFDataRef cd = *(CFDataRef*)inData;
-            /* Debug commands (0xF0 and up) are handled by the driver, never sent to the box. */
+            /* Debug commands (SL2_CMD_DEBUG_FIRST and up) are handled by the driver, never sent to the box. */
             if (cd && CFGetTypeID(cd) == CFDataGetTypeID() && CFDataGetLength(cd) >= 1 &&
-                CFDataGetBytePtr(cd)[0] >= 0xF0) {
+                CFDataGetBytePtr(cd)[0] >= SL2_CMD_DEBUG_FIRST) {
 #if SL2_DEBUG
                 return dbg_command(CFDataGetBytePtr(cd), CFDataGetLength(cd));
 #else
