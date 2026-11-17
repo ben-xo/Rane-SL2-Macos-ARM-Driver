@@ -2347,8 +2347,11 @@ static OSStatus SL2_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef 
         clk_reset();
         atomic_fetch_add(&g_zts_seed, 1);   /* new timeline for the HAL */
         /* Restart the stream at the new rate, or, with none running, just tell the box. */
-        if (was_streaming && !usb_open_all()) LOG("Could not restart streaming at %.0f Hz", g_sr);   /* sends 0x31 itself */
-        else if (usb_ensure_hid()) send_hw_samplerate((int)g_sr);
+        if (was_streaming) {
+            if (!usb_open_all()) LOG("Could not restart streaming at %.0f Hz", g_sr);   /* sends 0x31 itself */
+        } else if (usb_ensure_hid()) {
+            send_hw_samplerate((int)g_sr);
+        }
         LOG("Sample rate changed to %.0f Hz", g_sr);
     }
     pthread_mutex_unlock(&g_mutex);
