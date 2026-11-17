@@ -54,8 +54,8 @@ every click found at every size):
 of 6 (5.512 on average, for 5.5125); at 48 kHz 23,723 of 6, with 78 of 5 and 63 of 7 (0.6%), where the
 box corrects its clock.
 
-**Across a Mac sleep** (at 44.1 kHz, with nothing streaming) the box kept both decks on thru and its rate:
-the settle check found nothing to correct.
+**Across a Mac sleep** (at 44.1 kHz and at 48 kHz, with nothing streaming) the box kept both decks on thru
+and its rate: the settle check found nothing to correct.
 
 **Serato's "USB buffer size" is the CoreAudio IO buffer size.** Serato DJ Pro (2.5.5, from its code) turns
 the setting into frames (1 ms is 45 frames at 44.1 kHz, after rounding to the device's alignment) and sets
@@ -689,7 +689,7 @@ build; *(hook)* uses `tools/latency/bin/sl2dbg`.
       connect and after a USB resume; whether the SL 2 loses either is not yet known.
     - Fix: the settle check (Design, section 6), which logs any correction.
     - Test: `make hwtest`, "thru and rate after the Mac sleeps"; the log after a sleep shows whether the
-      box needed a correction. Seen on an SL 2 at 44.1 kHz: it kept both (the SL 3's firmware doesn't).
+      box needed a correction. Seen on an SL 2 at both rates: it kept both (the SL 3's firmware doesn't).
       `19f00ce`.
 51. **`sl2flash` would take any blank FX2 for an SL 2, and kept no copy of the EEPROM it replaced.**
     - Fix: a blank FX2 (`04b4:8613`) only with `--blank-fx2`; the whole EEPROM is saved to
