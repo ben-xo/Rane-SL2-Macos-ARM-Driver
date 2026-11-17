@@ -1674,10 +1674,10 @@ static dispatch_queue_t usb_queue_create(void) {
     return dispatch_queue_create("com.rane.sl2.usb", qa);
 }
 
-/* Open the HID interface (bInterfaceNumber IF_HID) if it is there and nobody else holds it; *there
-   says whether it is there at all. */
+/* Open the box's interface ifnum (its bInterfaceNumber) if it is there and nobody else holds it. *there
+   says whether it is there at all; *err gets why the open failed. */
 static bool g_hid_reconfigured;   /* usb_ensure_hid has set the configuration again for this device */
-static IOUSBHostInterface *hid_open(bool *there) {
+static IOUSBHostInterface *usb_open_interface(int ifnum, bool *there, NSError **err) {
     IOUSBHostInterface *found = nil;
     *there = false;
     io_iterator_t it = 0;
@@ -1689,10 +1689,10 @@ static IOUSBHostInterface *hid_open(bool *there) {
             int idx = -1;
             CFNumberGetValue(n, kCFNumberIntType, &idx);
             CFRelease(n);
-            if (idx == IF_HID && !found) {
+            if (idx == ifnum && !*there) {
                 *there = true;
                 found = [[IOUSBHostInterface alloc] initWithIOService:ch options:IOUSBHostObjectInitOptionsNone
-                                                                queue:g_q error:nil interestHandler:nil];
+                                                                queue:g_q error:err interestHandler:nil];
             }
         }
         IOObjectRelease(ch);
@@ -1735,13 +1735,13 @@ static bool usb_ensure_hid(void) {
        ones aren't offered to anyone. */
     if (!g_hid) {
         bool there = false;
-        g_hid = hid_open(&there);
+        g_hid = usb_open_interface(IF_HID, &there, &e);
         if (!g_hid && there && !g_hid_reconfigured) {
             g_hid_reconfigured = true;
             LOG("The SL 2's HID interface is held by another driver: setting the box's configuration again");
             [g_dev configureWithValue:0 matchInterfaces:NO error:&e];
             [g_dev configureWithValue:1 matchInterfaces:NO error:&e];
-            g_hid = hid_open(&there);
+            g_hid = usb_open_interface(IF_HID, &there, &e);
         }
         if (!g_hid) return false;
     }
@@ -1816,21 +1816,9 @@ static bool usb_open_all(void) {
     DBG_DO(dbg_reset());
 
     /* Claim the playback and capture interfaces. */
-    io_iterator_t it = 0;
-    IORegistryEntryGetChildIterator(g_dev.ioService, kIOServicePlane, &it);
-    io_service_t ch;
-    while ((ch = IOIteratorNext(it))) {
-        CFNumberRef n = IORegistryEntryCreateCFProperty(ch, CFSTR("bInterfaceNumber"), kCFAllocatorDefault, 0);
-        if (n) {
-            int idx = -1;
-            CFNumberGetValue(n, kCFNumberIntType, &idx);
-            CFRelease(n);
-            if (idx == IF_PLAY && !g_play) g_play = [[IOUSBHostInterface alloc] initWithIOService:ch options:IOUSBHostObjectInitOptionsNone queue:g_q error:&e interestHandler:nil];
-            if (idx == IF_CAP  && !g_cap)  g_cap  = [[IOUSBHostInterface alloc] initWithIOService:ch options:IOUSBHostObjectInitOptionsNone queue:g_q error:&e interestHandler:nil];
-        }
-        IOObjectRelease(ch);
-    }
-    IOObjectRelease(it);
+    bool there = false;
+    if (!g_play) g_play = usb_open_interface(IF_PLAY, &there, &e);
+    if (!g_cap)  g_cap  = usb_open_interface(IF_CAP, &there, &e);
     if (!g_play || !g_cap) {
         LOG("Failed to claim Play/Cap interfaces");
         usb_release_audio();
