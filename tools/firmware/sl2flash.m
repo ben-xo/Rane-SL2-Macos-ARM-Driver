@@ -246,10 +246,12 @@ done:
 
 /* ---- the EEPROM, through the driver ---- */
 
-/* Poll command 0x01 until the box answers through the driver (which opens it on demand). */
-static bool wait_for_answer(AudioObjectID hal, double seconds, uint8_t *maj, uint8_t *min) {
+/* Poll command 0x01 until the box answers through the driver. The driver lists its device only
+   while a box is attached, so the device is looked up again each time. */
+static bool wait_for_answer(AudioObjectID *hal, double seconds, uint8_t *maj, uint8_t *min) {
     for (int i = 0; i < (int)(seconds * 4); i++) {
-        if (sl2h_version(hal, maj, min)) return true;
+        *hal = sl2h_find_device();
+        if (*hal != kAudioObjectUnknown && sl2h_version(*hal, maj, min)) return true;
         usleep(250000);
     }
     return false;
@@ -339,7 +341,7 @@ static bool finalize(AudioObjectID hal, const uint8_t *final_hdr) {
     if (!back) { printf("the box did not come back within 30 s\n"); return false; }
 
     uint8_t maj, min;
-    if (!wait_for_answer(hal, 15, &maj, &min)) { printf("the box is back but does not answer through the driver\n"); return false; }
+    if (!wait_for_answer(&hal, 15, &maj, &min)) { printf("the box is back but does not answer through the driver\n"); return false; }
     printf("the box is running firmware %u.%02u\n", maj, min);
     if (maj != final_hdr[0x27] || min != final_hdr[0x28]) {
         printf("expected %u.%02u from the image\n", final_hdr[0x27], final_hdr[0x28]);
@@ -408,7 +410,7 @@ int main(int argc, char **argv) {
         bool ok = stage1(b[0].svc, boot.data);
         release_boxes(b, n);
         if (!ok) return 1;
-        if (!wait_for_answer(hal, 20, &maj, &min)) { printf("the bootstrap did not answer through the driver within 20 s\n"); return 1; }
+        if (!wait_for_answer(&hal, 20, &maj, &min)) { printf("the bootstrap did not answer through the driver within 20 s\n"); return 1; }
         printf("bootstrap running (reports %u.%02u)\n", maj, min);
     }
     if (sl2h_is_streaming(hal)) { printf("the SL 2 is in use for audio; stop playback (or quit the app using it) and try again\n"); return 1; }
