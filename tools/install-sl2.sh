@@ -5,7 +5,9 @@
 # was there before the first --api install.
 #
 # Prerequisite: the driver and framework bundles must already be installed, by the release package
-# (Installer/RaneSL2-macOS-Universal.pkg). This script only replaces the binaries inside them.
+# (Installer/RaneSL2-macOS-Universal.pkg). This script only replaces the binaries inside them, and the
+# driver's Info.plist (plugin/Device-Info.plist, as the package has it), so the bundle's version, which
+# the control panel shows, is the installed binary's.
 #
 # usage: sudo tools/install-sl2.sh [--api] [driver-binary]
 #        sudo tools/install-sl2.sh --restore-api
@@ -63,6 +65,8 @@ fi
 # The driver, then restart CoreAudio and the processes that go stale when it restarts.
 need_bundle "$DRV"
 echo "installing $SRC"
+cp "$ROOT/plugin/Device-Info.plist" "$DRV/Contents/Info.plist.new"
+mv -f "$DRV/Contents/Info.plist.new" "$DRV/Contents/Info.plist"
 install_binary "$SRC" "$DRV" Contents/MacOS/SL2Device
 killall coreaudiod || true
 killall -9 AirPlayXPCHelper 2>/dev/null || true   # can loop re-registering with the new coreaudiod; ignores SIGTERM
