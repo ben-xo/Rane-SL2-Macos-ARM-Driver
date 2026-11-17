@@ -7,11 +7,11 @@ with no glitches under load. See `docs/SL2-AUDIO-ENGINE.md`.
 
 They are written for the SL 2 driver, but they are a model for testing the SL 3 and SL 4 drivers. The
 measurement tools work with any CoreAudio device. `dptest.sh`, `restartcheck.sh` and `logq.sh` take the
-device name and the driver's log subsystem from two environment variables (the other tools take the device
-name as an argument):
+device name, the driver's log subsystem and the looped-back channel (`SL_LOOP_CH`, default 1) from
+environment variables (the other tools take the device name and channels as arguments):
 
 ```
-SL_DEVICE="SL 3" SL_LOG_SUBSYSTEM=com.rane.sl3 tools/latency/restartcheck.sh
+SL_DEVICE="SL 3" SL_LOG_SUBSYSTEM=com.rane.sl3 SL_LOOP_CH=3 tools/latency/restartcheck.sh
 ```
 
 The log lines the scripts look for are the SL 2 driver's, so they need adapting for another driver.
