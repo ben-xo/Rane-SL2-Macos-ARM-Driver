@@ -28,6 +28,8 @@
 #import <CoreAudio/AudioServerPlugIn.h>
 #import <IOKit/IOKitLib.h>
 #import <IOKit/usb/IOUSBLib.h>
+#import <IOKit/pwr_mgt/IOPMLib.h>
+#import <IOKit/IOMessage.h>
 #import <IOUSBHost/IOUSBHost.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
@@ -76,6 +78,7 @@ enum {
     SL2_CMD_EEPROM_WRITE   = 0x02,   /* refused (0xFF, stale tag) unless 0x17 enabled it */
     SL2_CMD_NO_REPLY       = 0x06,   /* the box sends no reply */
     SL2_CMD_PORT_SPEED     = 0x0a,   /* reply [5]: 0 unconfigured, 1 full speed, 2 high speed */
+    SL2_CMD_GET_RATE       = 0x30,   /* reply [5..6] rate, big-endian */
     SL2_CMD_SET_RATE       = 0x31,   /* [5..6] rate, big-endian: 44100 or 48000 */
     SL2_CMD_REPORTS        = 0x36,   /* [5] non-zero: send unsolicited 0x40 reports */
     SL2_CMD_CHALLENGE      = 0x37,   /* [5..12] challenge -> reply [5..12] response */
@@ -394,6 +397,7 @@ static uint8_t  g_wait_cmd = 0;
 static uint32_t g_wait_seq = 0;
 static uint8_t  g_reply_buf[HID_REPORT_LEN];
 static SL2StatusPacket g_st;
+static _Atomic uint32_t g_thru_reports;   /* thru notes reported by the box (hid_read), to see a state dump arrive */
 
 
 /* Reports for clients (see unsol_push) */
@@ -484,6 +488,7 @@ static void hid_read(void) {
                     int on = ((st & 0xF0) == 0x90) ? 1 : 0;
                     if (note == SL2_NOTE_THRU_DECK1 || note == SL2_NOTE_THRU_DECK2) {
                         g_st.thru[note - SL2_NOTE_THRU_DECK1] = on;
+                        atomic_fetch_add(&g_thru_reports, 1);
                     } else if (note == SL2_NOTE_LINE_PHONO) {
                         /* the box's one LINE/PHONO switch (firmware input PE0), shared by both decks */
                         g_st.phono[0] = g_st.phono[1] = on;
@@ -557,6 +562,16 @@ static bool hid_cmd(uint8_t cmd, const uint8_t *pl, size_t plen, uint8_t *reply_
     return accepted;
 }
 
+/* Switch and thru state arrive as unsolicited 0x40 reports (parsed in hid_read), which the box sends
+   only once 0x36 has enabled them. Enable them, then ask for a state dump (0x41 SysEx F0 17 04 F7),
+   which reports the LINE/PHONO switch and both decks' thru, so they are known before they change. */
+static void request_state(void) {
+    uint8_t enable[1] = { 1 };
+    hid_cmd(SL2_CMD_REPORTS, enable, 1, NULL, NULL);
+    uint8_t dump[5] = { 4, 0xF0, 0x17, 0x04, 0xF7 };
+    hid_cmd(SL2_CMD_HIDI, dump, 5, NULL, NULL);
+}
+
 static void refresh_hw_status(void) {
     /* Firmware version via HID command 0x01, as Rane's SL2Api reads it
        (SendHidRequest(dev, 0x01, ...) -> reply[5]=major, reply[6]=minor, 32-bit build stamp at
@@ -603,15 +618,8 @@ static void refresh_hw_status(void) {
         g_st.port_a = r[5];
         g_st.port_b = r[6];
     }
-    /* Switch and thru state arrive as unsolicited 0x40 reports (parsed in hid_read), which the box
-       sends only once 0x36 has enabled them. Then ask for a state dump (0x41 SysEx F0 17 04 F7),
-       so the LINE/PHONO switch is known before it is first moved. The bootstrap has no switches to
-       report and no 0x41. */
-    if (loader) return;
-    uint8_t enable[1] = { 1 };
-    hid_cmd(SL2_CMD_REPORTS, enable, 1, NULL, NULL);
-    uint8_t dump[5] = { 4, 0xF0, 0x17, 0x04, 0xF7 };
-    hid_cmd(SL2_CMD_HIDI, dump, 5, NULL, NULL);
+    /* The switch and thru state (the bootstrap has no switches to report and no 0x41). */
+    if (!loader) request_state();
 }
 
 static void send_hw_samplerate(int sr) {
@@ -1972,6 +1980,45 @@ static void relist_if_safety_changed(void) {
     });
 }
 
+/* Thru and the rate can be lost after connect_box has set them: the box finishes starting up (it loads
+   its FPGA) after it is configured, and it is suspended and resumed when the Mac sleeps. A while after
+   connecting, and after the Mac wakes, the driver checks: with nothing streaming, both decks on thru
+   (read from a state dump); and the rate the driver's (0x30). Each correction is logged. */
+#define SETTLE_CHECK_MS  2000
+#define SETTLE_DUMP_MS   200     /* time for a state dump's reports to arrive */
+static void settle_check(const char *why) {
+    if (!atomic_load(&g_box_present)) return;   /* unplugged meanwhile */
+    /* The rate, streaming or not; and, with nothing streaming, a state dump for thru. */
+    pthread_mutex_lock(&g_mutex);
+    bool idle = false;
+    uint32_t seen = atomic_load(&g_thru_reports);
+    if (usb_ensure_hid() && !atomic_load(&g_boot_mode)) {
+        uint8_t r[HID_REPORT_LEN];
+        if (hid_cmd(SL2_CMD_GET_RATE, NULL, 0, r, NULL)) {
+            int sr = (r[5] << 8) | r[6];
+            if (sr != (int)g_sr) {
+                LOG("%{public}s: the box was at %d Hz: set to %.0f Hz", why, sr, g_sr);
+                send_hw_samplerate((int)g_sr);
+            }
+        }
+        idle = !atomic_load(&g_io_running);
+        if (idle) request_state();
+    }
+    pthread_mutex_unlock(&g_mutex);
+    if (!idle) return;
+    /* Once the dump has reported both decks: back to thru if either is on USB audio, still idle. */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, SETTLE_DUMP_MS * NSEC_PER_MSEC), g_hotplug_q, ^{
+        if (!atomic_load(&g_box_present)) return;
+        pthread_mutex_lock(&g_mutex);
+        if (atomic_load(&g_thru_reports) - seen >= 2 && !atomic_load(&g_io_running) &&
+            (!g_st.thru[0] || !g_st.thru[1])) {
+            LOG("%{public}s: a deck was on USB audio with nothing streaming: back to thru", why);
+            set_usb_switches(false);
+        }
+        pthread_mutex_unlock(&g_mutex);
+    });
+}
+
 /* Open a newly attached box and, with no stream running, put its decks on analogue thru (the box
    powers up with thru on or off depending on a board input), as at stream stop, so turntables
    reach the mixer until an app streams. The first open can be refused ("exclusive open of usb
@@ -1992,6 +2039,9 @@ static void connect_box(int attempt) {
     pthread_mutex_unlock(&g_mutex);
     if (ok) {
         if (attempt > 0) LOG("Rane SL 2 opened on attempt %d", attempt + 1);
+        /* Check again once the box has surely finished starting up (see settle_check). */
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, SETTLE_CHECK_MS * NSEC_PER_MSEC), g_hotplug_q,
+                       ^{ settle_check("After connecting"); });
         return;
     }
     /* Refused: try again on the hot-plug queue shortly, up to CONNECT_TRIES times in all. */
@@ -2069,6 +2119,29 @@ static void on_usb_removed(void *refcon, io_iterator_t iter) {
     if (was_published != device_published()) notify_device_list_changed();
 }
 
+/* System sleep and wake: the box is suspended with the Mac and resumed after it (see settle_check).
+   Sleep itself is always allowed. */
+static io_connect_t g_pm_root;
+static IONotificationPortRef g_pm_port;
+static io_object_t g_pm_notifier;
+static void on_power(void *refcon, io_service_t svc, natural_t msg, void *arg) {
+    switch (msg) {
+        case kIOMessageCanSystemSleep:
+        case kIOMessageSystemWillSleep:
+            IOAllowPowerChange(g_pm_root, (long)arg);
+            break;
+        case kIOMessageSystemHasPoweredOn:
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * SETTLE_CHECK_MS * NSEC_PER_MSEC), g_hotplug_q,
+                           ^{ settle_check("After the Mac woke"); });
+            break;
+    }
+}
+static void start_power_monitor(void) {
+    g_pm_root = IORegisterForSystemPower(NULL, &g_pm_port, on_power, &g_pm_notifier);
+    if (!g_pm_root) { LOG("System wake notifications could not be set up: thru and rate aren't checked after a wake"); return; }
+    IONotificationPortSetDispatchQueue(g_pm_port, g_hotplug_q);
+}
+
 /* Watch for the box being plugged in and unplugged, and handle one already attached. */
 static void start_hotplug_monitor(void) {
     /* A serial queue for hot-plug work, and an IOKit notification port that delivers onto it. */
@@ -2134,6 +2207,7 @@ static OSStatus SL2_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerP
     mach_timebase_info(&g_tb);
     clk_reset();
     start_hotplug_monitor();
+    start_power_monitor();
     LOG("SL2Device %{public}s (%{public}s) AudioServerPlugIn Initialized", SL2_VERSION, SL2_DEBUG ? "DEBUG" : "release");
     return kAudioHardwareNoError;
 }
