@@ -34,6 +34,7 @@
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <os/log.h>
+#include <os/lock.h>
 #include <stdatomic.h>
 #include <math.h>
 
@@ -402,6 +403,12 @@ static uint32_t g_wait_seq = 0;
 static pthread_mutex_t g_reply_mtx = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t  g_reply_buf[HID_REPORT_LEN];
 static SL2StatusPacket g_st;
+/* g_st's box-state fields are written from the USB queue (reports), the hot-plug queue and client
+   threads: each write, and the copy 'sl2s' returns, is made under g_st_lock, so a client never gets
+   a packet mixed from two updates. Held only for the copy, never across a HID command. */
+static os_unfair_lock g_st_lock = OS_UNFAIR_LOCK_INIT;
+#define ST_LOCK()   os_unfair_lock_lock(&g_st_lock)
+#define ST_UNLOCK() os_unfair_lock_unlock(&g_st_lock)
 static _Atomic uint32_t g_thru_reports;   /* thru notes reported by the box (hid_read), to see a state dump arrive */
 
 
@@ -505,11 +512,11 @@ static void hid_read(void) {
                     uint8_t st = b[6 + i], note = b[6 + i + 1];   /* [6 + i + 2], the velocity, is always 0x40 */
                     int on = ((st & 0xF0) == 0x90) ? 1 : 0;
                     if (note == SL2_NOTE_THRU_DECK1 || note == SL2_NOTE_THRU_DECK2) {
-                        g_st.thru[note - SL2_NOTE_THRU_DECK1] = on;
+                        ST_LOCK(); g_st.thru[note - SL2_NOTE_THRU_DECK1] = on; ST_UNLOCK();
                         atomic_fetch_add(&g_thru_reports, 1);
                     } else if (note == SL2_NOTE_LINE_PHONO) {
                         /* the box's one LINE/PHONO switch (firmware input PE0), shared by both decks */
-                        g_st.phono[0] = g_st.phono[1] = on;
+                        ST_LOCK(); g_st.phono[0] = g_st.phono[1] = on; ST_UNLOCK();
                     }
                 }
                 unsol_push(b);
@@ -621,19 +628,23 @@ static void refresh_hw_status(void) {
        reply[7..10]); c.f. the SL3, which uses 0x10. bcdDevice is only a mode marker
        (0x0100 = running firmware, 0x0000 = bootloader), not the version. */
     uint8_t r[64];
-    g_st.version_maj = g_st.version_min = 0;   /* not the previous box's, if this one doesn't answer */
-    g_st.port_a = g_st.port_b = 0;
+    uint8_t maj = 0, min = 0;   /* 0.00, not the previous box's, if this one doesn't answer */
     for (int attempt = 0; attempt < 2; attempt++) {   /* the box may still be loading its FPGA */
         if (hid_cmd(SL2_CMD_VERSION, NULL, 0, r, NULL)) {
-            g_st.version_maj = r[5];
-            g_st.version_min = r[6];
+            maj = r[5];
+            min = r[6];
             break;
         }
     }
+    ST_LOCK();
+    g_st.version_maj = maj; g_st.version_min = min;
+    g_st.port_a = g_st.port_b = 0;
+    g_st.usb_link = 0;
+    ST_UNLOCK();
     /* Rane's bootstrap (the RAM-loaded EEPROM writer that sl2flash and Rane's updater load into a box
        in its bootloader) enumerates exactly like the running firmware, bcdDevice 0x0100 included, and
        answers 01 02: that box has no audio. */
-    bool loader = (g_st.version_maj << 8 | g_st.version_min) == SL2_BOOTSTRAP_VERSION;
+    bool loader = (maj << 8 | min) == SL2_BOOTSTRAP_VERSION;
     atomic_store(&g_bootstrap_open, loader);
     if (loader) {
         atomic_store(&g_boot_mode, true);
@@ -642,9 +653,8 @@ static void refresh_hw_status(void) {
     }
     /* USB speed (0x0a: 1 = full speed, 2 = high speed). At full speed the box offers only its HID
        interface, so there is no audio: say so, as the only other sign is a failed stream start. */
-    g_st.usb_link = 0;
     if (hid_cmd(SL2_CMD_PORT_SPEED, NULL, 0, r, NULL)) {
-        g_st.usb_link = r[5];
+        ST_LOCK(); g_st.usb_link = r[5]; ST_UNLOCK();
         if (r[5] == 1)
             LOG("The SL 2 is on a full-speed (USB 1.1) link: no audio. Connect it to a USB 2.0 high-speed port.");
     }
@@ -652,15 +662,16 @@ static void refresh_hw_status(void) {
        of the firmware version; c.f. the SL3, which queries it over HID 0x04. */
     CFTypeRef ser = IORegistryEntryCreateCFProperty(g_dev.ioService, CFSTR("USB Serial Number"), kCFAllocatorDefault, 0);
     if (ser) {
-        if (CFGetTypeID(ser) == CFStringGetTypeID())
-            CFStringGetCString((CFStringRef)ser, (char *)g_st.serial, sizeof g_st.serial, kCFStringEncodingUTF8);
+        char sb[sizeof g_st.serial] = {0};
+        if (CFGetTypeID(ser) == CFStringGetTypeID() && CFStringGetCString((CFStringRef)ser, sb, sizeof sb, kCFStringEncodingUTF8)) {
+            ST_LOCK(); memcpy(g_st.serial, sb, sizeof sb); ST_UNLOCK();
+        }
         CFRelease(ser);
     }
     /* Port status (0x45), kept in the status packet for clients; always 00 00 on the SL 2. */
     uint8_t req_ports[1] = {0};
     if (hid_cmd(SL2_CMD_PORT_STATUS, req_ports, 1, r, NULL)) {
-        g_st.port_a = r[5];
-        g_st.port_b = r[6];
+        ST_LOCK(); g_st.port_a = r[5]; g_st.port_b = r[6]; ST_UNLOCK();
     }
     /* The switch and thru state (the bootstrap has no switches to report and no 0x41). */
     if (!loader) request_state();
@@ -678,7 +689,7 @@ static void set_thru(const uint8_t thru[2]) {
     for (int i = 0; i < 2; i++) {
         uint8_t pl[4] = { 0x03, thru[i] ? 0x90 : 0x80, (uint8_t)(SL2_NOTE_THRU_DECK1 + i), 0x00 };
         hid_cmd(SL2_CMD_HIDI, pl, 4, NULL, NULL);
-        g_st.thru[i] = thru[i] ? 1 : 0;
+        ST_LOCK(); g_st.thru[i] = thru[i] ? 1 : 0; ST_UNLOCK();
     }
 }
 static void set_usb_switches(bool usb_mode) {
@@ -3023,6 +3034,7 @@ static OSStatus get_property_data(AudioServerPlugInDriverRef d, AudioObjectID oi
                 /* The status packet: fill in the live fields (the HID code keeps the rest up to
                    date), then return a copy as CFData. */
                 pthread_mutex_lock(&g_mutex);
+                ST_LOCK();
                 g_st.connected = atomic_load(&g_hw_connected) ? 1 : 0;
                 g_st.streaming = atomic_load(&g_io_running) ? 1 : 0;
                 g_st.sample_rate = (uint32_t)g_sr;
@@ -3034,8 +3046,10 @@ static OSStatus get_property_data(AudioServerPlugInDriverRef d, AudioObjectID oi
                 g_st.early_read = atomic_load(&g_early_state);
                 g_st.hub_depth = atomic_load(&g_hub_depth);
                 g_st.in_dropouts = atomic_load(&g_in_dropouts);
+                SL2StatusPacket copy = g_st;
+                ST_UNLOCK();
                 pthread_mutex_unlock(&g_mutex);
-                *(CFDataRef*)outData = CFDataCreate(kCFAllocatorDefault, (const UInt8*)&g_st, sizeof(g_st));
+                *(CFDataRef*)outData = CFDataCreate(kCFAllocatorDefault, (const UInt8*)&copy, sizeof(copy));
                 *outSize = sizeof(CFDataRef);
                 return 0;
             }
