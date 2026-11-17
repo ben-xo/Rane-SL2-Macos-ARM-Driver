@@ -337,8 +337,9 @@ converters' pre-ringing, which is smaller on a quieter click. It is not latency.
   44.1 kHz). The link speed is checked (`0x0a`): the status carries it, and at full speed the log, `sl2panel`
   and the control panel say there is no audio.
 - **A settle check** runs 2 s after connecting and 4 s after the Mac wakes (`IORegisterForSystemPower`): the
-  rate is sent again if `0x30` reports another, and with nothing streaming a state dump is requested and a
-  deck reported on USB audio goes back to thru. Each correction is logged.
+  rate is sent again if `0x30` reports another, and with nothing streaming a state dump is requested and any
+  deck whose routing differs from what the driver last knew (what it set, or what the box last reported) is
+  put back. A client's change reaches the driver as a report, so it is left alone. Each correction is logged.
 - **Rane's bootstrap** (the RAM-loaded EEPROM writer `sl2flash` loads into a box in its bootloader)
   enumerates exactly like the firmware, bcdDevice `0x0100` included. The driver knows it by its `0x01` reply
   (`01 02`), reports it as boot mode, sends it nothing at connect beyond the status read, and refuses to

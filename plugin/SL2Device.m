@@ -2048,9 +2048,10 @@ static void relist_if_safety_changed(void) {
 
 /* Thru and the rate can be lost after connect_box has set them: the box finishes starting up (it loads
    its FPGA) after it is configured, and it is suspended and resumed when the Mac sleeps. A while after
-   connecting, and after the Mac wakes, the driver checks: with nothing streaming, the decks' routing
-   (read from a state dump: thru, or as before a replug while the client is expected back, see
-   g_resume_pending); and the rate the driver's (0x30). Each correction is logged. */
+   connecting, and after the Mac wakes, the driver checks: with nothing streaming, that the decks' routing
+   (read from a state dump) is still what the driver last knew, which is what it set or what the box last
+   reported (a client's change, e.g. sl2panel usb, reaches it as a report, so it is left alone); and that
+   the box's rate (0x30) is the driver's. Each correction is logged. */
 #define SETTLE_CHECK_MS  2000
 #define SETTLE_DUMP_MS   200     /* time for a state dump's reports to arrive */
 static void settle_check(const char *why) {
@@ -2059,6 +2060,7 @@ static void settle_check(const char *why) {
     pthread_mutex_lock(&g_mutex);
     bool idle = false;
     uint32_t seen = atomic_load(&g_thru_reports);
+    uint8_t known0 = g_st.thru[0], known1 = g_st.thru[1];   /* the routing the driver last knew */
     if (usb_ensure_hid() && !atomic_load(&g_boot_mode)) {
         uint8_t r[HID_REPORT_LEN];
         if (hid_cmd(SL2_CMD_GET_RATE, NULL, 0, r, NULL)) {
@@ -2073,17 +2075,16 @@ static void settle_check(const char *why) {
     }
     pthread_mutex_unlock(&g_mutex);
     if (!idle) return;
-    /* Once the dump has reported both decks, still idle: put the routing right if it has changed. */
+    /* Once the dump has reported both decks, still idle: if the box has lost the routing, put it back. */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, SETTLE_DUMP_MS * NSEC_PER_MSEC), g_hotplug_q, ^{
         if (!atomic_load(&g_box_present)) return;
         pthread_mutex_lock(&g_mutex);
-        bool wrong = false;
-        for (int d = 0; d < 2; d++)
-            if ((g_st.thru[d] != 0) != (g_resume_pending ? g_resume_thru[d] != 0 : true)) wrong = true;
-        if (atomic_load(&g_thru_reports) - seen >= 2 && !atomic_load(&g_io_running) && wrong) {
-            LOG("%{public}s: the decks' routing had changed with nothing streaming: %{public}s", why,
-                g_resume_pending ? "routed as before the replug" : "back to thru");
-            set_idle_routing();
+        uint8_t known[2] = { known0, known1 };
+        bool lost = (g_st.thru[0] != 0) != (known[0] != 0) || (g_st.thru[1] != 0) != (known[1] != 0);
+        if (atomic_load(&g_thru_reports) - seen >= 2 && !atomic_load(&g_io_running) && lost) {
+            LOG("%{public}s: the box had lost the decks' routing: put back (deck 1 %{public}s, deck 2 %{public}s)", why,
+                known[0] ? "thru" : "USB", known[1] ? "thru" : "USB");
+            set_thru(known);
         }
         pthread_mutex_unlock(&g_mutex);
     });
