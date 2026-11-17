@@ -41,10 +41,14 @@
                                   Terminal).
 - Desinstalar-Rane-SL2.command -> Elimina el driver y sus componentes si
                                   deseas desinstalarlo.
-- Firmware-SL2.command         -> Solo para recuperar una Rane SL2 que ha
-                                  quedado en modo bootloader (sin firmware).
-                                  Necesita una copia del codigo fuente
-                                  (ver tools/firmware/README.md).
+- Firmware-SL2.command         -> Actualiza el firmware de la Rane SL2 a la
+                                  version 2.00 (la ultima de Rane), o
+                                  recupera una SL2 que ha quedado en modo
+                                  bootloader (sin firmware). Descarga el
+                                  driver 2.0.1f2 de Rane desde el Internet
+                                  Archive. La app SL 2 Control Panel lo
+                                  ofrece con el boton "Update Firmware..."
+                                  cuando el firmware no es el ultimo.
 
 
 3. COMO INSTALARLO EN CUALQUIER MAC

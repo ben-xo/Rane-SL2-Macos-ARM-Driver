@@ -30,7 +30,7 @@ dump:
 controlpanel:
 	tools/controlpanel/build-app.sh
 
-# the installer package and download zip, built into build/ (VERSION=x.y.z, default 1.4.1)
+# the installer package and download zip, built into build/ (VERSION=x.y.z, default 1.4.2)
 package:
 	Installer/build-pkg.sh $(VERSION)
 

@@ -180,6 +180,19 @@ enum SL2Driver {
     /// Audio MIDI Setup, where each output channel's volume is set.
     static let audioMIDISetup = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.audio.AudioMIDISetup")
 
+    /// Firmware-SL2.command, in the app's resources with the tools it runs: it gets Rane's newest
+    /// firmware, installs it for sl2flash and writes it to the box, asking before it writes.
+    static let firmwareScript = Bundle.main.url(forResource: "Firmware-SL2", withExtension: "command",
+                                                subdirectory: "Firmware")
+
+    /// Run the firmware script in Terminal, where it asks for the administrator password and for
+    /// confirmation before writing.
+    static func updateFirmware() {
+        guard let script = firmwareScript,
+              let terminal = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") else { return }
+        NSWorkspace.shared.open([script], withApplicationAt: terminal, configuration: NSWorkspace.OpenConfiguration())
+    }
+
     /// Set the input safety offset (microseconds). The driver takes it only with nothing streaming,
     /// then has CoreAudio set the device up again with it, which takes about half a second.
     @discardableResult
@@ -498,7 +511,11 @@ struct PanelView: View {
                         text: "Connect the SL 2 by USB, directly or through a single hub.")
             case .bootloader:
                 Message(symbol: "exclamationmark.triangle", title: "The SL 2 has no firmware loaded",
-                        text: "The box is in its USB bootloader and passes no audio until its firmware is restored. Run Firmware-SL2.command from the installer folder.")
+                        text: "The box is in its USB bootloader and passes no audio until its firmware is restored.") {
+                    if SL2Driver.firmwareScript != nil {
+                        Button("Restore Firmware…") { SL2Driver.updateFirmware() }
+                    }
+                }
             case .connected(let box):
                 connected(box)
             }
@@ -535,11 +552,18 @@ struct PanelView: View {
     private func boxSections(_ box: BoxState) -> some View {
         Section("Rane SL 2") {
             LabeledContent("Status", value: box.streaming ? "Connected, streaming audio" : "Connected")
-            // The firmware in red if it's older than the newest known, which is shown beside it.
+            // The firmware in red if it's older than the newest known, with a button that runs the
+            // update (or, without the bundled script, the newest version beside it).
             LabeledContent("Firmware") {
                 if box.firmwareOutdated {
-                    (Text(box.firmware).foregroundColor(.red) +
-                     Text(String(format: " (latest known: %d.%02d)", SL2Driver.latestFirmware.major, SL2Driver.latestFirmware.minor)))
+                    HStack {
+                        Text(box.firmware).foregroundColor(.red)
+                        if SL2Driver.firmwareScript != nil {
+                            Button("Update Firmware…") { SL2Driver.updateFirmware() }
+                        } else {
+                            Text(String(format: "(latest known: %d.%02d)", SL2Driver.latestFirmware.major, SL2Driver.latestFirmware.minor))
+                        }
+                    }
                 } else {
                     Text(box.firmware)
                 }
@@ -711,16 +735,24 @@ struct PanelView: View {
     }
 }
 
-struct Message: View {
+struct Message<Actions: View>: View {
     let symbol: String, title: String, text: String
+    @ViewBuilder var actions: () -> Actions
     var body: some View {
         VStack(spacing: 10) {
             Image(systemName: symbol).font(.system(size: 34)).foregroundStyle(.secondary)
             Text(title).font(.title3).bold()
             Text(text).multilineTextAlignment(.center).foregroundStyle(.secondary)
+            actions()
         }
         .padding(32)
         .frame(width: PanelView.columnWidth)
+    }
+}
+
+extension Message where Actions == EmptyView {
+    init(symbol: String, title: String, text: String) {
+        self.init(symbol: symbol, title: title, text: text) { EmptyView() }
     }
 }
 
