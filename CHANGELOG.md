@@ -13,6 +13,7 @@ All notable changes to the Rane SL 2 macOS ARM Driver project are documented in 
 ### Fixed
 - The chosen sample rate is kept across a coreaudiod restart.
 - Thru and the sample rate are checked again 2 s after connecting and after the Mac wakes.
+- After a replug while an app is streaming, the decks keep the routing they had (Serato no longer comes back with every deck in THRU); they go back on thru if no stream restarts within 5 s.
 - Rane's firmware loader (bootstrap) is reported as boot mode, and the driver no longer streams from it or sends it thru and rate commands.
 - A box that doesn't answer the version command no longer shows the previous box's version.
 - The driver's start-up log line shows its version instead of `<private>`.

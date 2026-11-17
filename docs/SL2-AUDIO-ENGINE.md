@@ -331,6 +331,8 @@ converters' pre-ringing, which is smaller on a quieter click. It is not latency.
 - **Unplugging while streaming.** The stream stops (nothing is sent to the box), and the client count is
   reset: the device leaves the HAL's list, and a client using it again after a replug sends a new StartIO.
   Observed: the HAL does send a StopIO shortly after the device disappears; it is logged and ignored.
+  If a client was streaming, each deck's thru state is remembered: a box back within 30 s gets that
+  routing at connect and at the next stream start, and goes back on thru if no stream starts within 5 s.
 - **StartIO fails** (`kAudioHardwareNotRunningError`) when the box can't be opened, rather than running a
   timeline with no box behind it.
 
@@ -415,7 +417,7 @@ Entries refer to the [bug catalogue](#bug-catalogue).
 
 | Applies | Entries |
 |---|---|
-| **Directly**: shared code or a shared HAL/USB pattern | 1 sample-rate handshake; 2 fixed timeline anchor; 4 clock tracking; 5, 31 reporting real latency (measure with `rtlat`); 15 bus time; 19, 20 capture gaps filled with silence; 21 ReadInput's write head; 22, 23 teardown on the USB queue and stream generations; 24, 25 failed opens and unplug while streaming; 26 opening at connect; 27 property buffer sizes; 28 the `sl2h` passthrough; 30 the zero-timestamp period; 39 the status frame count; 35 device listed only while attached; 38 retry a refused first open; 45 a stale version; 47 `%{public}s` in the log; 49 the rate kept across restarts; 50 the settle check after connect and wake |
+| **Directly**: shared code or a shared HAL/USB pattern | 1 sample-rate handshake; 2 fixed timeline anchor; 4 clock tracking; 5, 31 reporting real latency (measure with `rtlat`); 15 bus time; 19, 20 capture gaps filled with silence; 21 ReadInput's write head; 22, 23 teardown on the USB queue and stream generations; 24, 25 failed opens and unplug while streaming; 26 opening at connect; 27 property buffer sizes; 28 the `sl2h` passthrough; 30 the zero-timestamp period; 39 the status frame count; 35 device listed only while attached; 38 retry a refused first open; 45 a stale version; 47 `%{public}s` in the log; 49 the rate kept across restarts; 50 the settle check after connect and wake; 53 the routing kept across a replug mid-stream |
 | **With the deep schedule** (late writes into queued transfers) | 7, 9, 10, 11, 12, 13, 14, 16, 17, 18 |
 | **Check the device first** (the early capture read relies on the low byte of each sample being 0) | 44 |
 | **SL 2 only, or check on the SL 3/SL 4 first** | 8 input safety value (measure); 29 the heartbeat (check the SL 3/SL 4 firmware); 36 LINE/PHONO report (note `0x61`); 37 thru at connect (board input PC7); 46 Rane's bootstrap (each box's bootstrap answers its own version); 48 the link speed (`0x0a`); 32–34, 40–43 SL2Api, `sl2panel` and the test tools (each device's API has its own signatures; the SL 3 uses `0x10` for its version) |
@@ -681,6 +683,14 @@ build; *(hook)* uses `tools/latency/bin/sl2dbg`.
     - Fix: the images are carved at the offsets of the three known builds (1.0.1f4, 1.0.3f1, 2.0.1f2) and
       checked against their SHA-256; the .pkg, an expanded package, a folder or SL2Api itself is accepted.
     - Test: run it on each driver package. `9ebb50a`.
+53. **After a replug mid-stream, both decks came back on thru, and Serato adopted it.**
+    - Cause: `connect_box` put both decks on thru at every connect with nothing streaming; the client,
+      restarting its stream by itself, takes each deck's thru state from the box first. Seen on an SL 3
+      with Serato DJ Pro 2.5.5 (every deck back in THRU, timecode sent to the mixer).
+    - Fix: the routing at the unplug is remembered and restored at connect and at the next stream start,
+      for a box back within 30 s; thru after all if no stream starts within 5 s.
+    - Test: Serato 2.5.5 streaming in REL, unplug and replug: the decks stay in REL; `make hwtest`,
+      "unplug and replug, mid-stream". `00b0418`.
 
 ## Testing
 
@@ -740,16 +750,6 @@ Each was removed from the tip in its own commit.
   stream judges it not working.
 
 ## Still open
-
-- The early read counts a packet's last frame once the pad bytes of its first and last samples read 0, so
-  a last sample caught with its pad byte written and its three audio bytes not yet would pass; only the
-  settle time (`CAP_SETTLE_UF`) keeps the reader clear of a packet being written. Checking the top byte
-  against a mark would catch it, but every mark value is a real top byte: 0x7F is a positive clip, and a
-  clipped input would then leave every packet to its late completion. Not seen; left as is.
-- After a replug mid-stream, `connect_box` puts both decks on thru. The SL 3 driver restores the routing
-  the stream had instead, because Serato DJ Pro 2.5.5 reads each deck's thru state when it reconnects and
-  adopts it (its decks come back in THRU). On the SL 2, Serato learns thru from the state-dump reports;
-  what it does after a replug is not yet checked.
 
 - The output side (2 ms safety offset + 1.5 ms output latency) is set by the 1 ms write guard and 1 ms
   transfers; shorter transfers or a smaller guard might save up to ~1 ms. Untested.
