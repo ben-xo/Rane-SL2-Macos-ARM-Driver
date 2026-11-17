@@ -42,7 +42,10 @@ make flash dump
 ```
 
 `sl2flash` reads the images from `/Library/Audio/Plug-Ins/HAL/SL2Device.firmware` (where
-`sl2-firmware-install.sh` puts them), or from `--firmware DIR`. It needs no root. Stop any
+`sl2-firmware-install.sh` puts them), or from `--firmware DIR`. It needs no root. Before it
+writes anything it saves the whole EEPROM to `sl2-eeprom-backup-<date>.bin` in the current
+directory (and stops if it can't); that file holds Rane's firmware, so keep it out of any
+repository. Stop any
 audio on the SL 2 and quit sl2panel and Serato first: they talk to the box through the same
 driver channel.
 
