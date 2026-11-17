@@ -2,7 +2,10 @@
 
 All notable changes to the Rane SL 2 macOS ARM Driver project are documented in this file.
 
-## [Unreleased]
+## [1.4.1] — 2026-11-17
+
+### Changed
+- The installer's pages are in English and Spanish (it shows the Mac's language), and the Welcome page shows the installer's own version (it said 1.0.0).
 
 ### Fixed
 - After a replug mid-stream, a second unplug and replug before the app restarted its stream could put the decks back on thru (and Serato's decks in THRU) a second after the replug.
