@@ -230,9 +230,12 @@ static AudioObjectID ready_hal_device(void) {
         /* Ready: the device is listed and the driver reports the box open. */
         AudioObjectID dev = find_hal_device();
         SL2StatusPacket st;
-        if (dev != kAudioObjectUnknown && hal_get_status(&st) && st.connected) return dev;
-        /* Not ready, and not about to be (no box, or no driver to open it), or waited long enough. */
-        if (waited >= READY_WAIT_MS || !in_usb_registry() || !driver_loaded()) return kAudioObjectUnknown;
+        bool have_st = dev != kAudioObjectUnknown && hal_get_status(&st);
+        if (have_st && st.connected) return dev;
+        /* Not ready, and not about to be (no box, a box in its bootloader, which the driver never opens,
+           or no driver to open it), or waited long enough. */
+        if (waited >= READY_WAIT_MS || (have_st && st.boot_mode) || !in_usb_registry() || !driver_loaded())
+            return kAudioObjectUnknown;
         if (waited == 0) TRACE(": the box is attached but the driver has not opened it yet: waiting");
         usleep(READY_POLL_MS * 1000);
     }
