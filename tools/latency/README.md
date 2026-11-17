@@ -46,8 +46,9 @@ fewest physical steps:
    frames at both rates (recording the round trip at each), the output volume and mute (it puts your
    volume and mute back afterwards), the level meters, and with a debug build `dptest.sh`, the capture
    packet sizes at both rates and the `sl2dbg` fault hooks (a USB stall, errored capture packets);
-3. steps for someone at the box: flipping the LINE/PHONO switch, and unplugging and replugging while idle
-   and while a (silent) stream runs. The script prints each step and waits until it sees the change, so
+3. steps for someone at the box: flipping the LINE/PHONO switch, sleeping and waking the Mac (both decks
+   must be back on thru and the box at the driver's rate), and unplugging and replugging while idle and
+   while a (silent) stream runs. The script prints each step and waits until it sees the change, so
    nothing needs typing. `ARGS="--no-physical"` skips them.
 
 Run it in a Terminal window, so the steps show as they come up. A release build skips the tests that
