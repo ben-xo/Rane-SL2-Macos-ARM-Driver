@@ -21,8 +21,9 @@
 #define SL2_EEPROM_BLOCK  32      /* bytes per 0x02 write / 0x03 read */
 #define SL2_CMD_GET_RATE  0x30    /* the box's sample rate: reply [5..6], big-endian */
 
-/* The SL 2's HAL device, or kAudioObjectUnknown if the driver is not loaded. The device exists
-   whenever the driver is loaded, whether or not a box is connected. */
+/* The SL 2's HAL device, or kAudioObjectUnknown if there is none. The driver lists its device only
+   while a box is attached (in its bootloader too), so a box that restarts or is replugged takes the
+   device out of the list and back: look it up again rather than keep its ID across that. */
 AudioObjectID sl2h_find_device(void);
 
 /* Send one command report and fetch its reply. Fills in the tag (req[1..4]) itself. True if the

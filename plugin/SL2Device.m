@@ -2092,9 +2092,9 @@ static void settle_check(const char *why) {
 
 /* Open a newly attached box and, with no stream running, put its decks on analogue thru (the box
    powers up with thru on or off depending on a board input), as at stream stop, so turntables
-   reach the mixer until an app streams; after a replug mid-stream, as they were (g_resume_pending). The first open can be refused ("exclusive open of usb
-   object failed") while macOS is still setting the box up, about 1 connect in 30: retry for
-   about a second. */
+   reach the mixer until an app streams; after a replug mid-stream, route them as they were
+   (g_resume_pending). The first open can be refused ("exclusive open of usb object failed") while
+   macOS is still setting the box up, about 1 connect in 30: retry for about a second. */
 #define CONNECT_TRIES    10
 #define CONNECT_RETRY_MS 100
 static void connect_box(int attempt) {
