@@ -460,9 +460,19 @@ static void push_sr_unsol(int sr) {
 /* Keep one read queued on the HID IN pipe (runs on g_q). Each report is either the reply hid_cmd
    is waiting for, or an unsolicited report from the box,
    which updates the status and is queued for clients. */
+static void hid_read(void);
+static IOReturn g_hid_read_err;   /* the last HID read error logged, so a repeating one logs once (logging only) */
+/* Queue the next read after ms, if the pipe is still the one it was for (not closed or replaced). */
+static void hid_read_later(IOUSBHostPipe *pipe, int ms) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)ms * NSEC_PER_MSEC), g_q, ^{
+        if (g_hpipe_in == pipe) hid_read();
+    });
+}
 static void hid_read(void) {
     if (!g_hpipe_in || !g_hbuf_in) return;
-    [g_hpipe_in enqueueIORequestWithData:g_hbuf_in completionTimeout:0 error:nil completionHandler:^(IOReturn s, NSUInteger n) {
+    IOUSBHostPipe *pipe = g_hpipe_in;
+    NSError *e = nil;
+    BOOL queued = [pipe enqueueIORequestWithData:g_hbuf_in completionTimeout:0 error:&e completionHandler:^(IOReturn s, NSUInteger n) {
         if (s == kIOReturnSuccess && n > 0) {
             /* The report's command byte [0] and its tag [1..4]. */
             const uint8_t *b = g_hbuf_in.bytes;
@@ -499,9 +509,23 @@ static void hid_read(void) {
             }
             /* Anything else is a reply that came after hid_cmd gave up: not for clients. */
         }
-        /* Queue the next read, unless the pipe was aborted or released (the box is closing). */
-        if (s != kIOReturnAborted && g_hpipe_in) hid_read();
+        /* Queue the next read, unless the pipe was aborted or released (the box is closing). After
+           an error, clear the endpoint's halt and wait a little first, so a pipe that keeps failing
+           doesn't spin on g_q, which also runs the audio completions. */
+        if (s == kIOReturnAborted || g_hpipe_in != pipe) return;
+        if (s == kIOReturnSuccess) { g_hid_read_err = kIOReturnSuccess; hid_read(); return; }
+        if (s != g_hid_read_err) LOG("HID read failed (0x%x): clearing the endpoint and reading again", s);
+        g_hid_read_err = s;
+        [pipe clearStallWithError:nil];
+        hid_read_later(pipe, 10);
     }];
+    /* Not queued: try again shortly, rather than leave the box's replies and reports unread. */
+    if (!queued) {
+        if (g_hid_read_err != kIOReturnNotReady)
+            LOG("HID read could not be queued (%{public}@): trying again", e.localizedDescription);
+        g_hid_read_err = kIOReturnNotReady;   /* marks "not queued", so a lasting refusal logs once */
+        hid_read_later(pipe, 100);
+    }
 }
 
 /* Send a command and wait up to 150 ms for its reply. Every command gets one except
