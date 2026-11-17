@@ -1367,10 +1367,11 @@ static void cap_read_early(void) {
             break;
         }
         /* Count the frames that arrived by their marks; none means missing or errored. A frame counts
-           only once the pad bytes of its first and last samples both read 0. That catches most frames
-           caught part-way through being written, but not the last sample's three audio bytes (no byte
-           value marks those): the settle time (CAP_SETTLE_UF) is what keeps the early reader clear of
-           a packet still being written. */
+           only once the pad bytes of its first and last samples both read 0: the controller writes a
+           packet in order, so the frame has then arrived up to its last sample, whose three audio bytes
+           come in the same aligned 32-bit word as its pad byte. (c.f. the SL 3, whose packed 24-bit
+           samples have no pad byte to mark.) The settle time (CAP_SETTLE_UF) keeps the early reader
+           clear of a packet still being written. */
         const volatile uint8_t *p = g_cap_bytes[idx] + k * PKT_MAX;
         int n = 0;
         while (n < PKT_MAX / FRAME_BYTES && p[n * FRAME_BYTES] == 0x00 &&
