@@ -55,8 +55,11 @@ after a flash; both on = running.
 
 ## Files
 - `extract-sl2-firmware.py` — de-obfuscate the firmware out of your own copy of
-  SL2Api.framework (Mac); produces `eeprom-image-24lc512.bin` (for the Pi reflash and for
-  `sl2dump --verify`) plus the bootstrap and final images (for `sl2flash`).
+  SL2Api.framework (Mac): Rane's SL2 driver package 1.0.1f4 or 1.0.3f1 (firmware 1.10) or
+  2.0.1f2 (firmware 2.00, bundled with Serato DJ Pro 2.5.5), the SL2Api binary, or a folder
+  holding either. It checks each image against the SHA-256 of the known build. Produces
+  `eeprom-image-24lc512.bin` (for the Pi reflash and for `sl2dump --verify`) plus the
+  bootstrap and final images (for `sl2flash`).
 - `pi/pi-eeprom-24lc512.py` — safety-gated read / write / verify of the EEPROM from a Pi.
 - `sl2flash.m` — the over-USB flasher.
 - `sl2-firmware-install.sh` — install firmware images next to the HAL driver for `sl2flash`.
